@@ -44,10 +44,23 @@ impl Default for EngineAPI {
 }
 impl EngineAPI {
     pub fn test_default() -> Self {
+        // `sled::Config::temporary(true)` defaults to `/dev/shm` on Linux when no path is set.
+        // Some environments deny writes there, so force a unique temp path.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let db_id = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db_path = std::env::temp_dir().join(format!(
+            "enginelib-test-db-{}-{}",
+            std::process::id(),
+            db_id
+        ));
+
         Self {
             cfg: Config::new(),
             task_queue: TaskQueue::default(),
             db: sled::Config::new()
+                .path(db_path)
                 .temporary(true)
                 .flush_every_ms(None)
                 .open()
@@ -136,20 +149,25 @@ impl EngineAPI {
     }
 
     pub fn setup_logger() {
+        use std::sync::OnceLock;
+
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
         #[cfg(debug_assertions)]
-        tracing_subscriber::FmtSubscriber::builder()
+            let _ = tracing_subscriber::FmtSubscriber::builder()
             // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
             // will be written to stdout.
             .with_max_level(Level::DEBUG)
             // builds the subscriber.
-            .init();
+            .try_init();
         #[cfg(not(debug_assertions))]
-        tracing_subscriber::FmtSubscriber::builder()
+            let _ = tracing_subscriber::FmtSubscriber::builder()
             // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
             // will be written to stdout.
             .with_max_level(Level::INFO)
             // builds the subscriber.
-            .init();
+            .try_init();
+        });
     }
 }
 #[derive(Default, Clone, Debug)]

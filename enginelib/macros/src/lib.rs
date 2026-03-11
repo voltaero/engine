@@ -47,6 +47,10 @@ pub fn module(_attr: TokenStream, item: TokenStream) -> TokenStream {
             env!("CARGO_PKG_NAME"),
         );),
     );
+    item_fn
+        .block
+        .stmts
+        .insert(0, parse_quote!(::enginelib::api::EngineAPI::setup_logger();));
     item_fn.attrs.push(parse_quote!(#[unsafe(export_name="run")]));
 
     quote!(#item_fn).into()
