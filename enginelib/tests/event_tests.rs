@@ -1,17 +1,30 @@
-use enginelib::{
-    RegisterEventHandler, Registry,
-    api::EngineAPI,
-    event::{
-        EngineEventHandlerRegistry, EngineEventRegistry, Event, EventBus, EventCTX, EventHandler,
-    },
-    events::ID,
-    plugin::LibraryManager,
-    task::{SolvedTasks, TaskQueue, Verifiable},
-};
+use enginelib::{Registry, api::EngineAPI, events::ID, task::Verifiable};
 use macros::Verifiable;
-use sled::Config;
-use std::{any::Any, collections::HashMap, sync::Arc};
+use std::sync::Arc;
 use tracing_test::traced_test;
+
+#[derive(Clone, Debug, macros::Event)]
+#[event(namespace = "test", name = "test_event", cancellable)]
+struct TestEvent {
+    pub value: i32,
+    pub cancelled: bool,
+}
+
+#[macros::event_handler(namespace = "test", name = "test_event")]
+fn increment_test_event(event: &mut TestEvent) {
+    event.value += 1;
+}
+
+#[derive(Clone, Debug, macros::Event)]
+#[event(namespace = "test", name = "stateful_event")]
+struct StatefulEvent {
+    pub value: u32,
+}
+
+#[macros::event_handler(namespace = "test", name = "stateful_event", ctx = 7u32)]
+fn add_ctx_to_event(event: &mut StatefulEvent, ctx: &u32) {
+    event.value += *ctx;
+}
 
 #[traced_test]
 #[test]
@@ -24,64 +37,27 @@ fn id() {
 fn test_event_registration_and_handling() {
     let mut api = EngineAPI::test_default();
 
-    // Create a test event
-    #[derive(Clone, Debug)]
-    struct TestEvent {
-        pub value: i32,
-        pub cancelled: bool,
-        pub id: (String, String),
-    }
-
-    impl Event for TestEvent {
-        fn clone_box(&self) -> Box<dyn Event> {
-            Box::new(self.clone())
-        }
-        fn cancel(&mut self) {
-            self.cancelled = true;
-        }
-        fn is_cancelled(&self) -> bool {
-            self.cancelled
-        }
-        fn get_id(&self) -> (String, String) {
-            self.id.clone()
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-        fn as_any_mut(&mut self) -> &mut dyn Any {
-            self
-        }
-    }
-
-    // Create a test handler
-    RegisterEventHandler!(TestHandler, TestEvent, |event: &mut TestEvent| {
-        event.value += 1;
-    });
-
-    // Register event and handler
-    let event_id = ID("test", "test_event");
-    api.event_bus.event_registry.register(
-        Arc::new(TestEvent {
-            value: 0,
-            cancelled: false,
-            id: event_id.clone(),
-        }),
-        event_id.clone(),
-    );
-
-    api.event_bus
-        .event_handler_registry
-        .register_handler(TestHandler, event_id.clone());
-
-    // Test event handling
     let mut test_event = TestEvent {
         value: 0,
         cancelled: false,
-        id: event_id.clone(),
     };
 
-    api.event_bus.handle(event_id, &mut test_event);
+    enginelib::event::register_inventory_handlers(&mut api);
+    api.event_bus.fire(&mut test_event);
     assert_eq!(test_event.value, 1);
+    drop(api.db);
+}
+
+#[traced_test]
+#[test]
+fn test_stateful_event_auto_registration() {
+    let mut api = EngineAPI::test_default();
+
+    enginelib::event::register_inventory_handlers(&mut api);
+
+    let mut event = StatefulEvent { value: 0 };
+    api.event_bus.fire(&mut event);
+    assert_eq!(event.value, 7);
     drop(api.db);
 }
 

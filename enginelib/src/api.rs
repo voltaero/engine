@@ -134,15 +134,7 @@ impl EngineAPI {
             api.solved_tasks = res;
         };
     }
-    pub fn init_dev(api: &mut Self) {
-        Self::setup_logger();
-        Self::init_events(api);
-        let mut newLibManager = LibraryManager::default();
-        newLibManager
-            .load_library("./target/release/libengine_core.so", api)
-            .unwrap();
-        api.lib_manager = newLibManager;
-    }
+
     pub fn setup_logger() {
         #[cfg(debug_assertions)]
         tracing_subscriber::FmtSubscriber::builder()
