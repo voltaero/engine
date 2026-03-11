@@ -1,15 +1,12 @@
-use std::{
-    any::Any,
-    sync::{Arc, RwLock},
-};
+use std::sync::{Arc, RwLock};
 
+use macros::{Event, event_handler};
 use sled::Db;
 
-use crate::{Identifier, api::EngineAPI, event::Event};
+use crate::{Identifier, api::EngineAPI};
 
-use super::{Events, ID};
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Event)]
+#[event(namespace = "core", name = "admin_auth_event", cancellable)]
 pub struct AdminAuthEvent {
     pub cancelled: bool,
     pub id: Identifier,
@@ -18,53 +15,42 @@ pub struct AdminAuthEvent {
     pub db: Db,
     pub output: Arc<RwLock<bool>>,
 }
-#[macro_export]
-macro_rules! RegisterAdminAuthEventHandler {
-    ($handler:ident,$mod_ctx:ty, $handler_fn:expr) => {
-        use crate::event::Event;
-        use crate::event::EventCTX;
-        use crate::event::EventHandler;
-        use crate::events::admin_auth_event::AdminAuthEvent;
-        use std::sync::Arc;
-        pub struct $handler {
-            mod_ctx: Arc<$mod_ctx>,
-        };
-        impl $handler {
-            pub fn new(mod_ctx: Arc<$mod_ctx>) -> Self {
-                Self { mod_ctx }
-            }
-        }
-        impl EventHandler for $handler {
-            fn handle(&self, event: &mut dyn Event) {
-                let event: &mut AdminAuthEvent =
-                    <Self as EventCTX<AdminAuthEvent>>::get_event::<AdminAuthEvent>(event);
-                self.handleCTX(event);
-            }
-        }
-        impl EventCTX<AdminAuthEvent> for $handler {
-            fn handleCTX(&self, event: &mut AdminAuthEvent) {
-                let mod_ctx: &Arc<$mod_ctx> = &self.mod_ctx;
-                $handler_fn(event, mod_ctx)
-            }
-        }
-    };
-    ($handler:ident,$handler_fn:expr) => {
-        use crate::event::Event;
-        use crate::event::EventCTX;
-        use crate::event::EventHandler;
-        use crate::events::admin_auth_event::AdminAuthEvent;
-        pub struct $handler;
-        impl EventHandler for $handler {
-            fn handle(&self, event: &mut dyn Event) {
-                let event: &mut AdminAuthEvent =
-                    <Self as EventCTX<AdminAuthEvent>>::get_event::<AdminAuthEvent>(event);
-                self.handleCTX(event);
-            }
-        }
-        impl EventCTX<AdminAuthEvent> for $handler {
-            fn handleCTX(&self, event: &mut AdminAuthEvent) {
-                $handler_fn(event)
-            }
-        }
-    };
+// Event trait auto-implemented by derive macro
+
+impl AdminAuthEvent {
+    pub fn fire(
+        api: &mut EngineAPI,
+        payload: String,
+        target: Identifier,
+        db: Db,
+        output: Arc<RwLock<bool>>,
+    ) {
+        api.event_bus.fire(&mut AdminAuthEvent {
+            cancelled: false,
+            id: ("core".to_string(), "admin_auth_event".to_string()),
+            payload,
+            target,
+            db,
+            output,
+        });
+    }
+
+    pub fn check(api: &mut EngineAPI, payload: String, target: Identifier, db: Db) -> bool {
+        let output = Arc::new(RwLock::new(false));
+        Self::fire(api, payload, target, db, output.clone());
+        *output.read().unwrap()
+    }
+}
+
+#[event_handler(
+    namespace = "core",
+    name = "admin_auth_event",
+    ctx = api.cfg.config_toml.cgrpc_token.clone()
+)]
+fn admin_auth_handler(event: &mut AdminAuthEvent, token: &Option<String>) {
+    match token.as_deref() {
+        None => *event.output.write().unwrap() = true,
+        Some(token) if token == event.payload.as_str() => *event.output.write().unwrap() = true,
+        Some(_) => {}
+    }
 }

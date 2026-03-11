@@ -70,7 +70,16 @@ impl EngineAPI {
         let mut new_lib_manager = LibraryManager::default();
         new_lib_manager.load_modules(api);
         api.lib_manager = new_lib_manager;
-        Events::init(api);
+        for (id, _tsk) in api.task_registry.tasks.iter() {
+            api.task_queue.tasks.entry(id.clone()).or_default();
+            api.executing_tasks.tasks.entry(id.clone()).or_default();
+            api.solved_tasks.tasks.entry(id.clone()).or_default();
+        }
+
+        Self::init_events(api);
+    }
+    fn init_events(api: &mut Self) {
+        crate::event::register_inventory_handlers(api);
     }
     pub fn init_packer(api: &mut Self) {
         Self::setup_logger();
@@ -127,7 +136,7 @@ impl EngineAPI {
     }
     pub fn init_dev(api: &mut Self) {
         Self::setup_logger();
-        Events::init(api);
+        Self::init_events(api);
         let mut newLibManager = LibraryManager::default();
         newLibManager
             .load_library("./target/release/libengine_core.so", api)

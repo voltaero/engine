@@ -1,6 +1,10 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
-use syn::{DeriveInput, parse_macro_input};
+use syn::{
+    DeriveInput, Expr, Ident, ItemFn, LitStr, Path, Token,
+    parse::{Parse, ParseStream},
+    parse_macro_input, parse_quote,
+};
 #[proc_macro_attribute]
 pub fn metadata(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let item = proc_macro2::TokenStream::from(item);
@@ -12,12 +16,40 @@ pub fn metadata(_attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 #[proc_macro_attribute]
 pub fn module(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let item = proc_macro2::TokenStream::from(item);
-    quote! {
-        #[unsafe(export_name="run")]
-        #item
-    }
-    .into()
+    let mut item_fn = parse_macro_input!(item as ItemFn);
+
+    let api_ident = match item_fn.sig.inputs.first() {
+        Some(syn::FnArg::Typed(pat_type)) => match &*pat_type.pat {
+            syn::Pat::Ident(pat_ident) => pat_ident.ident.clone(),
+            _ => {
+                return syn::Error::new_spanned(
+                    &pat_type.pat,
+                    "expected first argument to be an identifier (e.g. `api: &mut EngineAPI`)",
+                )
+                .to_compile_error()
+                .into();
+            }
+        },
+        _ => {
+            return syn::Error::new_spanned(
+                &item_fn.sig,
+                "`#[module]` expects a function like `fn run(api: &mut EngineAPI)`",
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
+
+    item_fn.block.stmts.insert(
+        0,
+        parse_quote!(::enginelib::event::register_inventory_handlers_for_origin(
+            #api_ident,
+            env!("CARGO_PKG_NAME"),
+        );),
+    );
+    item_fn.attrs.push(parse_quote!(#[unsafe(export_name="run")]));
+
+    quote!(#item_fn).into()
 }
 #[proc_macro_derive(Verifiable)]
 pub fn derive_verifiable(input: TokenStream) -> TokenStream {
@@ -93,38 +125,115 @@ pub fn derive_event(input: TokenStream) -> TokenStream {
     .into()
 }
 
+struct EventHandlerArgs {
+    namespace: LitStr,
+    name: LitStr,
+    receive_cancelled: bool,
+    ctx: Option<Expr>,
+    ctx_fn: Option<Path>,
+}
+
+impl Parse for EventHandlerArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut namespace: Option<LitStr> = None;
+        let mut name: Option<LitStr> = None;
+        let mut receive_cancelled = false;
+        let mut ctx: Option<Expr> = None;
+        let mut ctx_fn: Option<Path> = None;
+
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            match key.to_string().as_str() {
+                "receive_cancelled" => {
+                    receive_cancelled = true;
+                }
+                "namespace" => {
+                    input.parse::<Token![=]>()?;
+                    namespace = Some(input.parse::<LitStr>()?);
+                }
+                "name" => {
+                    input.parse::<Token![=]>()?;
+                    name = Some(input.parse::<LitStr>()?);
+                }
+                "ctx" => {
+                    input.parse::<Token![=]>()?;
+                    ctx = Some(input.parse::<Expr>()?);
+                }
+                "ctx_fn" => {
+                    input.parse::<Token![=]>()?;
+                    ctx_fn = Some(input.parse::<Path>()?);
+                }
+                _ => {
+                    return Err(syn::Error::new_spanned(
+                        key,
+                        "unknown argument (expected `namespace`, `name`, `receive_cancelled`, `ctx`, or `ctx_fn`)",
+                    ));
+                }
+            }
+
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+        }
+
+        let namespace = namespace.ok_or_else(|| {
+            syn::Error::new(proc_macro2::Span::call_site(), "missing `namespace = \"...\"`")
+        })?;
+        let name = name.ok_or_else(|| {
+            syn::Error::new(proc_macro2::Span::call_site(), "missing `name = \"...\"`")
+        })?;
+
+        if ctx.is_some() && ctx_fn.is_some() {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "use only one of `ctx = ...` or `ctx_fn = ...`",
+            ));
+        }
+
+        Ok(Self {
+            namespace,
+            name,
+            receive_cancelled,
+            ctx,
+            ctx_fn,
+        })
+    }
+}
+
 #[proc_macro_attribute]
 pub fn event_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let item_fn = parse_macro_input!(item as syn::ItemFn);
+    let args = parse_macro_input!(attr as EventHandlerArgs);
+    let EventHandlerArgs {
+        namespace,
+        name,
+        receive_cancelled,
+        ctx,
+        ctx_fn,
+    } = args;
+    let item_fn = parse_macro_input!(item as ItemFn);
     let fn_name = &item_fn.sig.ident;
 
-    // parse attrs: event = AuthEvent, namespace = "core", name = "auth_event", receive_cancelled
-    let mut ns = String::new();
-    let mut ev_name = String::new();
-    let mut receive_cancelled = false;
-
-    let meta_parser = syn::meta::parser(|meta| {
-        if meta.path.is_ident("namespace") {
-            ns = meta.value()?.parse::<syn::LitStr>()?.value();
-        } else if meta.path.is_ident("name") {
-            ev_name = meta.value()?.parse::<syn::LitStr>()?.value();
-        } else if meta.path.is_ident("receive_cancelled") {
-            receive_cancelled = true;
-        }
-        Ok(())
-    });
-    parse_macro_input!(attr with meta_parser);
-
     // extract the event param type (e.g. &mut AuthEvent -> AuthEvent)
-    let event_type = match &item_fn.sig.inputs[0] {
-        syn::FnArg::Typed(pat_type) => match &*pat_type.ty {
-            syn::Type::Reference(type_ref) => match &*type_ref.elem {
-                syn::Type::Path(type_path) => type_path.path.segments.last().unwrap().ident.clone(),
-                _ => panic!("Expected path type for event"),
-            },
-            _ => panic!("Expected reference type for event"),
+    let event_type: syn::Type = match item_fn.sig.inputs.first() {
+        Some(syn::FnArg::Typed(pat_type)) => match &*pat_type.ty {
+            syn::Type::Reference(type_ref) => (*type_ref.elem).clone(),
+            _ => {
+                return syn::Error::new_spanned(
+                    &pat_type.ty,
+                    "expected first parameter to be a reference (e.g. `event: &mut MyEvent`)",
+                )
+                .to_compile_error()
+                .into();
+            }
         },
-        _ => panic!("Expected typed argument for event"),
+        _ => {
+            return syn::Error::new_spanned(
+                &item_fn.sig,
+                "expected first parameter to be the event (e.g. `fn handler(event: &mut MyEvent)`)",
+            )
+            .to_compile_error()
+            .into();
+        }
     };
 
     let handler_name_str = fn_name
@@ -140,6 +249,7 @@ pub fn event_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
         .collect::<String>();
     let handler_name = syn::Ident::new(&format!("{}Handler", handler_name_str), fn_name.span());
     let register_fn_name = format_ident!("__register_{}", fn_name);
+    let inventory_register_fn_name = format_ident!("__inventory_register_{}", fn_name);
 
     let is_stateful = item_fn.sig.inputs.len() > 1; // more than just &mut Event
 
@@ -151,12 +261,67 @@ pub fn event_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     if is_stateful {
         // extract the context param type (e.g. &Arc<String> -> Arc<String>)
-        let ctx_type = match &item_fn.sig.inputs[1] {
-            syn::FnArg::Typed(pat_type) => match &*pat_type.ty {
-                syn::Type::Reference(type_ref) => &*type_ref.elem,
-                _ => &*pat_type.ty,
+        let ctx_type: syn::Type = match item_fn.sig.inputs.iter().nth(1) {
+            Some(syn::FnArg::Typed(pat_type)) => match &*pat_type.ty {
+                syn::Type::Reference(type_ref) => {
+                    if type_ref.mutability.is_some() {
+                        return syn::Error::new_spanned(
+                            &pat_type.ty,
+                            "context parameter must be a shared reference (e.g. `ctx: &MyCtx`)",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+                    (*type_ref.elem).clone()
+                }
+                _ => {
+                    return syn::Error::new_spanned(
+                        &pat_type.ty,
+                        "context parameter must be a reference (e.g. `ctx: &MyCtx`)",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
             },
-            _ => panic!("Expected typed argument for context"),
+            _ => {
+                return syn::Error::new_spanned(
+                    &item_fn.sig,
+                    "expected second parameter to be handler context (e.g. `fn handler(event: &mut E, ctx: &Ctx)`)",
+                )
+                .to_compile_error()
+                .into();
+            }
+        };
+
+        let maybe_inventory_registrar = match (ctx, ctx_fn) {
+            (Some(ctx_expr), None) => quote! {
+                fn #inventory_register_fn_name(api: &mut ::enginelib::api::EngineAPI) {
+                    let ctx: #ctx_type = (#ctx_expr);
+                    #register_fn_name(api, ctx);
+                }
+
+                ::enginelib::inventory::submit! {
+                    ::enginelib::event::EventRegistrar {
+                        origin: env!("CARGO_PKG_NAME"),
+                        func: #inventory_register_fn_name,
+                    }
+                }
+            },
+            (None, Some(ctx_fn)) => quote! {
+                fn #inventory_register_fn_name(api: &mut ::enginelib::api::EngineAPI) {
+                    let ctx: #ctx_type = #ctx_fn(api);
+                    #register_fn_name(api, ctx);
+                }
+
+                ::enginelib::inventory::submit! {
+                    ::enginelib::event::EventRegistrar {
+                        origin: env!("CARGO_PKG_NAME"),
+                        func: #inventory_register_fn_name,
+                    }
+                }
+            },
+            (None, None) => quote! {},
+            (Some(_), Some(_)) => unreachable!(),
         };
 
         quote! {
@@ -174,7 +339,7 @@ pub fn event_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             impl enginelib::event::EventCTX<#event_type> for #handler_name {
                 fn expected_event_id() -> enginelib::Identifier {
-                    (#ns.to_string(), #ev_name.to_string())
+                    (#namespace.to_string(), #name.to_string())
                 }
                 fn handleCTX(&self, event: &mut #event_type) {
                     #fn_name(event, &self.ctx);
@@ -189,15 +354,26 @@ pub fn event_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #receive_cancelled_impl
             }
 
-            fn #register_fn_name(event_bus: &mut enginelib::event::EventBus, ctx: #ctx_type) {
-                event_bus.register_handler(
+            pub fn #register_fn_name(api: &mut enginelib::api::EngineAPI, ctx: #ctx_type) {
+                api.event_bus.register_handler(
                     #handler_name::with_ctx(ctx),
-                    (#ns.to_string(), #ev_name.to_string()),
+                    (#namespace.to_string(), #name.to_string()),
                 );
             }
+
+            #maybe_inventory_registrar
         }
         .into()
     } else {
+        let inventory_registrar = quote! {
+            ::enginelib::inventory::submit! {
+                ::enginelib::event::EventRegistrar {
+                    origin: env!("CARGO_PKG_NAME"),
+                    func: #register_fn_name,
+                }
+            }
+        };
+
         quote! {
             #item_fn
 
@@ -205,7 +381,7 @@ pub fn event_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             impl enginelib::event::EventCTX<#event_type> for #handler_name {
                 fn expected_event_id() -> enginelib::Identifier {
-                    (#ns.to_string(), #ev_name.to_string())
+                    (#namespace.to_string(), #name.to_string())
                 }
                 fn handleCTX(&self, event: &mut #event_type) {
                     #fn_name(event);
@@ -220,12 +396,14 @@ pub fn event_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #receive_cancelled_impl
             }
 
-            fn #register_fn_name(event_bus: &mut enginelib::event::EventBus) {
-                event_bus.register_handler(
+            pub fn #register_fn_name(api: &mut enginelib::api::EngineAPI) {
+                api.event_bus.register_handler(
                     #handler_name,
-                    (#ns.to_string(), #ev_name.to_string()),
+                    (#namespace.to_string(), #name.to_string()),
                 );
             }
+
+            #inventory_registrar
         }
         .into()
     }
