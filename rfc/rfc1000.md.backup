@@ -14,18 +14,11 @@ The current system requires:
 
 This is verbose, error-prone, and relies on `unsafe` downcasting. RFC 1000 replaces all of it with two proc macros (`#[derive(Event)]` and `#[event_handler]`).
 
-### Using `inventory` for per-module aggregation
+### Why not `inventory`?
 
-While `inventory` cannot be used to collect items **across** dynamic library boundaries (the engine cannot see a mod's inventory items), it **can** be used **within** a single compilation unit. Each mod uses `inventory` to collect its own handler registrations, and the `#[module]` macro automatically iterates over the module's inventory to register all handlers.
+Mods are separate `.so`/`.dll` shared libraries loaded at runtime via `libloading`. The `inventory` crate uses linker-level magic (`.init_array` / link sections) to collect items at link time within a single binary. A mod's `inventory::submit!` entries live inside the mod's `.so` and are invisible to the engine binary's `inventory::iter`. This makes `inventory` fundamentally incompatible with dynamically loaded mods.
 
-This hybrid approach:
-- **Eliminates boilerplate** for stateless handlers - no manual `__register_*` calls needed
-- **Works with dynamic loading** - each mod manages its own inventory
-- **Still supports stateful handlers** - modules manually register handlers that require context
-
-The `#[event_handler]` macro generates a registration function and submits it to the module's inventory. The `#[module]` macro injects a call to `register_inventory_handlers()` at the start of the module's `run` function, which iterates over all submitted registrars and registers them with the engine's event bus.
-
-Stateful handlers (those requiring context) cannot be auto-registered and still require explicit `__register_*` calls with the appropriate context.
+Instead, the `#[event_handler]` proc macro generates a registration function per handler. Both core and mod code use the same mechanism.
 
 ## Design
 
