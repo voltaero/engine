@@ -1,17 +1,11 @@
-use chrono::{Timelike, Utc};
-use sled::Db;
-use tokio::{
-    spawn,
-    sync::RwLock,
-    time::{interval, sleep},
-};
+use chrono::Utc;
+use tokio::{spawn, sync::RwLock, time::interval};
 use tracing::{Level, debug, error, info, instrument};
 
 use crate::{
     Identifier, Registry,
     config::Config,
-    event::{EngineEventHandlerRegistry, EngineEventRegistry, EventBus},
-    events::Events,
+    event::{EngineEventHandlerRegistry, EventBus},
     plugin::LibraryManager,
     task::{ExecutingTaskQueue, SolvedTasks, StoredTask, Task, TaskQueue},
 };
@@ -39,9 +33,6 @@ impl Default for EngineAPI {
             lib_manager: LibraryManager::default(),
             task_registry: EngineTaskRegistry::default(),
             event_bus: EventBus {
-                event_registry: EngineEventRegistry {
-                    events: HashMap::new(),
-                },
                 event_handler_registry: EngineEventHandlerRegistry {
                     event_handlers: HashMap::new(),
                 },
@@ -64,9 +55,6 @@ impl EngineAPI {
             lib_manager: LibraryManager::default(),
             task_registry: EngineTaskRegistry::default(),
             event_bus: EventBus {
-                event_registry: EngineEventRegistry {
-                    events: HashMap::new(),
-                },
                 event_handler_registry: EngineEventHandlerRegistry {
                     event_handlers: HashMap::new(),
                 },

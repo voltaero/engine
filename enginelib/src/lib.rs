@@ -3,8 +3,7 @@ pub mod api;
 pub mod config;
 pub mod event;
 pub mod events;
-#[macro_use]
-pub mod macros;
+extern crate self as enginelib;
 pub mod plugin;
 pub mod prelude;
 pub mod task;

@@ -1,17 +1,11 @@
-use std::{any::Any, process, sync::Arc};
+use std::sync::Arc;
 
-use tracing::info;
+use macros::Event;
 
-use crate::{
-    Identifier,
-    api::EngineAPI,
-    event::Event,
-    plugin::{LibraryManager, LibraryMetadata},
-};
+use crate::{Identifier, plugin::LibraryMetadata};
 
-use super::{Events, ID};
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Event)]
+#[event(namespace = "core", name = "auth_event", cancellable)]
 pub struct StartEvent {
     pub modules: Vec<Arc<LibraryMetadata>>,
     pub cancelled: bool,
