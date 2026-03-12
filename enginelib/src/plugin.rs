@@ -74,13 +74,9 @@ impl LibraryManager {
                     let path = entry.path();
                     if path.is_file() {
                         if let Some(extension) = path.extension() {
-                            if extension == "tar" {
-                                if let Some(stem) = path.file_stem() {
-                                    if stem.to_string_lossy().ends_with(".rustforge") {
-                                        debug!("Found valid module file: {}", path.display());
-                                        files.push(path.display().to_string());
-                                    }
-                                }
+                            if extension == "rf" {
+                                debug!("Found valid module file: {}", path.display());
+                                files.push(path.display().to_string());
                             }
                         }
                     }
@@ -103,7 +99,9 @@ impl LibraryManager {
         let fs = OxiFS::new(path);
 
         let tmp_path = fs.tempdir.path();
-        #[cfg(unix)]
+        #[cfg(target_os = "macos")]
+        let library_path = tmp_path.join("mod.dylib");
+        #[cfg(all(unix, not(target_os = "macos")))]
         let library_path = tmp_path.join("mod.so");
         #[cfg(windows)]
         let library_path = tmp_path.join("mod.dll");
@@ -141,8 +139,9 @@ impl LibraryManager {
         };
 
         // Version compatibility check
-        if metadata.api_version != crate::GIT_VERSION
-            || metadata.rustc_version != crate::RUSTC_VERSION
+        if std::env::var_os("GE_STRICT_MODS").is_some()
+            && (metadata.api_version != crate::GIT_VERSION
+                || metadata.rustc_version != crate::RUSTC_VERSION)
         {
             let err = format!(
                 "Version mismatch - Module API: {}, Engine API: {}, Module Rustc: {}, Engine Rustc: {}",
