@@ -17,13 +17,16 @@ druid = { git = "https://github.com/GrandEngineering/druid.git" }
 enginelib = { path = "../enginelib" }
 # libloading = "0.8.6"
 prost = "0.14"
+rand = "0.8.5"
 serde = { workspace = true }
 # serde = "1.0.219"
 tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros"] }
+tokio-stream = { version = "0.1.17", features = ["net"] }
 toml = { workspace = true }
 # toml = "0.8.19"
 tonic = "0.14"
 tonic-prost = "0.14.5"
+tracing = "0.1.44"
 
 tonic-reflection = "0.14"
 [build-dependencies]

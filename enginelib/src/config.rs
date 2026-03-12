@@ -25,6 +25,16 @@ pub struct ConfigTomlServer {
     pub clean_tasks: u64,
     #[serde(default = "default_pagination_limit")]
     pub pagination_limit: u32,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    #[serde(default)]
+    pub advertise_addr: Option<String>,
+    #[serde(default)]
+    pub cluster_proxy_addr: Option<String>,
+    #[serde(default)]
+    pub cluster_token: Option<String>,
+    #[serde(default)]
+    pub node_tags: Option<Vec<String>>,
 }
 impl Default for ConfigTomlServer {
     fn default() -> Self {
@@ -33,6 +43,11 @@ impl Default for ConfigTomlServer {
             cgrpc_token: None,
             clean_tasks: 60,
             pagination_limit: u32::MAX,
+            node_id: None,
+            advertise_addr: None,
+            cluster_proxy_addr: None,
+            cluster_token: None,
+            node_tags: None,
         }
     }
 }

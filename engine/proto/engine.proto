@@ -10,6 +10,13 @@ service Engine {
   rpc GetTasks(TaskPageRequest) returns (TaskPage);
   rpc CheckAuth(empty) returns (empty);
 }
+
+// Cluster membership and discovery service, used between backend nodes and a proxy.
+service Cluster {
+  rpc RegisterNode(NodeRegisterRequest) returns (NodeRegisterResponse);
+  rpc Heartbeat(NodeHeartbeat) returns (NodeHeartbeatAck);
+  rpc ListNodes(empty) returns (NodeList);
+}
 message TaskSelector {
   TaskState state = 1;
   string namespace = 2;
@@ -57,4 +64,39 @@ message Task {
   bytes task_payload = 1;
   string task_id = 2; // namespace:task
   bytes payload = 3;
+}
+
+message NodeRegisterRequest {
+  string node_id = 1;
+  string advertise_addr = 2;        // e.g. "http://10.0.0.12:50051"
+  repeated string tags = 3;         // e.g. ["gpu", "control"]
+  repeated string tasks = 4;        // ["ns:task", ...] from local task registry
+}
+
+message NodeRegisterResponse {
+  string session_id = 1;
+  uint64 heartbeat_interval_seconds = 2; // default 5
+  uint64 ttl_seconds = 3;               // default 15
+}
+
+message NodeHeartbeat {
+  string node_id = 1;
+  string session_id = 2;
+}
+
+message NodeHeartbeatAck {
+  uint64 server_time_unix = 1;
+}
+
+message NodeInfo {
+  string node_id = 1;
+  string advertise_addr = 2;
+  repeated string tags = 3;
+  repeated string tasks = 4;
+  uint64 last_seen_unix = 5;
+  bool healthy = 6;
+}
+
+message NodeList {
+  repeated NodeInfo nodes = 1;
 }
