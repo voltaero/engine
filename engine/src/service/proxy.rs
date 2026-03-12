@@ -9,6 +9,7 @@ use crate::{
     proto::{self, cluster_server::Cluster, engine_client::EngineClient, engine_server::Engine},
     routing::{NodeState, ProxyState, now_unix},
     service::backend::parse_owner_node,
+    task_id::parse_task_key_string,
 };
 use rand::{seq::SliceRandom, thread_rng};
 use tokio::{task::JoinHandle, time::sleep};
@@ -56,20 +57,6 @@ fn require_cluster_auth<T>(request: &Request<T>, cluster_token: &str) -> Result<
         return Err(Status::permission_denied("Invalid cluster authorization"));
     }
     Ok(())
-}
-
-fn parse_task_key(task_id: &str) -> Result<String, Status> {
-    let Some((namespace, task)) = task_id.split_once(':') else {
-        return Err(Status::invalid_argument(
-            "Invalid task ID format, expected 'namespace:task'",
-        ));
-    };
-    if namespace.is_empty() || task.is_empty() {
-        return Err(Status::invalid_argument(
-            "Invalid task ID format, expected 'namespace:task'",
-        ));
-    }
-    Ok(format!("{namespace}:{task}"))
 }
 
 fn build_request<T: Clone>(request: &Request<T>, message: T) -> Request<T> {
@@ -236,7 +223,7 @@ impl Engine for ProxyService {
         &self,
         request: Request<proto::TaskRequest>,
     ) -> Result<Response<proto::Task>, Status> {
-        let task_key = parse_task_key(&request.get_ref().task_id)?;
+        let task_key = parse_task_key_string(&request.get_ref().task_id)?;
         let mut candidates = self.state.candidate_nodes_for_task(&task_key).await;
         if candidates.is_empty() {
             return Err(unavailable());
@@ -281,7 +268,7 @@ impl Engine for ProxyService {
         &self,
         request: Request<proto::Task>,
     ) -> Result<Response<proto::Empty>, Status> {
-        let task_key = parse_task_key(&request.get_ref().task_id)?;
+        let task_key = parse_task_key_string(&request.get_ref().task_id)?;
         if let Some((owner_node, _)) = parse_owner_node(&request.get_ref().id) {
             if let Some(node) = self.state.node_by_id(owner_node).await {
                 return forward_publish(node, &request).await;
@@ -315,7 +302,7 @@ impl Engine for ProxyService {
         &self,
         request: Request<proto::Task>,
     ) -> Result<Response<proto::Task>, Status> {
-        let task_key = parse_task_key(&request.get_ref().task_id)?;
+        let task_key = parse_task_key_string(&request.get_ref().task_id)?;
         let candidates = self.state.candidate_nodes_for_task(&task_key).await;
         let Some(node) = select_create_candidate(candidates) else {
             return Err(unavailable());

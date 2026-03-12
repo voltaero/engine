@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use enginelib::api::EngineAPI;
 use tokio::{task::JoinHandle, time::sleep};
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, transport::Endpoint};
 use tracing::{error, info, warn};
 
@@ -83,9 +84,15 @@ pub fn normalize_advertise_addr(
     }
 }
 
-pub fn spawn_registration(registration: NodeRegistration) -> JoinHandle<()> {
+pub fn spawn_registration(
+    registration: NodeRegistration,
+    shutdown: CancellationToken,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
+            if shutdown.is_cancelled() {
+                return;
+            }
             match ClusterClient::connect(registration.cluster_proxy_addr.clone()).await {
                 Ok(mut client) => {
                     let register_response = match register_node(&mut client, &registration).await {
@@ -95,7 +102,10 @@ pub fn spawn_registration(registration: NodeRegistration) -> JoinHandle<()> {
                                 "cluster registration failed for {}: {}",
                                 registration.node_id, err
                             );
-                            sleep(Duration::from_secs(1)).await;
+                            tokio::select! {
+                                _ = shutdown.cancelled() => return,
+                                _ = sleep(Duration::from_secs(1)) => {}
+                            }
                             continue;
                         }
                     };
@@ -109,7 +119,10 @@ pub fn spawn_registration(registration: NodeRegistration) -> JoinHandle<()> {
                     let interval_seconds = register_response.heartbeat_interval_seconds.max(1);
 
                     loop {
-                        sleep(Duration::from_secs(interval_seconds)).await;
+                        tokio::select! {
+                            _ = shutdown.cancelled() => return,
+                            _ = sleep(Duration::from_secs(interval_seconds)) => {}
+                        }
                         match heartbeat(&mut client, &registration, &session_id).await {
                             Ok(_) => {}
                             Err(err) => {
@@ -127,7 +140,10 @@ pub fn spawn_registration(registration: NodeRegistration) -> JoinHandle<()> {
                         "failed to connect backend node {} to cluster proxy {}: {}",
                         registration.node_id, registration.cluster_proxy_addr, err
                     );
-                    sleep(Duration::from_secs(1)).await;
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = sleep(Duration::from_secs(1)) => {}
+                    }
                 }
             }
         }

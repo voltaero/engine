@@ -153,20 +153,20 @@ impl EngineAPI {
 
         static INIT: OnceLock<()> = OnceLock::new();
         INIT.get_or_init(|| {
-        #[cfg(debug_assertions)]
+            #[cfg(debug_assertions)]
             let _ = tracing_subscriber::FmtSubscriber::builder()
-            // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
-            // will be written to stdout.
-            .with_max_level(Level::DEBUG)
-            // builds the subscriber.
-            .try_init();
-        #[cfg(not(debug_assertions))]
+                // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
+                // will be written to stdout.
+                .with_max_level(Level::DEBUG)
+                // builds the subscriber.
+                .try_init();
+            #[cfg(not(debug_assertions))]
             let _ = tracing_subscriber::FmtSubscriber::builder()
-            // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
-            // will be written to stdout.
-            .with_max_level(Level::INFO)
-            // builds the subscriber.
-            .try_init();
+                // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
+                // will be written to stdout.
+                .with_max_level(Level::INFO)
+                // builds the subscriber.
+                .try_init();
         });
     }
 }

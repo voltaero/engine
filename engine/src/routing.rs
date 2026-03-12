@@ -119,7 +119,7 @@ pub struct ProxyState {
 
 impl ProxyState {
     pub fn new(config: ProxyConfigToml) -> Result<Self, String> {
-        let mut rules = if config.rules.is_empty() {
+        let rules = if config.rules.is_empty() {
             vec![RouteRule::from_toml(RouteRuleToml {
                 r#match: "*:*".into(),
                 require_tags: Vec::new(),
@@ -131,13 +131,6 @@ impl ProxyState {
             }
             rules
         };
-
-        if rules.is_empty() {
-            rules.push(RouteRule::from_toml(RouteRuleToml {
-                r#match: "*:*".into(),
-                require_tags: Vec::new(),
-            })?);
-        }
 
         Ok(Self {
             config,

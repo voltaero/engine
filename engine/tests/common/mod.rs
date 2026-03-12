@@ -25,6 +25,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 use tokio_stream::wrappers::TcpListenerStream;
+use tokio_util::sync::CancellationToken;
 use tonic::{Request, transport::Server};
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
@@ -71,6 +72,7 @@ pub struct TestBackend {
     pub api: Arc<RwLock<EngineAPI>>,
     shutdown: Option<oneshot::Sender<()>>,
     server_task: JoinHandle<Result<(), tonic::transport::Error>>,
+    registration_shutdown: Option<CancellationToken>,
     registration_task: Option<JoinHandle<()>>,
 }
 
@@ -79,8 +81,11 @@ impl TestBackend {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
+        if let Some(shutdown) = self.registration_shutdown.take() {
+            shutdown.cancel();
+        }
         if let Some(task) = self.registration_task.take() {
-            task.abort();
+            let _ = task.await;
         }
         let _ = self.server_task.await;
     }
@@ -169,12 +174,6 @@ pub async fn spawn_backend(
     register_task(&mut api, "node", node_id);
 
     let api = Arc::new(RwLock::new(api));
-    let registration_task = {
-        let api_guard = api.read().await;
-        registration_from_api(&api_guard)?
-    }
-    .map(spawn_registration);
-
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let engine_service = BackendEngineService::new(api.clone());
     let server_task = tokio::spawn(async move {
@@ -186,12 +185,20 @@ pub async fn spawn_backend(
             .await
     });
 
+    let registration_shutdown = CancellationToken::new();
+    let registration_task = {
+        let api_guard = api.read().await;
+        registration_from_api(&api_guard)?
+    }
+    .map(|registration| spawn_registration(registration, registration_shutdown.clone()));
+
     wait_for_node(proxy_addr, node_id).await?;
 
     Ok(TestBackend {
         api,
         shutdown: Some(shutdown_tx),
         server_task,
+        registration_shutdown: Some(registration_shutdown),
         registration_task,
     })
 }
@@ -244,8 +251,20 @@ pub fn cluster_request<T>(message: T) -> Result<Request<T>, BoxError> {
 pub async fn wait_for_node(proxy_addr: &str, node_id: &str) -> Result<(), BoxError> {
     timeout(Duration::from_secs(5), async move {
         loop {
-            let mut client = cluster_client(proxy_addr).await?;
-            let response = client.list_nodes(cluster_request(proto::Empty {})?).await?;
+            let mut client = match cluster_client(proxy_addr).await {
+                Ok(client) => client,
+                Err(_) => {
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+            let response = match client.list_nodes(cluster_request(proto::Empty {})?).await {
+                Ok(response) => response,
+                Err(_) => {
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
             if response
                 .get_ref()
                 .nodes
@@ -264,8 +283,20 @@ pub async fn wait_for_node(proxy_addr: &str, node_id: &str) -> Result<(), BoxErr
 pub async fn wait_for_node_count(proxy_addr: &str, expected: usize) -> Result<(), BoxError> {
     timeout(Duration::from_secs(5), async move {
         loop {
-            let mut client = cluster_client(proxy_addr).await?;
-            let response = client.list_nodes(cluster_request(proto::Empty {})?).await?;
+            let mut client = match cluster_client(proxy_addr).await {
+                Ok(client) => client,
+                Err(_) => {
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+            let response = match client.list_nodes(cluster_request(proto::Empty {})?).await {
+                Ok(response) => response,
+                Err(_) => {
+                    sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
             if response.get_ref().nodes.len() == expected {
                 return Ok::<(), BoxError>(());
             }

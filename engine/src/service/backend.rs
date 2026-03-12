@@ -5,7 +5,7 @@ use std::{
 
 use enginelib::api::postcard;
 use enginelib::{
-    Identifier, RawIdentier, Registry,
+    RawIdentier, Registry,
     api::EngineAPI,
     chrono::Utc,
     events::{Events, ID},
@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 use crate::{
     get_auth, get_uid,
     proto::{self, TaskState, engine_server::Engine},
+    task_id::parse_task_key,
 };
 
 #[allow(non_snake_case)]
@@ -45,22 +46,6 @@ pub fn parse_owner_node(task_instance_id: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((node_id, local_id))
-}
-
-fn parse_task_key(task_id: &str) -> Result<Identifier, Status> {
-    let Some((namespace, task)) = task_id.split_once(':') else {
-        return Err(Status::invalid_argument(
-            "Invalid task ID format, expected 'namespace:task'",
-        ));
-    };
-
-    if namespace.is_empty() || task.is_empty() {
-        return Err(Status::invalid_argument(
-            "Invalid task ID format, expected 'namespace:task'",
-        ));
-    }
-
-    Ok(ID(namespace, task))
 }
 
 fn delete_task_from_collection<T, F>(
@@ -444,7 +429,7 @@ impl Engine for BackendEngineService {
         let instance_id = task.id.clone();
 
         if !Events::CheckAuth(&mut api, uid.clone(), challenge, db) {
-            info!("Aquire Task denied due to Invalid Auth");
+            info!("Publish Task denied due to Invalid Auth");
             return Err(Status::permission_denied("Invalid authentication"));
         }
         if !api.task_registry.tasks.contains_key(&key) {

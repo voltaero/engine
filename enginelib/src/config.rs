@@ -1,4 +1,4 @@
-use std::{fs, io::Error, u32};
+use std::{fmt, fs, io::Error, u32};
 
 use serde::{Deserialize, Serialize};
 use tracing::{error, instrument};
@@ -15,7 +15,7 @@ fn default_pagination_limit() -> u32 {
     u32::MAX
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ConfigTomlServer {
     #[serde(default)]
     pub cgrpc_token: Option<String>, // Administrator Token, used to invoke cgrpc reqs. If not preset will default to no protection.
@@ -36,6 +36,29 @@ pub struct ConfigTomlServer {
     #[serde(default)]
     pub node_tags: Option<Vec<String>>,
 }
+
+impl fmt::Debug for ConfigTomlServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfigTomlServer")
+            .field(
+                "cgrpc_token",
+                &self.cgrpc_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("host", &self.host)
+            .field("clean_tasks", &self.clean_tasks)
+            .field("pagination_limit", &self.pagination_limit)
+            .field("node_id", &self.node_id)
+            .field("advertise_addr", &self.advertise_addr)
+            .field("cluster_proxy_addr", &self.cluster_proxy_addr)
+            .field(
+                "cluster_token",
+                &self.cluster_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("node_tags", &self.node_tags)
+            .finish()
+    }
+}
+
 impl Default for ConfigTomlServer {
     fn default() -> Self {
         Self {

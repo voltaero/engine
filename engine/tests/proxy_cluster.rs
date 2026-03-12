@@ -249,13 +249,15 @@ async fn aquire_task_reg_returns_union_of_registered_tasks() -> Result<(), BoxEr
     let backend_b = spawn_backend("node-b", &["gpu"], &proxy.addr).await?;
 
     let mut client = engine_client(&proxy.addr).await?;
-    let response = client
+    let mut tasks = client
         .aquire_task_reg(worker_request(proto::Empty {})?)
         .await?
-        .into_inner();
+        .into_inner()
+        .tasks;
+    tasks.sort();
 
     assert_eq!(
-        response.tasks,
+        tasks,
         vec![
             "dist:work".to_string(),
             "ml:train".to_string(),

@@ -47,11 +47,13 @@ pub fn module(_attr: TokenStream, item: TokenStream) -> TokenStream {
             env!("CARGO_PKG_NAME"),
         );),
     );
+    item_fn.block.stmts.insert(
+        0,
+        parse_quote!(::enginelib::api::EngineAPI::setup_logger();),
+    );
     item_fn
-        .block
-        .stmts
-        .insert(0, parse_quote!(::enginelib::api::EngineAPI::setup_logger();));
-    item_fn.attrs.push(parse_quote!(#[unsafe(export_name="run")]));
+        .attrs
+        .push(parse_quote!(#[unsafe(export_name="run")]));
 
     quote!(#item_fn).into()
 }
@@ -181,7 +183,10 @@ impl Parse for EventHandlerArgs {
         }
 
         let namespace = namespace.ok_or_else(|| {
-            syn::Error::new(proc_macro2::Span::call_site(), "missing `namespace = \"...\"`")
+            syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "missing `namespace = \"...\"`",
+            )
         })?;
         let name = name.ok_or_else(|| {
             syn::Error::new(proc_macro2::Span::call_site(), "missing `name = \"...\"`")

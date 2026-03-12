@@ -22,7 +22,12 @@ impl Events {
         auth_event::AuthEvent::check(api, uid, challenge, db)
     }
 
-    pub fn CheckAdminAuth(api: &mut EngineAPI, payload: String, target: Identifier, db: Db) -> bool {
+    pub fn CheckAdminAuth(
+        api: &mut EngineAPI,
+        payload: String,
+        target: Identifier,
+        db: Db,
+    ) -> bool {
         admin_auth_event::AdminAuthEvent::check(api, payload, target, db)
     }
 

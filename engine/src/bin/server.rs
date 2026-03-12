@@ -10,6 +10,7 @@ use std::{
 };
 use tokio::{net::TcpListener, sync::RwLock};
 use tokio_stream::wrappers::TcpListenerStream;
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 
 #[tokio::main]
@@ -35,7 +36,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let api_guard = api.read().await;
         registration_from_api(&api_guard)?
     };
-    let _registration_task = registration.map(spawn_registration);
+    let _registration_shutdown = CancellationToken::new();
+    let _registration_task = registration
+        .map(|registration| spawn_registration(registration, _registration_shutdown.clone()));
 
     EngineAPI::init_chron(api.clone());
     let engine = BackendEngineService::new(api);

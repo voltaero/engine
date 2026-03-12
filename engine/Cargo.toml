@@ -22,6 +22,7 @@ serde = { workspace = true }
 # serde = "1.0.219"
 tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros"] }
 tokio-stream = { version = "0.1.17", features = ["net"] }
+tokio-util = "0.7.17"
 toml = { workspace = true }
 # toml = "0.8.19"
 tonic = "0.14"

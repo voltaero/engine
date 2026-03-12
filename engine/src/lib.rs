@@ -8,6 +8,7 @@ pub mod proto;
 pub mod proxy_config;
 pub mod routing;
 pub mod service;
+pub mod task_id;
 
 pub fn get_uid<T>(req: &Request<T>) -> String {
     req.metadata()
