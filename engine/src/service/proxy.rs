@@ -8,8 +8,7 @@ use crate::{
     copy_metadata, get_auth,
     proto::{self, cluster_server::Cluster, engine_client::EngineClient, engine_server::Engine},
     routing::{NodeState, ProxyState, now_unix},
-    service::backend::parse_owner_node,
-    task_id::parse_task_key_string,
+    task_id::{parse_owner_node, parse_task_key_string},
 };
 use rand::{seq::SliceRandom, thread_rng};
 use tokio::{task::JoinHandle, time::sleep};

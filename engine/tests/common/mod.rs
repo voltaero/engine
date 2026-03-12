@@ -1,14 +1,14 @@
 use std::{error::Error, sync::Arc, time::Duration};
 
+#[path = "../../src/bin/server.rs"]
+mod server_bin;
+
 use engine::{
     cluster_client::{registration_from_api, spawn_registration},
     proto::{self, cluster_client::ClusterClient, engine_client::EngineClient},
     proxy_config::{ProxyConfigToml, RouteRuleToml},
     routing::ProxyState,
-    service::{
-        backend::BackendEngineService,
-        proxy::{ProxyService, spawn_reaper},
-    },
+    service::proxy::{ProxyService, spawn_reaper},
 };
 use enginelib::{
     Registry,
@@ -175,7 +175,7 @@ pub async fn spawn_backend(
 
     let api = Arc::new(RwLock::new(api));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let engine_service = BackendEngineService::new(api.clone());
+    let engine_service = server_bin::BackendEngineService::new(api.clone());
     let server_task = tokio::spawn(async move {
         Server::builder()
             .add_service(proto::engine_server::EngineServer::new(engine_service))
