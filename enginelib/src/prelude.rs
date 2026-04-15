@@ -1,11 +1,24 @@
 pub use std::sync::Arc;
 
-pub use crate::Identifier;
+pub use macros;
+pub use macros::{Event, Verifiable, event_handler, metadata, module};
+pub use tracing::{debug, error, info, instrument, warn};
+
 pub use crate::api::EngineAPI;
-pub use crate::event::{self, Event, EventBus, EventCTX, EventHandler, debug, error, info, warn};
+pub use crate::config::Config;
+pub use crate::event::{
+    Event, EventBus, EventCTX, EventHandler, EventRegistrar, register_inventory_handlers,
+    register_inventory_handlers_for_origin,
+};
 pub use crate::events::{Events, ID};
 pub use crate::plugin::{LibraryDependency, LibraryMetadata};
 pub use crate::task::{Runner, Task, Verifiable};
+pub use crate::{Identifier, RawIdentifier, Registry};
 
-pub use macros;
-pub use tracing::instrument;
+pub use crate::events::admin_auth_event::AdminAuthEvent;
+pub use crate::events::auth_event::AuthEvent;
+pub use crate::events::cgrpc_event::CgrpcEvent;
+pub use crate::events::start_event::StartEvent;
+
+pub use crate::chrono;
+pub use crate::inventory;
