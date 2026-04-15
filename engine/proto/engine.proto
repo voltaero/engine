@@ -9,6 +9,17 @@ service Engine {
   rpc DeleteTask(TaskSelector) returns (empty);
   rpc GetTasks(TaskPageRequest) returns (TaskPage);
   rpc CheckAuth(empty) returns (empty);
+  rpc GetMetadata(empty) returns (ServerMetadata);
+}
+message ServerMetadata {
+  string engine_api = 1;
+  repeated ModuleInfo mods = 2;
+}
+message ModuleInfo {
+  string mod_id = 1;
+  string api_version = 2;
+  string rustc_version = 3;
+  string mod_version = 4;
 }
 message TaskSelector {
   TaskState state = 1;

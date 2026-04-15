@@ -1,5 +1,6 @@
 use engine::{get_auth, get_uid};
 use enginelib::api::postcard;
+use enginelib::plugin::LibraryMetadata;
 use enginelib::{
     Identifier, RawIdentifier, Registry,
     api::EngineAPI,
@@ -23,6 +24,8 @@ use std::{
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status, metadata::MetadataValue, transport::Server};
 
+use crate::proto::ModuleInfo;
+
 mod proto {
     tonic::include_proto!("engine");
     pub(crate) const FILE_DESCRIPTOR_SET: &[u8] =
@@ -34,6 +37,33 @@ struct EngineService {
 }
 #[tonic::async_trait]
 impl Engine for EngineService {
+    async fn get_metadata(
+        &self,
+        request: tonic::Request<proto::Empty>,
+    ) -> Result<Response<proto::ServerMetadata>, Status> {
+        let api = self.EngineAPI.read().await;
+
+        let modules: Vec<ModuleInfo> = api
+            .lib_manager
+            .libraries
+            .values()
+            .map(|lib| lib.metadata.clone())
+            // vec<arc<librareymetadata>> --> vec<ModuleInfo>
+            .map(|f| ModuleInfo {
+                mod_id: f.mod_id.clone(),
+                api_version: f.api_version.clone(),
+                rustc_version: f.rustc_version.clone(),
+                mod_version: f.mod_version.clone(),
+            })
+            .collect();
+
+        let res = proto::ServerMetadata {
+            engine_api: enginelib::GIT_VERSION.to_string(),
+            mods: modules,
+        };
+        return Ok(Response::new(res));
+    }
+
     async fn check_auth(
         &self,
         request: tonic::Request<proto::Empty>,
