@@ -5,9 +5,12 @@ A blazingly fast distrubted computing framework made with Rust and Tonic.
 Volt Engine provides an API with an event system and tasks allowing for great adaptability. To create a mod dev env use rustforge our own tool that manages it all for you.
 
 ## License & Use
-[GE](https://github.com/GrandEngineering) reserve all rights and [GE](https://github.com/GrandEngineering) also reserves the rights to restrain individuals abilities to use this software and its code. The points below outline what you can, cannot and must do when dealing with the
-contents of this repository and its submodules. Licenses for commercial use can only be granted by [GE](https://github.com/GrandEngineering).
-For better understading checkout [LICENSE](https://github.com/GrandEngineering/engine/blob/main/LICENSE.md)
+This project is availible under **dual licensing**:
+
+1. **AGPL-3.0** (open-source license for non-commercial use) - see [`LICENSE.md`](./LICENSE.md) 
+2. **Commercial License** — for organizations that want to use this software commercially
+
+In general:
 ### You CAN
 * Write your own code that uses this code as a dependency.
 * Submit Pull Requests to this repository.
@@ -16,9 +19,9 @@ For better understading checkout [LICENSE](https://github.com/GrandEngineering/e
 
 ### You CANNOT
 * Claim this software as your own.
-* Use this SOFTWARE commercially/for profit without a License given by [GE](https://github.com/GrandEngineering)
-* Share this software without express permission from [GE](https://github.com/GrandEngineering) in the form of a License.
-* Distribute modifications of this software without giving credit to [GE](https://github.com/GrandEngineering)
+* Use this SOFTWARE commercially/for profit without a License given by [GE](https://github.com/VoltAero)
+* Share this software without express permission from [GE](https://github.com/VoltAero) in the form of a License.
+* Distribute modifications of this software without giving credit to [GE](https://github.com/VoltAero)
 * Use this software in a way that damages other humans.
 
 ### Disclaimer
