@@ -565,7 +565,7 @@ dependencies = [
 [[package]]
 name = "druid"
 version = "0.1.0"
-source = "git+https://github.com/GrandEngineering/druid.git#55a7565a6bc6d5dae4281d5233c86a94ae3290ea"
+source = "git+https://github.com/GrandEngineering/druid.git#dc2e5dcab0568079ffb4bad9a58e489c51c7fbad"
 dependencies = [
  "rand",
  "uuid",
