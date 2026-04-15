@@ -1,12 +1,8 @@
-# GE Engine [![Rust](https://github.com/GrandEngineering/engine/actions/workflows/rust.yml/badge.svg)](https://github.com/GrandEngineering/engine/actions/workflows/rust.yml)
-A blazingly fast distrubted computing project made with Rust and Tonic.
+# Volt Engine [![Rust](https://github.com/VoltAero/engine/actions/workflows/rust.yml/badge.svg)](https://github.com/GrandEngineering/engine/actions/workflows/rust.yml)
+A blazingly fast distrubted computing framework made with Rust and Tonic.
 
 ## Modding
-GE Engine provides an API with an event system and tasks allowing for great moddability. To create a mod dev env use rustforge our own tool that manages it all for you.
-
-## Todo
-- [ ] switch to wasm
-- [ ] linking with inventory
+Volt Engine provides an API with an event system and tasks allowing for great adaptability. To create a mod dev env use rustforge our own tool that manages it all for you.
 
 ## License & Use
 [GE](https://github.com/GrandEngineering) reserve all rights and [GE](https://github.com/GrandEngineering) also reserves the rights to restrain individuals abilities to use this software and its code. The points below outline what you can, cannot and must do when dealing with the
