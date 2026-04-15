@@ -9,7 +9,7 @@ pub mod plugin;
 pub mod prelude;
 pub mod task;
 pub type Identifier = (String, String);
-pub type RawIdentier = String;
+pub type RawIdentifier = String;
 pub const GIT_VERSION: &str = env!("CARGO_PKG_VERSION"); //get commit hash
 pub const RUSTC_VERSION: &str = env!("VERGEN_RUSTC_SEMVER");
 pub trait Registry<T: ?Sized>: Default + Clone {

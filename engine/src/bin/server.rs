@@ -1,7 +1,7 @@
 use engine::{get_auth, get_uid};
 use enginelib::api::postcard;
 use enginelib::{
-    Identifier, RawIdentier, Registry,
+    Identifier, RawIdentifier, Registry,
     api::EngineAPI,
     chrono::Utc,
     event::{debug, info, warn},
@@ -372,7 +372,7 @@ impl Engine for EngineService {
             );
             return Err(Status::permission_denied("Invalid authentication"));
         };
-        let mut tasks: Vec<RawIdentier> = Vec::new();
+        let mut tasks: Vec<RawIdentifier> = Vec::new();
         for (k, v) in &api.task_registry.tasks {
             let js: Vec<String> = vec![k.0.clone(), k.1.clone()];
             let jstr = js.join(":");
