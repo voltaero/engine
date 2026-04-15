@@ -25,6 +25,7 @@ pub struct LibraryMetadata {
     pub mod_dependencies: Vec<LibraryDependency>,
     pub mod_display_url: String,
     pub mod_issue_tracker: String,
+    pub mod_server: bool,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LibraryDependency {
@@ -47,6 +48,7 @@ impl Default for LibraryMetadata {
             mod_dependencies: Vec::new(),
             mod_display_url: String::new(),
             mod_issue_tracker: String::new(),
+            mod_server: false,
         }
     }
 }

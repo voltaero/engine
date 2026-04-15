@@ -48,6 +48,8 @@ impl Engine for EngineService {
             .libraries
             .values()
             .map(|lib| lib.metadata.clone())
+            //Dont show server mods
+            .filter(|lib| !lib.mod_server)
             // vec<arc<librareymetadata>> --> vec<ModuleInfo>
             .map(|f| ModuleInfo {
                 mod_id: f.mod_id.clone(),

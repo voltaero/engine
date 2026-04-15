@@ -22,6 +22,7 @@ pub struct EngineAPI {
     pub event_bus: EventBus,
     pub db: sled::Db,
     pub lib_manager: LibraryManager,
+    pub client: bool,
 }
 
 impl Default for EngineAPI {
@@ -39,6 +40,7 @@ impl Default for EngineAPI {
             },
             solved_tasks: SolvedTasks::default(),
             executing_tasks: ExecutingTaskQueue::default(),
+            client: false,
         }
     }
 }
@@ -57,6 +59,7 @@ impl EngineAPI {
         ));
 
         Self {
+            client: false,
             cfg: Config::new(),
             task_queue: TaskQueue::default(),
             db: sled::Config::new()
@@ -89,6 +92,15 @@ impl EngineAPI {
             api.solved_tasks.tasks.entry(id.clone()).or_default();
         }
 
+        Self::init_events(api);
+    }
+
+    pub fn init_client(api: &mut Self) {
+        api.client = true;
+        Self::setup_logger();
+        let mut new_lib_manager = LibraryManager::default();
+        new_lib_manager.load_modules(api);
+        api.lib_manager = new_lib_manager;
         Self::init_events(api);
     }
     fn init_events(api: &mut Self) {
@@ -153,20 +165,20 @@ impl EngineAPI {
 
         static INIT: OnceLock<()> = OnceLock::new();
         INIT.get_or_init(|| {
-        #[cfg(debug_assertions)]
+            #[cfg(debug_assertions)]
             let _ = tracing_subscriber::FmtSubscriber::builder()
-            // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
-            // will be written to stdout.
-            .with_max_level(Level::DEBUG)
-            // builds the subscriber.
-            .try_init();
-        #[cfg(not(debug_assertions))]
+                // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
+                // will be written to stdout.
+                .with_max_level(Level::DEBUG)
+                // builds the subscriber.
+                .try_init();
+            #[cfg(not(debug_assertions))]
             let _ = tracing_subscriber::FmtSubscriber::builder()
-            // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
-            // will be written to stdout.
-            .with_max_level(Level::INFO)
-            // builds the subscriber.
-            .try_init();
+                // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
+                // will be written to stdout.
+                .with_max_level(Level::INFO)
+                // builds the subscriber.
+                .try_init();
         });
     }
 }
