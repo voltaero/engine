@@ -7,8 +7,8 @@ Volt Engine provides an API with an event system and tasks allowing for great ad
 ## License & Use
 This project is availible under **dual licensing**:
 
-1. **AGPL-3.0** (open-source license for non-commercial use) - see [`LICENSE.md`](./LICENSE.md) 
-2. **Commercial License** — for organizations that want to use this software commercially
+1. **AGPL-3.0** (open-source license) - see [`LICENSE.md`](./LICENSE.md)
+2. **Commercial License** — for organizations that want to use this software with different terms.
 
 In general:
 ### You CAN
