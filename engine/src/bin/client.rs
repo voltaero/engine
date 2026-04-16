@@ -15,7 +15,7 @@ pub mod proto {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let mut api = EngineAPI::default();
+    let mut api = EngineAPI::default_client();
     EngineAPI::init_client(&mut api);
     let url = "http://[::1]:50051";
     let mut client = engine_client::EngineClient::connect(url).await?;
@@ -39,7 +39,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .get(&x.mod_id)
             .expect("Client Missing Mod");
         assert!(module.metadata.mod_version == x.mod_version)
-        // Init CM(compute module)
     }
+    // Init CM(compute module)
+    let handler = tokio::spawn(async move { compute_module().await });
     Ok(())
+}
+// Compute Module
+// Responsible for getting task, executing and publishing it.
+async fn compute_module() {
+    panic!("Oh no!")
 }

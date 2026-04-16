@@ -45,6 +45,23 @@ impl Default for EngineAPI {
     }
 }
 impl EngineAPI {
+    pub fn default_client() -> Self {
+        Self {
+            cfg: Config::default(),
+            task_queue: TaskQueue::default(),
+            db: sled::open("engine_client_db").unwrap(),
+            lib_manager: LibraryManager::default(),
+            task_registry: EngineTaskRegistry::default(),
+            event_bus: EventBus {
+                event_handler_registry: EngineEventHandlerRegistry {
+                    event_handlers: HashMap::new(),
+                },
+            },
+            solved_tasks: SolvedTasks::default(),
+            executing_tasks: ExecutingTaskQueue::default(),
+            client: true,
+        }
+    }
     pub fn test_default() -> Self {
         // `sled::Config::temporary(true)` defaults to `/dev/shm` on Linux when no path is set.
         // Some environments deny writes there, so force a unique temp path.
