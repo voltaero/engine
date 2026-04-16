@@ -96,7 +96,7 @@ async fn main() {
         eprintln!("Generating completion file for {generator:?}...");
         print_completions(generator, &mut cmd);
     }
-    let mut api = EngineAPI::default();
+    let mut api = EngineAPI::default_client();
     EngineAPI::init_packer(&mut api);
     for (id, tsk) in api.task_registry.tasks.iter() {
         api.task_queue.tasks.entry(id.clone()).or_default();
