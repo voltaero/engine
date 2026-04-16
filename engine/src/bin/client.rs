@@ -6,8 +6,8 @@ use enginelib::{
     prelude::debug,
 };
 use proto::engine_client;
-use std::error::Error;
-use tonic::Request;
+use std::{error::Error, sync::Arc};
+use tonic::{Request, Status, transport::Endpoint};
 
 pub mod proto {
     tonic::include_proto!("engine");
@@ -30,14 +30,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 }
+#[derive(Clone)]
+struct Ctx {
+    token: Vec<Identifier>,
+}
+
 // Compute Module
 // Verifies server and also is
 // Responsible for getting task, executing and publishing it.
 async fn compute_module() {
+    let ctx = Arc::new(Ctx { token: Vec::new() });
+    let interceptor = move |mut req: Request<()>| {
+        // access ctx here
+
+        Ok(req)
+    };
     let mut api = EngineAPI::default_client();
     EngineAPI::init_client(&mut api);
     let url = "http://[::1]:50051";
-    let mut client = engine_client::EngineClient::connect(url).await.unwrap();
+    let channel = Endpoint::from_static(url).connect().await.unwrap();
+    let mut client = engine_client::EngineClient::with_interceptor(channel, interceptor);
 
     // Get server metadata
     let server_meta = client
