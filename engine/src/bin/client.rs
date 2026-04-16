@@ -15,9 +15,13 @@ pub mod proto {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let mut api = EngineAPI::default_client();
+    EngineAPI::init_client(&mut api);
+    let mut api_arc = Arc::new(api);
     // Init CM(compute module)
     loop {
-        let handler = tokio::spawn(async move { compute_module().await });
+        let api_inst = api_arc.clone();
+        let handler = tokio::spawn(async move { compute_module(api_inst).await });
         match handler.await {
             Ok(_) => println!("Task finished normally"),
             Err(e) => {
@@ -38,15 +42,14 @@ struct Ctx {
 // Compute Module
 // Verifies server and also is
 // Responsible for getting task, executing and publishing it.
-async fn compute_module() {
+async fn compute_module(api: Arc<EngineAPI>) {
     let ctx = Arc::new(Ctx { token: Vec::new() });
     let interceptor = move |mut req: Request<()>| {
         // access ctx here
 
         Ok(req)
     };
-    let mut api = EngineAPI::default_client();
-    EngineAPI::init_client(&mut api);
+
     let url = "http://[::1]:50051";
     let channel = Endpoint::from_static(url).connect().await.unwrap();
     let mut client = engine_client::EngineClient::with_interceptor(channel, interceptor);
