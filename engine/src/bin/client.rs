@@ -1,13 +1,13 @@
 use enginelib::{
+    Identifier, Registry,
     api::EngineAPI,
     event::{error, info},
     plugin::LibraryInstance,
+    prelude::debug,
 };
 use proto::engine_client;
-use tonic::Request;
-//use enginelib::EventHandler;
-
 use std::error::Error;
+use tonic::Request;
 
 pub mod proto {
     tonic::include_proto!("engine");
@@ -15,15 +15,35 @@ pub mod proto {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // Init CM(compute module)
+    loop {
+        let handler = tokio::spawn(async move { compute_module().await });
+        match handler.await {
+            Ok(_) => println!("Task finished normally"),
+            Err(e) => {
+                if e.is_panic() {
+                    println!("Task panicked, but main is still alive");
+                } else {
+                    println!("Task failed: {:?}", e);
+                }
+            }
+        }
+    }
+}
+// Compute Module
+// Verifies server and also is
+// Responsible for getting task, executing and publishing it.
+async fn compute_module() {
     let mut api = EngineAPI::default_client();
     EngineAPI::init_client(&mut api);
     let url = "http://[::1]:50051";
-    let mut client = engine_client::EngineClient::connect(url).await?;
+    let mut client = engine_client::EngineClient::connect(url).await.unwrap();
 
     // Get server metadata
     let server_meta = client
         .get_metadata(Request::new(proto::Empty {}))
-        .await?
+        .await
+        .unwrap()
         .get_mut()
         .clone();
     // validate server
@@ -40,12 +60,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .expect("Client Missing Mod");
         assert!(module.metadata.mod_version == x.mod_version)
     }
-    // Init CM(compute module)
-    let handler = tokio::spawn(async move { compute_module().await });
-    Ok(())
-}
-// Compute Module
-// Responsible for getting task, executing and publishing it.
-async fn compute_module() {
-    panic!("Oh no!")
+    let mut task_reg = client
+        .aquire_task_reg(Request::new(proto::Empty {}))
+        .await
+        .unwrap();
+
+    loop {
+        for x in task_reg.get_mut().clone().tasks.clone() {
+            debug!("Aquring Task {}", x);
+            let mut task_req = client
+                .aquire_task(Request::new(proto::TaskRequest { task_id: x.clone() }))
+                .await
+                .unwrap();
+            let task_payload = task_req.get_mut();
+            let identifier = x.split_once(":").unwrap();
+            let task = api
+                .task_registry
+                .get(&(identifier.0.to_string(), identifier.1.to_string()))
+                .unwrap();
+            let mut task = task.from_bytes(&task_payload.task_payload);
+            info!("Running Task {}", x.clone());
+            task.run_hip();
+            let solv_task = proto::Task {
+                id: task_payload.id.clone(),
+                payload: Vec::new(),
+                task_id: x.clone(),
+                task_payload: task.to_bytes(),
+            };
+            info!("Publishing Task {}", x);
+            client.publish_task(Request::new(solv_task)).await.unwrap();
+        }
+    }
 }

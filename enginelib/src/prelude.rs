@@ -10,15 +10,15 @@ pub use crate::event::{
     Event, EventBus, EventCTX, EventHandler, EventRegistrar, register_inventory_handlers,
     register_inventory_handlers_for_origin,
 };
-pub use crate::events::{Events, ID};
-pub use crate::plugin::{LibraryDependency, LibraryMetadata};
-pub use crate::task::{Runner, Task, Verifiable};
-pub use crate::{Identifier, RawIdentifier, Registry};
-
 pub use crate::events::admin_auth_event::AdminAuthEvent;
 pub use crate::events::auth_event::AuthEvent;
 pub use crate::events::cgrpc_event::CgrpcEvent;
 pub use crate::events::start_event::StartEvent;
+pub use crate::events::{Events, ID};
+pub use crate::plugin::{LibraryDependency, LibraryMetadata};
+pub use crate::task::{Runner, Task, Verifiable};
+pub use crate::{Identifier, RawIdentifier, Registry};
+pub use tracing;
 
 pub use crate::chrono;
 pub use crate::inventory;
