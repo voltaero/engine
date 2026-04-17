@@ -1,7 +1,14 @@
 pub mod admin_auth_event;
 pub mod auth_event;
+pub mod before_task_acquire_event;
+pub mod before_task_execute_event;
+pub mod before_task_publish_event;
 pub mod cgrpc_event;
+pub mod client_auth_prepare_event;
+pub mod client_start_event;
 pub mod start_event;
+pub mod task_acquired_event;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use sled::Db;
@@ -37,5 +44,44 @@ impl Events {
 
     pub fn StartEvent(api: &mut EngineAPI) {
         start_event::StartEvent::fire(api)
+    }
+
+    pub fn ClientStart(api: &EngineAPI) {
+        client_start_event::ClientStartEvent::fire(api)
+    }
+
+    pub fn ClientAuthPrepare(api: &EngineAPI, headers: Arc<RwLock<HashMap<String, String>>>) {
+        client_auth_prepare_event::ClientAuthPrepareEvent::fire(api, headers)
+    }
+
+    pub fn BeforeTaskAcquire(api: &EngineAPI, task_id: String) -> bool {
+        before_task_acquire_event::BeforeTaskAcquireEvent::check(api, task_id)
+    }
+
+    pub fn TaskAcquired(
+        api: &EngineAPI,
+        task_id: String,
+        instance_id: String,
+        payload: Arc<RwLock<Vec<u8>>>,
+    ) {
+        task_acquired_event::TaskAcquiredEvent::fire(api, task_id, instance_id, payload)
+    }
+
+    pub fn BeforeTaskExecute(
+        api: &EngineAPI,
+        task_id: String,
+        instance_id: String,
+        payload: Arc<RwLock<Vec<u8>>>,
+    ) -> bool {
+        before_task_execute_event::BeforeTaskExecuteEvent::check(api, task_id, instance_id, payload)
+    }
+
+    pub fn BeforeTaskPublish(
+        api: &EngineAPI,
+        task_id: String,
+        instance_id: String,
+        payload: Arc<RwLock<Vec<u8>>>,
+    ) -> bool {
+        before_task_publish_event::BeforeTaskPublishEvent::check(api, task_id, instance_id, payload)
     }
 }
