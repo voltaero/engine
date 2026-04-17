@@ -19,8 +19,8 @@ Workspace members:
 4. `enginelib/src/event.rs`
 5. `enginelib/src/plugin.rs`
 6. `engine/proto/engine.proto`
-
-For deeper indexing details, see `AGENT_INDEX.md`.
+7. `rfc/rfc1003.md` (client event hooks)
+8. `rfc/rfc1004.md` (server event hooks)
 
 ## Build/test commands
 
@@ -36,6 +36,8 @@ For deeper indexing details, see `AGENT_INDEX.md`.
 - Engine state is centralized in `enginelib::api::EngineAPI`.
 - Persistent queues are sled-backed (`engine_db` / `engine_client_db`).
 - Core event system is in `enginelib/src/event.rs`; core events in `enginelib/src/events/*`.
+- Client modding hooks (RFC1003) are wired in `engine/src/bin/client.rs`.
+- Server lifecycle hooks (RFC1004 Tier 1) are wired in `engine/src/bin/server.rs`.
 - Mods are loaded from `./mods/*.rf` by `enginelib/src/plugin.rs`.
 
 ## Data/persistence model (important)
@@ -85,6 +87,9 @@ Do not assume secure defaults without verifying handlers/mods.
 - Runtime dispatch: `enginelib/src/event.rs`
 - Macro generation: `enginelib/macros/src/lib.rs`
 - Core event wrappers: `enginelib/src/events/*.rs`
+- Check RFC scope first:
+  - Client hooks: `rfc/rfc1003.md`
+  - Server hooks: `rfc/rfc1004.md`
 
 ### Mod loading issue
 - Inspect `enginelib/src/plugin.rs`
@@ -105,3 +110,4 @@ Report any warnings/errors that indicate risk (panic paths, serialization, auth 
 - Existing code has several warnings and `unwrap()` calls in runtime paths.
 - Prefer minimal, targeted edits.
 - Preserve current external behavior unless task explicitly requests behavior change.
+- For server/client modding work, keep cancellation semantics explicit (`Status::aborted` default for cancellable lifecycle hooks unless endpoint policy says otherwise).
