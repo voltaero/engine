@@ -460,6 +460,14 @@ impl Engine for EngineService {
             );
             return Err(Status::invalid_argument("Task Does not Exist"));
         }
+        if Events::ServerBeforeTaskAcquire(&api, uid.clone(), task_id.clone()) {
+            info!(
+                "ServerBeforeTaskAcquire cancelled for user: {} task: {}",
+                uid, task_id
+            );
+            return Err(Status::aborted("Task acquire cancelled by server event handler"));
+        }
+
         let key = ID(namespace, task_name);
         let mut map = match api.task_queue.tasks.get(&key) {
             Some(v) if !v.is_empty() => v.clone(),
@@ -507,11 +515,12 @@ impl Engine for EngineService {
             }
         }
         let response = proto::Task {
-            id: ttask.id,
+            id: ttask.id.clone(),
             task_id: input.task_id.clone(),
             task_payload,
             payload: Vec::new(),
         };
+        Events::ServerTaskAcquired(&api, uid, input.task_id.clone(), ttask.id.clone());
         Ok(tonic::Response::new(response))
     }
     async fn publish_task(
@@ -524,6 +533,25 @@ impl Engine for EngineService {
         let db = api.db.clone();
 
         let task_id = request.get_ref().task_id.clone();
+        let payload_for_event = Arc::new(std::sync::RwLock::new(request.get_ref().task_payload.clone()));
+        if Events::ServerBeforeTaskPublish(
+            &api,
+            uid.clone(),
+            task_id.clone(),
+            request.get_ref().id.clone(),
+            payload_for_event.clone(),
+        ) {
+            info!(
+                "ServerBeforeTaskPublish cancelled for user: {} task: {}",
+                uid, task_id
+            );
+            return Err(Status::aborted("Task publish cancelled by server event handler"));
+        }
+        let publish_payload = payload_for_event
+            .read()
+            .map(|p| p.clone())
+            .map_err(|_| Status::internal("Task publish payload lock poisoned"))?;
+
         let alen = &task_id.split(":").collect::<Vec<&str>>().len();
         if *alen != 2 {
             return Err(Status::invalid_argument("Invalid Params"));
@@ -564,7 +592,7 @@ impl Engine for EngineService {
                     return Err(Status::invalid_argument("Task Does not Exist"));
                 }
             };
-            if !reg_tsk.verify(request.get_ref().task_payload.clone()) {
+            if !reg_tsk.verify(publish_payload.clone()) {
                 info!("Failed to parse task");
                 return Err(Status::invalid_argument("Failed to parse given task bytes"));
             }
@@ -591,7 +619,7 @@ impl Engine for EngineService {
                 .cloned()
                 .unwrap_or_default();
             mem_solv.push(enginelib::task::StoredTask {
-                bytes: tsk.bytes.clone(),
+                bytes: publish_payload.clone(),
                 id: tsk.id.clone(),
             });
             api.solved_tasks.tasks.insert(key.clone(), mem_solv);
@@ -605,6 +633,7 @@ impl Engine for EngineService {
                 Err(e) => return Err(Status::internal(format!("Serialization error: {}", e))),
             }
             info!("Task published successfully: {} by user: {}", task_id, uid);
+            Events::ServerTaskPublished(&api, uid.clone(), task_id.clone(), tsk.id.clone());
             return Ok(tonic::Response::new(proto::Empty {}));
         } else {
             return Err(tonic::Status::not_found("Invalid taskid or userid"));
@@ -625,6 +654,16 @@ impl Engine for EngineService {
         };
         let task = request.get_ref();
         let task_id = task.task_id.clone();
+        let payload_for_event = Arc::new(std::sync::RwLock::new(task.task_payload.clone()));
+        if Events::ServerBeforeTaskCreate(&api, task_id.clone(), payload_for_event.clone()) {
+            info!("ServerBeforeTaskCreate cancelled for task: {}", task_id);
+            return Err(Status::aborted("Task create cancelled by server event handler"));
+        }
+        let task_payload = payload_for_event
+            .read()
+            .map(|p| p.clone())
+            .map_err(|_| Status::internal("Task create payload lock poisoned"))?;
+
         let parts: Vec<&str> = task_id.splitn(2, ':').collect();
         if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
             return Err(Status::invalid_argument(
@@ -634,12 +673,12 @@ impl Engine for EngineService {
         let id: Identifier = (parts[0].to_string(), parts[1].to_string());
         let tsk_reg = api.task_registry.get(&id);
         if let Some(tsk_reg) = tsk_reg {
-            if !tsk_reg.clone().verify(task.task_payload.clone()) {
+            if !tsk_reg.clone().verify(task_payload.clone()) {
                 warn!("Failed to parse given task bytes");
                 return Err(Status::invalid_argument("Failed to parse given task bytes"));
             }
             let tbp_tsk = StoredTask {
-                bytes: task.task_payload.clone(),
+                bytes: task_payload.clone(),
                 id: druid::Druid::default().to_hex(),
             };
             let mut mem_tsks = api.task_queue.clone();
@@ -655,6 +694,12 @@ impl Engine for EngineService {
                 }
                 Err(e) => return Err(Status::internal(format!("Serialization error: {}", e))),
             }
+            Events::ServerTaskCreated(
+                &api,
+                task_id.clone(),
+                tbp_tsk.id.clone(),
+                Arc::new(std::sync::RwLock::new(tbp_tsk.bytes.clone())),
+            );
             return Ok(tonic::Response::new(proto::Task {
                 id: tbp_tsk.id.clone(),
                 task_id: task_id.clone(),
@@ -672,6 +717,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     EngineAPI::init(&mut api);
     Events::init_auth(&mut api);
     Events::StartEvent(&mut api);
+    Events::ServerStart(&api);
     let addr = api
         .cfg
         .config_toml
