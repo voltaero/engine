@@ -465,7 +465,9 @@ impl Engine for EngineService {
                 "ServerBeforeTaskAcquire cancelled for user: {} task: {}",
                 uid, task_id
             );
-            return Err(Status::aborted("Task acquire cancelled by server event handler"));
+            return Err(Status::aborted(
+                "Task acquire cancelled by server event handler",
+            ));
         }
 
         let key = ID(namespace, task_name);
@@ -533,7 +535,10 @@ impl Engine for EngineService {
         let db = api.db.clone();
 
         let task_id = request.get_ref().task_id.clone();
-        let payload_for_event = Arc::new(std::sync::RwLock::new(request.get_ref().task_payload.clone()));
+        let instance_id = request.get_ref().id.clone();
+        let payload_for_event = Arc::new(std::sync::RwLock::new(
+            request.get_ref().task_payload.clone(),
+        ));
         if Events::ServerBeforeTaskPublish(
             &api,
             uid.clone(),
@@ -545,7 +550,9 @@ impl Engine for EngineService {
                 "ServerBeforeTaskPublish cancelled for user: {} task: {}",
                 uid, task_id
             );
-            return Err(Status::aborted("Task publish cancelled by server event handler"));
+            return Err(Status::aborted(
+                "Task publish cancelled by server event handler",
+            ));
         }
         let publish_payload = payload_for_event
             .read()
@@ -583,7 +590,7 @@ impl Engine for EngineService {
             .unwrap_or_default();
         let tsk_opt = mem_tsk
             .iter()
-            .find(|f| f.id == task_id.clone() && f.user_id == uid.clone());
+            .find(|f| f.id == instance_id && f.user_id == uid.clone());
         if let Some(tsk) = tsk_opt {
             let reg_tsk = match api.task_registry.get(&key) {
                 Some(r) => r.clone(),
@@ -598,7 +605,7 @@ impl Engine for EngineService {
             }
             // Exec Tasks -> DB
             let mut nmem_tsk = mem_tsk.clone();
-            nmem_tsk.retain(|f| f.id != task_id.clone() && f.user_id != uid.clone());
+            nmem_tsk.retain(|f| !(f.id == instance_id && f.user_id == uid.clone()));
             api.executing_tasks
                 .tasks
                 .insert(key.clone(), nmem_tsk.clone());
@@ -657,7 +664,9 @@ impl Engine for EngineService {
         let payload_for_event = Arc::new(std::sync::RwLock::new(task.task_payload.clone()));
         if Events::ServerBeforeTaskCreate(&api, task_id.clone(), payload_for_event.clone()) {
             info!("ServerBeforeTaskCreate cancelled for task: {}", task_id);
-            return Err(Status::aborted("Task create cancelled by server event handler"));
+            return Err(Status::aborted(
+                "Task create cancelled by server event handler",
+            ));
         }
         let task_payload = payload_for_event
             .read()
