@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Write;
-use std::io::{self, Read};
+use std::io::{self, BufReader, ErrorKind, Read};
 use std::path::PathBuf;
 use toml::Value;
 use tonic::{
@@ -86,6 +86,8 @@ enum Commands {
     #[command()]
     AdminCheck,
     #[command()]
+    AdminList(ListArgs),
+    #[command()]
     AdminExport(ExportArgs),
     #[command()]
     AdminDelete(DeleteArgs),
@@ -97,6 +99,8 @@ enum Commands {
 struct PackArgs {
     #[arg(short, required = true, value_hint = ValueHint::FilePath)]
     input: PathBuf,
+    #[arg(long)]
+    stream: bool,
 }
 
 #[derive(Clone, Debug, ValueEnum, PartialEq)]
@@ -114,6 +118,26 @@ impl StateArg {
             StateArg::Solved => proto::TaskState::Solved as i32,
         }
     }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            StateArg::Queued => "queued",
+            StateArg::Processing => "processing",
+            StateArg::Solved => "solved",
+        }
+    }
+}
+
+#[derive(Args, Debug, PartialEq)]
+struct ListArgs {
+    #[arg(long)]
+    task_id: Option<String>, // namespace:task
+    #[arg(long, value_enum, default_value = "queued")]
+    state: StateArg,
+    #[arg(long)]
+    all_states: bool,
+    #[arg(long, default_value_t = 1000)]
+    page_size: u32,
 }
 
 #[derive(Args, Debug, PartialEq)]
@@ -162,6 +186,163 @@ fn build_headers(api: &EngineAPI, admin: bool) -> HashMap<String, String> {
     }
 
     prepared_headers
+}
+
+const CHUNKED_MAGIC: [u8; 4] = *b"RFPK";
+const CHUNKED_VERSION: u8 = 2;
+const FRAME_TASK: u8 = 1;
+const FRAME_END: u8 = 255;
+
+#[derive(Debug)]
+struct ChunkedTaskRecord {
+    namespace: String,
+    task: String,
+    id: String,
+    payload: Vec<u8>,
+}
+
+fn write_chunked_header<W: Write>(writer: &mut W) -> io::Result<()> {
+    writer.write_all(&CHUNKED_MAGIC)?;
+    writer.write_all(&[CHUNKED_VERSION])?;
+    Ok(())
+}
+
+fn write_chunked_task_record<W: Write>(
+    writer: &mut W,
+    record: &ChunkedTaskRecord,
+) -> io::Result<()> {
+    let ns = record.namespace.as_bytes();
+    let task = record.task.as_bytes();
+    let id = record.id.as_bytes();
+
+    let ns_len: u16 = ns
+        .len()
+        .try_into()
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "namespace too large"))?;
+    let task_len: u16 = task
+        .len()
+        .try_into()
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "task too large"))?;
+    let id_len: u32 = id
+        .len()
+        .try_into()
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "id too large"))?;
+    let payload_len: u64 = record
+        .payload
+        .len()
+        .try_into()
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "payload too large"))?;
+
+    let mut meta = [0u8; 1 + 2 + 2 + 4 + 8];
+    meta[0] = FRAME_TASK;
+    meta[1..3].copy_from_slice(&ns_len.to_le_bytes());
+    meta[3..5].copy_from_slice(&task_len.to_le_bytes());
+    meta[5..9].copy_from_slice(&id_len.to_le_bytes());
+    meta[9..17].copy_from_slice(&payload_len.to_le_bytes());
+
+    writer.write_all(&meta)?;
+    writer.write_all(ns)?;
+    writer.write_all(task)?;
+    writer.write_all(id)?;
+    writer.write_all(&record.payload)?;
+
+    Ok(())
+}
+
+fn write_chunked_end<W: Write>(writer: &mut W) -> io::Result<()> {
+    writer.write_all(&[FRAME_END])?;
+    Ok(())
+}
+
+fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<bool> {
+    match reader.read_exact(buf) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn read_chunked_header<R: Read>(reader: &mut R) -> io::Result<()> {
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic)?;
+    if magic != CHUNKED_MAGIC {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid chunked magic",
+        ));
+    }
+
+    let mut version = [0u8; 1];
+    reader.read_exact(&mut version)?;
+    if version[0] != CHUNKED_VERSION {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("unsupported chunked version {}", version[0]),
+        ));
+    }
+
+    Ok(())
+}
+
+fn read_chunked_next<R: Read>(reader: &mut R) -> io::Result<Option<ChunkedTaskRecord>> {
+    let mut frame = [0u8; 1];
+    if !read_exact_or_eof(reader, &mut frame)? {
+        return Ok(None);
+    }
+
+    match frame[0] {
+        FRAME_END => Ok(None),
+        FRAME_TASK => {
+            let mut ns_len = [0u8; 2];
+            let mut task_len = [0u8; 2];
+            let mut id_len = [0u8; 4];
+            let mut payload_len = [0u8; 8];
+            reader.read_exact(&mut ns_len)?;
+            reader.read_exact(&mut task_len)?;
+            reader.read_exact(&mut id_len)?;
+            reader.read_exact(&mut payload_len)?;
+
+            let ns_len = u16::from_le_bytes(ns_len) as usize;
+            let task_len = u16::from_le_bytes(task_len) as usize;
+            let id_len = u32::from_le_bytes(id_len) as usize;
+            let payload_len_u64 = u64::from_le_bytes(payload_len);
+            if payload_len_u64 > usize::MAX as u64 {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "payload length too large for this platform",
+                ));
+            }
+            let payload_len = payload_len_u64 as usize;
+
+            let mut ns = vec![0u8; ns_len];
+            let mut task = vec![0u8; task_len];
+            let mut id = vec![0u8; id_len];
+            let mut payload = vec![0u8; payload_len];
+
+            reader.read_exact(&mut ns)?;
+            reader.read_exact(&mut task)?;
+            reader.read_exact(&mut id)?;
+            reader.read_exact(&mut payload)?;
+
+            let namespace = String::from_utf8(ns)
+                .map_err(|_| io::Error::new(ErrorKind::InvalidData, "invalid namespace utf8"))?;
+            let task = String::from_utf8(task)
+                .map_err(|_| io::Error::new(ErrorKind::InvalidData, "invalid task utf8"))?;
+            let id = String::from_utf8(id)
+                .map_err(|_| io::Error::new(ErrorKind::InvalidData, "invalid id utf8"))?;
+
+            Ok(Some(ChunkedTaskRecord {
+                namespace,
+                task,
+                id,
+                payload,
+            }))
+        }
+        other => Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("unknown frame type {}", other),
+        )),
+    }
 }
 
 #[tokio::main]
@@ -289,29 +470,11 @@ async fn main() {
                     return;
                 }
 
-                info!("Uploading File: {}", input.input.to_string_lossy());
-
-                let mut buf = Vec::new();
-                match File::open(&input.input) {
-                    Ok(mut f) => {
-                        if let Err(e) = f.read_to_end(&mut buf) {
-                            error!("Failed to read input file {}: {}", input.input.display(), e);
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to open input file {}: {}", input.input.display(), e);
-                        return;
-                    }
-                }
-
-                let queue: TaskQueue = match postcard::from_bytes::<TaskQueue>(&buf) {
-                    Ok(q) => q,
-                    Err(e) => {
-                        error!("Failed to deserialize task queue: {}", e);
-                        return;
-                    }
-                };
+                info!(
+                    "Uploading File: {}{}",
+                    input.input.to_string_lossy(),
+                    if input.stream { " (stream mode)" } else { "" }
+                );
 
                 let prepared_headers = build_headers(&api, false);
 
@@ -342,19 +505,47 @@ async fn main() {
                     }
                 };
 
-                let mut client = proto::engine_client::EngineClient::with_interceptor(channel, interceptor);
+                let mut client =
+                    proto::engine_client::EngineClient::with_interceptor(channel, interceptor);
 
                 let mut uploaded = 0usize;
                 let mut failed = 0usize;
-                for ((namespace, task), tasks) in queue.tasks {
-                    let task_id = format!("{}:{}", namespace, task);
-                    for stored in tasks {
+
+                if input.stream {
+                    let file = match File::open(&input.input) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            error!("Failed to open input file {}: {}", input.input.display(), e);
+                            return;
+                        }
+                    };
+                    let mut reader = BufReader::new(file);
+                    if let Err(e) = read_chunked_header(&mut reader) {
+                        error!("Failed to read chunked stream header: {}", e);
+                        return;
+                    }
+
+                    loop {
+                        let record = match read_chunked_next(&mut reader) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                error!("Failed to read chunked stream record: {}", e);
+                                return;
+                            }
+                        };
+
+                        let Some(record) = record else {
+                            break;
+                        };
+
+                        let task_id = format!("{}:{}", record.namespace, record.task);
                         let req = proto::Task {
-                            id: stored.id,
+                            id: record.id,
                             task_id: task_id.clone(),
-                            task_payload: stored.bytes,
+                            task_payload: record.payload,
                             payload: Vec::new(),
                         };
+
                         match client.create_task(Request::new(req)).await {
                             Ok(_) => uploaded += 1,
                             Err(e) => {
@@ -363,11 +554,58 @@ async fn main() {
                             }
                         }
                     }
+                } else {
+                    let mut buf = Vec::new();
+                    match File::open(&input.input) {
+                        Ok(mut f) => {
+                            if let Err(e) = f.read_to_end(&mut buf) {
+                                error!(
+                                    "Failed to read input file {}: {}",
+                                    input.input.display(),
+                                    e
+                                );
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to open input file {}: {}", input.input.display(), e);
+                            return;
+                        }
+                    }
+
+                    let queue: TaskQueue = match postcard::from_bytes::<TaskQueue>(&buf) {
+                        Ok(q) => q,
+                        Err(e) => {
+                            error!("Failed to deserialize task queue: {}", e);
+                            return;
+                        }
+                    };
+
+                    for ((namespace, task), tasks) in queue.tasks {
+                        let task_id = format!("{}:{}", namespace, task);
+                        for stored in tasks {
+                            let req = proto::Task {
+                                id: stored.id,
+                                task_id: task_id.clone(),
+                                task_payload: stored.bytes,
+                                payload: Vec::new(),
+                            };
+                            match client.create_task(Request::new(req)).await {
+                                Ok(_) => uploaded += 1,
+                                Err(e) => {
+                                    failed += 1;
+                                    error!("Failed to upload task {}: {}", task_id, e);
+                                }
+                            }
+                        }
+                    }
                 }
 
                 info!(
-                    "Upload complete. uploaded={}, failed={}",
-                    uploaded, failed
+                    "Upload complete. uploaded={}, failed={}, mode={}",
+                    uploaded,
+                    failed,
+                    if input.stream { "stream" } else { "legacy" }
                 );
             }
             Commands::AdminCheck => {
@@ -405,6 +643,102 @@ async fn main() {
                     Ok(_) => info!("Admin auth check: OK"),
                     Err(e) => error!("Admin auth check failed: {}", e),
                 }
+            }
+            Commands::AdminList(args) => {
+                let prepared_headers = build_headers(&api, true);
+                let interceptor = move |mut req: Request<()>| {
+                    for (key, value) in prepared_headers.iter() {
+                        if let (Ok(key), Ok(value)) = (
+                            MetadataKey::from_bytes(key.as_bytes()),
+                            MetadataValue::try_from(value.as_str()),
+                        ) {
+                            req.metadata_mut().insert(key, value);
+                        }
+                    }
+                    Ok(req)
+                };
+
+                let endpoint = format!("http://{}", api.cfg.config_toml.host);
+                let channel = match Endpoint::from_shared(endpoint.clone()) {
+                    Ok(ep) => match ep.connect().await {
+                        Ok(ch) => ch,
+                        Err(e) => {
+                            error!("Failed to connect to server {}: {}", endpoint, e);
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        error!("Invalid server endpoint {}: {}", endpoint, e);
+                        return;
+                    }
+                };
+
+                let mut client =
+                    proto::engine_client::EngineClient::with_interceptor(channel, interceptor);
+
+                let task_ids: Vec<String> = if let Some(task_id) = args.task_id.clone() {
+                    vec![task_id]
+                } else {
+                    match client.aquire_task_reg(Request::new(proto::Empty {})).await {
+                        Ok(res) => res.into_inner().tasks,
+                        Err(e) => {
+                            error!("Failed to fetch task registry: {}", e);
+                            return;
+                        }
+                    }
+                };
+
+                let states: Vec<StateArg> = if args.all_states {
+                    vec![StateArg::Queued, StateArg::Processing, StateArg::Solved]
+                } else {
+                    vec![args.state.clone()]
+                };
+
+                let mut listed = 0usize;
+                println!("state\ttask\tid");
+                for task_id in task_ids {
+                    let Some((namespace, task)) = task_id.split_once(':') else {
+                        error!("Invalid task id '{}' (expected namespace:task)", task_id);
+                        continue;
+                    };
+
+                    for state in &states {
+                        let mut page = 0u64;
+                        loop {
+                            let req = proto::TaskPageRequest {
+                                namespace: namespace.to_string(),
+                                task: task.to_string(),
+                                page,
+                                page_size: args.page_size,
+                                state: state.to_proto(),
+                            };
+
+                            let resp = match client.get_tasks(Request::new(req)).await {
+                                Ok(r) => r.into_inner(),
+                                Err(e) => {
+                                    error!(
+                                        "GetTasks failed for {} state {:?}: {}",
+                                        task_id, state, e
+                                    );
+                                    break;
+                                }
+                            };
+
+                            if resp.tasks.is_empty() {
+                                break;
+                            }
+
+                            for t in resp.tasks {
+                                println!("{}\t{}:{}\t{}", state.as_str(), namespace, task, t.id);
+                                listed += 1;
+                            }
+
+                            page += 1;
+                        }
+                    }
+                }
+
+                info!("Listed {} task(s)", listed);
             }
             Commands::AdminExport(args) => {
                 let prepared_headers = build_headers(&api, true);
@@ -622,17 +956,53 @@ async fn main() {
                                             }
                                         }
                                     }
-                                    match postcard::to_allocvec(&api.task_queue) {
-                                        Ok(data) => match File::create("output.rustforge.bin") {
+                                    if input.stream {
+                                        match File::create("output.rustforge.bin") {
                                             Ok(mut file) => {
-                                                if let Err(e) = file.write_all(&data) {
+                                                if let Err(e) = write_chunked_header(&mut file) {
                                                     error!(
-                                                        "Failed to write output.rustforge.bin: {}",
+                                                        "Failed to write chunked output header: {}",
                                                         e
                                                     );
-                                                } else {
-                                                    info!("Wrote output.rustforge.bin");
+                                                    return;
                                                 }
+
+                                                let mut wrote = 0usize;
+                                                for ((namespace, task), tasks) in
+                                                    &api.task_queue.tasks
+                                                {
+                                                    for stored in tasks {
+                                                        let record = ChunkedTaskRecord {
+                                                            namespace: namespace.clone(),
+                                                            task: task.clone(),
+                                                            id: stored.id.clone(),
+                                                            payload: stored.bytes.clone(),
+                                                        };
+                                                        if let Err(e) = write_chunked_task_record(
+                                                            &mut file, &record,
+                                                        ) {
+                                                            error!(
+                                                                "Failed to write chunked output record: {}",
+                                                                e
+                                                            );
+                                                            return;
+                                                        }
+                                                        wrote += 1;
+                                                    }
+                                                }
+
+                                                if let Err(e) = write_chunked_end(&mut file) {
+                                                    error!(
+                                                        "Failed to finalize chunked output: {}",
+                                                        e
+                                                    );
+                                                    return;
+                                                }
+
+                                                info!(
+                                                    "Wrote output.rustforge.bin (chunked stream, {} task(s))",
+                                                    wrote
+                                                );
                                             }
                                             Err(e) => {
                                                 error!(
@@ -640,9 +1010,32 @@ async fn main() {
                                                     e
                                                 );
                                             }
-                                        },
-                                        Err(e) => {
-                                            error!("Failed to serialize task queue: {}", e);
+                                        }
+                                    } else {
+                                        match postcard::to_allocvec(&api.task_queue) {
+                                            Ok(data) => {
+                                                match File::create("output.rustforge.bin") {
+                                                    Ok(mut file) => {
+                                                        if let Err(e) = file.write_all(&data) {
+                                                            error!(
+                                                                "Failed to write output.rustforge.bin: {}",
+                                                                e
+                                                            );
+                                                        } else {
+                                                            info!("Wrote output.rustforge.bin");
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        error!(
+                                                            "Failed to create output.rustforge.bin: {}",
+                                                            e
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to serialize task queue: {}", e);
+                                            }
                                         }
                                     }
                                 }
