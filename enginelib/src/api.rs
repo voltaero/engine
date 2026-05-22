@@ -17,16 +17,17 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+
 pub struct ServerAPI {
-    pub cfg: Config,
-    pub task_queue: TaskQueue,
-    pub executing_tasks: ExecutingTaskQueue,
-    pub solved_tasks: SolvedTasks,
-    pub task_registry: EngineTaskRegistry,
-    pub event_bus: EventBus,
-    pub db: sled::Db,
-    pub lib_manager: LibraryManager,
-    pub client: bool,
+    pub cfg: RwLock<Config>,                 // RW
+    pub task_queue: TaskQueue,               // RW
+    pub executing_tasks: ExecutingTaskQueue, // RW
+    pub solved_tasks: SolvedTasks,           // RW
+    pub task_registry: EngineTaskRegistry,   // RW
+    pub event_bus: EventBus,                 // RW
+    pub db: sled::Db,                        // R
+    pub lib_manager: LibraryManager,         // RW
+    pub client: bool,                        // RW
 }
 
 impl Default for ServerAPI {
@@ -358,7 +359,7 @@ impl Registry<dyn Task> for EngineTaskRegistry {
     }
 }
 
-pub async fn clear_sled_periodically(api: Arc<ServerAPI>, n_minutes: u64) {
+pub async fn clear_sled_periodically(api: Arc<RwLock<ServerAPI>>, n_minutes: u64) {
     info!("Sled Cron Job Started");
     let mut interval = interval(Duration::from_secs(n_minutes * 60));
     loop {

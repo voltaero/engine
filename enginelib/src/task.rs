@@ -1,10 +1,9 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::{fmt::Debug, sync::Arc};
+use std::fmt::Debug;
 
-use crate::api::EngineAPI;
-use crate::{Identifier, Registry};
+use crate::Identifier;
 use chrono::{DateTime, Utc};
+use crossbeam::queue::ArrayQueue;
 use serde::{Deserialize, Serialize};
 use tracing::{error, instrument, warn};
 
@@ -20,9 +19,9 @@ pub struct StoredExecutingTask {
     pub user_id: String,
     pub given_at: DateTime<Utc>,
 }
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default)]
 pub struct TaskQueue {
-    pub tasks: HashMap<Identifier, Vec<StoredTask>>,
+    pub tasks: HashMap<Identifier, ArrayQueue<StoredTask>>,
 }
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SolvedTasks {
