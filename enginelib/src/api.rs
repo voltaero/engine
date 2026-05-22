@@ -82,6 +82,7 @@ impl ServerAPI {
         Self {
             client: false,
             cfg: Config::new(),
+            leased_tasks: LeasedTaskQueue::default(),
             task_queue: TaskQueue::default(),
             db: sled::Config::new()
                 .path(db_path)
@@ -96,8 +97,6 @@ impl ServerAPI {
                     event_handlers: HashMap::new(),
                 },
             },
-            solved_tasks: SolvedTasks::default(),
-            executing_tasks: ExecutingTaskQueue::default(),
         }
     }
     pub fn init(api: &mut Self) {
