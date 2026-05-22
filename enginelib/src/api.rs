@@ -144,116 +144,112 @@ impl ServerAPI {
         Some((namespace.to_string(), task.to_string()))
     }
 
-    pub fn apply_batch_entries(
-        db: &sled::Db,
-        entries: Vec<(&'static str, Vec<u8>)>,
-    ) -> sled::Result<()> {
-        let mut batch = sled::Batch::default();
-        for (key, value) in entries {
-            batch.insert(key, value);
-        }
-        db.apply_batch(batch)
-    }
+    // pub fn apply_batch_entries(
+    //     db: &sled::Db,
+    //     entries: Vec<(&'static str, Vec<u8>)>,
+    // ) -> sled::Result<()> {
+    //     let mut batch = sled::Batch::default();
+    //     for (key, value) in entries {
+    //         batch.insert(key, value);
+    //     }
+    //     db.apply_batch(batch)
+    // }
 
-    pub fn apply_batch_ops(
-        db: &sled::Db,
-        ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-    ) -> sled::Result<()> {
-        let mut batch = sled::Batch::default();
-        for (key, value) in ops {
-            match value {
-                Some(v) => batch.insert(key, v),
-                None => batch.remove(key),
-            }
-        }
-        db.apply_batch(batch)
-    }
+    // pub fn apply_batch_ops(
+    //     db: &sled::Db,
+    //     ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    // ) -> sled::Result<()> {
+    //     let mut batch = sled::Batch::default();
+    //     for (key, value) in ops {
+    //         match value {
+    //             Some(v) => batch.insert(key, v),
+    //             None => batch.remove(key),
+    //         }
+    //     }
+    //     db.apply_batch(batch)
+    // }
 
-    pub fn state_op_tasks(
-        id: &Identifier,
-        value: &Vec<StoredTask>,
-    ) -> Result<(Vec<u8>, Option<Vec<u8>>), postcard::Error> {
-        if value.is_empty() {
-            Ok((Self::state_key(Self::TASKS_PREFIX, id), None))
-        } else {
-            Ok((
-                Self::state_key(Self::TASKS_PREFIX, id),
-                Some(postcard::to_allocvec(value)?),
-            ))
-        }
-    }
+    // pub fn state_op_tasks(
+    //     id: &Identifier,
+    //     value: &Vec<StoredTask>,
+    // ) -> Result<(Vec<u8>, Option<Vec<u8>>), postcard::Error> {
+    //     if value.is_empty() {
+    //         Ok((Self::state_key(Self::TASKS_PREFIX, id), None))
+    //     } else {
+    //         Ok((
+    //             Self::state_key(Self::TASKS_PREFIX, id),
+    //             Some(postcard::to_allocvec(value)?),
+    //         ))
+    //     }
+    // }
 
-    pub fn state_op_executing(
-        id: &Identifier,
-        value: &Vec<StoredExecutingTask>,
-    ) -> Result<(Vec<u8>, Option<Vec<u8>>), postcard::Error> {
-        if value.is_empty() {
-            Ok((Self::state_key(Self::LEASING_PREFIX, id), None))
-        } else {
-            Ok((
-                Self::state_key(Self::LEASING_PREFIX, id),
-                Some(postcard::to_allocvec(value)?),
-            ))
-        }
-    }
+    // pub fn state_op_executing(
+    //     id: &Identifier,
+    //     value: &Vec<StoredExecutingTask>,
+    // ) -> Result<(Vec<u8>, Option<Vec<u8>>), postcard::Error> {
+    //     if value.is_empty() {
+    //         Ok((Self::state_key(Self::LEASING_PREFIX, id), None))
+    //     } else {
+    //         Ok((
+    //             Self::state_key(Self::LEASING_PREFIX, id),
+    //             Some(postcard::to_allocvec(value)?),
+    //         ))
+    //     }
+    // }
 
-    pub fn state_op_solved(
-        id: &Identifier,
-        value: &Vec<StoredTask>,
-    ) -> Result<(Vec<u8>, Option<Vec<u8>>), postcard::Error> {
-        if value.is_empty() {
-            Ok((Self::state_key(Self::SOLVED_PREFIX, id), None))
-        } else {
-            Ok((
-                Self::state_key(Self::SOLVED_PREFIX, id),
-                Some(postcard::to_allocvec(value)?),
-            ))
-        }
-    }
+    // pub fn state_op_solved(
+    //     id: &Identifier,
+    //     value: &Vec<StoredTask>,
+    // ) -> Result<(Vec<u8>, Option<Vec<u8>>), postcard::Error> {
+    //     if value.is_empty() {
+    //         Ok((Self::state_key(Self::SOLVED_PREFIX, id), None))
+    //     } else {
+    //         Ok((
+    //             Self::state_key(Self::SOLVED_PREFIX, id),
+    //             Some(postcard::to_allocvec(value)?),
+    //         ))
+    //     }
+    // }
 
-    pub fn sync_db(api: &mut ServerAPI) {
-        // IF THIS FN CAUSES PANIC SOMETHING IS VERY BROKEN
-        let mut ops: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+    // pub fn sync_db(api: &mut ServerAPI) {
+    //     // IF THIS FN CAUSES PANIC SOMETHING IS VERY BROKEN
+    //     let mut ops: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
 
-        for prefix in [
-            Self::TASKS_PREFIX,
-            Self::LEASING_PREFIX,
-            Self::SOLVED_PREFIX,
-        ] {
-            for item in api.db.scan_prefix(prefix.as_bytes()) {
-                if let Ok((key, _)) = item {
-                    ops.push((key.to_vec(), None));
-                }
-            }
-        }
+    //     for prefix in [
+    //         Self::TASKS_PREFIX,
+    //         Self::LEASING_PREFIX,
+    //         Self::SOLVED_PREFIX,
+    //     ] {
+    //         for item in api.db.scan_prefix(prefix.as_bytes()) {
+    //             if let Ok((key, _)) = item {
+    //                 ops.push((key.to_vec(), None));
+    //             }
+    //         }
+    //     }
 
-        for (id, tasks) in &api.task_queue.tasks {
-            ops.push(Self::state_op_tasks(id, tasks).unwrap());
-        }
-        for (id, tasks) in &api.executing_tasks.tasks {
-            ops.push(Self::state_op_executing(id, tasks).unwrap());
-        }
-        for (id, tasks) in &api.solved_tasks.tasks {
-            ops.push(Self::state_op_solved(id, tasks).unwrap());
-        }
+    //     for (id, tasks) in &api.task_queue.tasks {
+    //         ops.push(Self::state_op_tasks(id, tasks).unwrap());
+    //     }
+    //     for (id, tasks) in &api.executing_tasks.tasks {
+    //         ops.push(Self::state_op_executing(id, tasks).unwrap());
+    //     }
+    //     for (id, tasks) in &api.solved_tasks.tasks {
+    //         ops.push(Self::state_op_solved(id, tasks).unwrap());
+    //     }
 
-        Self::apply_batch_ops(&api.db, ops).unwrap();
-        debug!("Synced in-memory state to keyed sled storage");
-    }
+    //     Self::apply_batch_ops(&api.db, ops).unwrap();
+    //     debug!("Synced in-memory state to keyed sled storage");
+    // }
 
     fn init_db(api: &mut ServerAPI) {
         api.task_queue = TaskQueue::default();
-        api.executing_tasks = ExecutingTaskQueue::default();
-        api.solved_tasks = SolvedTasks::default();
-
-        let mut found_keyed_state = false;
+        api.leased_tasks = LeasedTaskQueue::default();
 
         for item in api.db.scan_prefix(Self::TASKS_PREFIX.as_bytes()) {
             if let Ok((key, value)) = item {
                 if let Some(id) = Self::parse_state_key(Self::TASKS_PREFIX, &key) {
-                    if let Ok(tasks) = postcard::from_bytes::<Vec<StoredTask>>(&value) {
+                    if let Ok(tasks) = postcard::from_bytes::<StoredTask>(&value) {
                         api.task_queue.tasks.insert(id, tasks);
-                        found_keyed_state = true;
                     }
                 }
             }
@@ -264,7 +260,6 @@ impl ServerAPI {
                 if let Some(id) = Self::parse_state_key(Self::LEASING_PREFIX, &key) {
                     if let Ok(tasks) = postcard::from_bytes::<Vec<StoredExecutingTask>>(&value) {
                         api.executing_tasks.tasks.insert(id, tasks);
-                        found_keyed_state = true;
                     }
                 }
             }
@@ -275,38 +270,10 @@ impl ServerAPI {
                 if let Some(id) = Self::parse_state_key(Self::SOLVED_PREFIX, &key) {
                     if let Ok(tasks) = postcard::from_bytes::<Vec<StoredTask>>(&value) {
                         api.solved_tasks.tasks.insert(id, tasks);
-                        found_keyed_state = true;
                     }
                 }
             }
         }
-
-        if found_keyed_state {
-            return;
-        }
-
-        // Legacy fallback migration path.
-        let tasks = api.db.get("tasks");
-        let exec_tasks = api.db.get("executing_tasks");
-        let solved_tasks = api.db.get("solved_tasks");
-
-        if let Ok(Some(store)) = tasks {
-            let res: TaskQueue = postcard::from_bytes(&store).unwrap();
-            api.task_queue = res;
-        }
-
-        if let Ok(Some(store)) = exec_tasks {
-            let res: ExecutingTaskQueue = postcard::from_bytes(&store).unwrap();
-            api.executing_tasks = res;
-        }
-
-        if let Ok(Some(store)) = solved_tasks {
-            let res: SolvedTasks = postcard::from_bytes(&store).unwrap();
-            api.solved_tasks = res;
-        }
-
-        // Migrate legacy snapshot into keyed storage.
-        Self::sync_db(api);
     }
 
     pub fn setup_logger() {
