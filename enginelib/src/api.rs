@@ -7,7 +7,10 @@ use crate::{
     config::Config,
     event::{EngineEventHandlerRegistry, EventBus},
     plugin::LibraryManager,
-    task::{ExecutingTaskQueue, SolvedTasks, StoredExecutingTask, StoredTask, Task, TaskQueue},
+    task::{
+        ExecutingTaskQueue, LeasedTaskQueue, LeasedTasks, SolvedTasks, StoredExecutingTask,
+        StoredTask, Task, TaskQueue,
+    },
 };
 pub use postcard;
 pub use postcard::from_bytes;
@@ -21,7 +24,7 @@ use std::{
 pub struct ServerAPI {
     pub cfg: RwLock<Config>,               // RW
     pub task_queue: TaskQueue,             // RW
-    pub leased_tasks: ExecutingTaskQueue,  // RW
+    pub leased_tasks: LeasedTaskQueue,     // RW
     pub solved_tasks: SolvedTasks,         // RW
     pub task_registry: EngineTaskRegistry, // RW
     pub event_bus: EventBus,               // RW
@@ -33,7 +36,7 @@ pub struct ServerAPI {
 impl Default for ServerAPI {
     fn default() -> Self {
         Self {
-            cfg: Config::default(),
+            cfg: RwLock::new(Config::default()),
             task_queue: TaskQueue::default(),
             db: sled::open("engine_db").unwrap(),
             lib_manager: LibraryManager::default(),
@@ -44,7 +47,7 @@ impl Default for ServerAPI {
                 },
             },
             solved_tasks: SolvedTasks::default(),
-            executing_tasks: ExecutingTaskQueue::default(),
+            leased_tasks: LeasedTaskQueue::default(),
             client: false,
         }
     }
