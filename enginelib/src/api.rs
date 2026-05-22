@@ -1,4 +1,5 @@
 use chrono::Utc;
+use crossbeam::queue::ArrayQueue;
 use tokio::{spawn, sync::RwLock, time::interval};
 use tracing::{Level, debug, error, info, instrument};
 
@@ -109,7 +110,12 @@ impl ServerAPI {
         new_lib_manager.load_modules(api);
         api.lib_manager = new_lib_manager;
         for (id, _tsk) in api.task_registry.tasks.iter() {
-            api.task_queue.tasks.entry(id.clone()).or_default();
+            api.task_queue
+                .tasks
+                .entry(id.clone())
+                .insert_entry(ArrayQueue::new(
+                    api.cfg.config_toml.task_block_size as usize,
+                ));
             api.leased_tasks.tasks.entry(id.clone()).or_default();
             api.solved_tasks.tasks.entry(id.clone()).or_default();
         }
@@ -117,14 +123,6 @@ impl ServerAPI {
         Self::init_events(api);
     }
 
-    pub fn init_client(api: &mut Self) {
-        api.client = true;
-        Self::setup_logger();
-        let mut new_lib_manager = LibraryManager::default();
-        new_lib_manager.load_modules(api);
-        api.lib_manager = new_lib_manager;
-        Self::init_events(api);
-    }
     fn init_events(api: &mut Self) {
         crate::event::register_inventory_handlers(api);
     }
