@@ -10,7 +10,9 @@ fn default_host() -> String {
 fn default_clean_tasks() -> u64 {
     60
 }
-
+fn default_task_block_size() -> u32 {
+    256
+}
 fn default_pagination_limit() -> u32 {
     u32::MAX
 }
@@ -25,14 +27,17 @@ pub struct ConfigTomlServer {
     pub clean_tasks: u64,
     #[serde(default = "default_pagination_limit")]
     pub pagination_limit: u32,
+    #[serde(default = "default_task_block_size")]
+    pub task_block_size: u32,
 }
 impl Default for ConfigTomlServer {
     fn default() -> Self {
         Self {
-            host: "[::1]:50051".into(),
             cgrpc_token: None,
-            clean_tasks: 60,
-            pagination_limit: u32::MAX,
+            host: default_host(),
+            clean_tasks: default_clean_tasks(),
+            pagination_limit: default_pagination_limit(),
+            task_block_size: default_task_block_size(),
         }
     }
 }
