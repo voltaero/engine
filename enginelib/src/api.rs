@@ -114,7 +114,6 @@ impl ServerAPI {
                     api.cfg.config_toml.task_block_size as usize,
                 ));
             api.leased_tasks.tasks.entry(id.clone()).or_default();
-            api.solved_tasks.tasks.entry(id.clone()).or_default();
         }
 
         Self::init_events(api);
@@ -248,7 +247,7 @@ impl ServerAPI {
             if let Ok((key, value)) = item {
                 if let Some(id) = Self::parse_state_key(Self::TASKS_PREFIX, &key) {
                     if let Ok(tasks) = postcard::from_bytes::<StoredTask>(&value) {
-                        api.task_queue.tasks.insert(id, tasks);
+                        api.task_queue.tasks.get(&id).unwrap().push(Arc::new(tasks));
                     }
                 }
             }
