@@ -19,15 +19,15 @@ use std::{
 };
 
 pub struct ServerAPI {
-    pub cfg: RwLock<Config>,                 // RW
-    pub task_queue: TaskQueue,               // RW
-    pub executing_tasks: ExecutingTaskQueue, // RW
-    pub solved_tasks: SolvedTasks,           // RW
-    pub task_registry: EngineTaskRegistry,   // RW
-    pub event_bus: EventBus,                 // RW
-    pub db: sled::Db,                        // R
-    pub lib_manager: LibraryManager,         // RW
-    pub client: bool,                        // RW
+    pub cfg: RwLock<Config>,               // RW
+    pub task_queue: TaskQueue,             // RW
+    pub leased_tasks: ExecutingTaskQueue,  // RW
+    pub solved_tasks: SolvedTasks,         // RW
+    pub task_registry: EngineTaskRegistry, // RW
+    pub event_bus: EventBus,               // RW
+    pub db: sled::Db,                      // R
+    pub lib_manager: LibraryManager,       // RW
+    pub client: bool,                      // RW
 }
 
 impl Default for ServerAPI {

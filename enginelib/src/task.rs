@@ -13,7 +13,7 @@ pub struct StoredTask {
     pub id: String,
 }
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct StoredExecutingTask {
+pub struct LeasedTask {
     pub bytes: Vec<u8>,
     pub id: String,
     pub user_id: String,
@@ -27,9 +27,9 @@ pub struct TaskQueue {
 pub struct SolvedTasks {
     pub tasks: HashMap<Identifier, Vec<StoredTask>>,
 }
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct ExecutingTaskQueue {
-    pub tasks: HashMap<Identifier, Vec<StoredExecutingTask>>,
+#[derive(Debug, Default, Clone)]
+pub struct LeasedTasks {
+    pub tasks: HashMap<Identifier, Vec<LeasedTask>>,
 }
 
 pub trait Verifiable {
