@@ -19,7 +19,7 @@ use std::{
 };
 
 pub struct ServerAPI {
-    pub cfg: RwLock<Config>,               // RW
+    pub cfg: Config,                       // RW
     pub task_queue: TaskQueue,             // RW
     pub leased_tasks: LeasedTaskQueue,     // RW
     pub solved_tasks: SolvedTasks,         // RW
@@ -33,7 +33,7 @@ pub struct ServerAPI {
 impl Default for ServerAPI {
     fn default() -> Self {
         Self {
-            cfg: RwLock::new(Config::default()),
+            cfg: Config::default(),
             task_queue: TaskQueue::default(),
             db: sled::open("engine_db").unwrap(),
             lib_manager: LibraryManager::default(),
@@ -103,7 +103,7 @@ impl ServerAPI {
     }
     pub fn init(api: &mut Self) {
         Self::setup_logger();
-        api.cfg = RwLock::new(Config::new());
+        api.cfg = Config::new();
         Self::init_db(api);
         let mut new_lib_manager = LibraryManager::default();
         new_lib_manager.load_modules(api);
