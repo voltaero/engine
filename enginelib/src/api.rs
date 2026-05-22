@@ -131,7 +131,7 @@ impl ServerAPI {
         spawn(clear_sled_periodically(api, t));
     }
     const TASKS_PREFIX: &'static str = "q:tasks:";
-    const EXECUTING_PREFIX: &'static str = "q:executing:";
+    const LEASING_PREFIX: &'static str = "q:executing:";
     const SOLVED_PREFIX: &'static str = "q:solved:";
 
     fn state_key(prefix: &str, id: &Identifier) -> Vec<u8> {
@@ -189,10 +189,10 @@ impl ServerAPI {
         value: &Vec<StoredExecutingTask>,
     ) -> Result<(Vec<u8>, Option<Vec<u8>>), postcard::Error> {
         if value.is_empty() {
-            Ok((Self::state_key(Self::EXECUTING_PREFIX, id), None))
+            Ok((Self::state_key(Self::LEASING_PREFIX, id), None))
         } else {
             Ok((
-                Self::state_key(Self::EXECUTING_PREFIX, id),
+                Self::state_key(Self::LEASING_PREFIX, id),
                 Some(postcard::to_allocvec(value)?),
             ))
         }
@@ -218,7 +218,7 @@ impl ServerAPI {
 
         for prefix in [
             Self::TASKS_PREFIX,
-            Self::EXECUTING_PREFIX,
+            Self::LEASING_PREFIX,
             Self::SOLVED_PREFIX,
         ] {
             for item in api.db.scan_prefix(prefix.as_bytes()) {
@@ -260,9 +260,9 @@ impl ServerAPI {
             }
         }
 
-        for item in api.db.scan_prefix(Self::EXECUTING_PREFIX.as_bytes()) {
+        for item in api.db.scan_prefix(Self::LEASING_PREFIX.as_bytes()) {
             if let Ok((key, value)) = item {
-                if let Some(id) = Self::parse_state_key(Self::EXECUTING_PREFIX, &key) {
+                if let Some(id) = Self::parse_state_key(Self::LEASING_PREFIX, &key) {
                     if let Ok(tasks) = postcard::from_bytes::<Vec<StoredExecutingTask>>(&value) {
                         api.executing_tasks.tasks.insert(id, tasks);
                         found_keyed_state = true;
