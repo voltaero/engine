@@ -5,24 +5,7 @@ A blazingly fast distrubted computing framework made with Rust and Tonic.
 Volt Engine provides an API with an event system and tasks allowing for great adaptability. To create a mod dev env use rustforge our own tool that manages it all for you.
 
 ## License & Use
-This project is availible under **dual licensing**:
-
-1. **AGPL-3.0** (open-source license) - see [`LICENSE.md`](./LICENSE.md)
-2. **Commercial License** — for organizations that want to use this software with different terms.
-
-In general:
-### You CAN
-* Write your own code that uses this code as a dependency.
-* Submit Pull Requests to this repository.
-* Use this software for research.
-* Fork and modify the code as long as modifications are distributed publicly.
-
-### You CANNOT
-* Claim this software as your own.
-* Use this SOFTWARE commercially/for profit without a License given by [GE](https://github.com/VoltAero)
-* Share this software without express permission from [GE](https://github.com/VoltAero) in the form of a License.
-* Distribute modifications of this software without giving credit to [GE](https://github.com/VoltAero)
-* Use this software in a way that damages other humans.
+ **AGPL-3.0** (open-source license) - see [`LICENSE.md`](./LICENSE.md)
 
 ### Disclaimer
 <sub>
