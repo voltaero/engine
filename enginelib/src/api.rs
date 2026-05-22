@@ -7,10 +7,7 @@ use crate::{
     config::Config,
     event::{EngineEventHandlerRegistry, EventBus},
     plugin::LibraryManager,
-    task::{
-        ExecutingTaskQueue, LeasedTaskQueue, LeasedTasks, SolvedTasks, StoredExecutingTask,
-        StoredTask, Task, TaskQueue,
-    },
+    task::{LeasedTaskQueue, SolvedTasks, StoredTask, Task, TaskQueue},
 };
 pub use postcard;
 pub use postcard::from_bytes;
@@ -106,7 +103,7 @@ impl ServerAPI {
     }
     pub fn init(api: &mut Self) {
         Self::setup_logger();
-        api.cfg = Config::new();
+        api.cfg = RwLock::new(Config::new());
         Self::init_db(api);
         let mut new_lib_manager = LibraryManager::default();
         new_lib_manager.load_modules(api);
