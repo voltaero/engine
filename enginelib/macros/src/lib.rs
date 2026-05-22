@@ -24,7 +24,7 @@ pub fn module(_attr: TokenStream, item: TokenStream) -> TokenStream {
             _ => {
                 return syn::Error::new_spanned(
                     &pat_type.pat,
-                    "expected first argument to be an identifier (e.g. `api: &mut EngineAPI`)",
+                    "expected first argument to be an identifier (e.g. `api: &mut ServerAPI`)",
                 )
                 .to_compile_error()
                 .into();
@@ -33,7 +33,7 @@ pub fn module(_attr: TokenStream, item: TokenStream) -> TokenStream {
         _ => {
             return syn::Error::new_spanned(
                 &item_fn.sig,
-                "`#[module]` expects a function like `fn run(api: &mut EngineAPI)`",
+                "`#[module]` expects a function like `fn run(api: &mut ServerAPI)`",
             )
             .to_compile_error()
             .into();
@@ -47,11 +47,13 @@ pub fn module(_attr: TokenStream, item: TokenStream) -> TokenStream {
             env!("CARGO_PKG_NAME"),
         );),
     );
+    item_fn.block.stmts.insert(
+        0,
+        parse_quote!(::enginelib::api::ServerAPI::setup_logger();),
+    );
     item_fn
-        .block
-        .stmts
-        .insert(0, parse_quote!(::enginelib::api::EngineAPI::setup_logger();));
-    item_fn.attrs.push(parse_quote!(#[unsafe(export_name="run")]));
+        .attrs
+        .push(parse_quote!(#[unsafe(export_name="run")]));
 
     quote!(#item_fn).into()
 }
@@ -181,7 +183,10 @@ impl Parse for EventHandlerArgs {
         }
 
         let namespace = namespace.ok_or_else(|| {
-            syn::Error::new(proc_macro2::Span::call_site(), "missing `namespace = \"...\"`")
+            syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "missing `namespace = \"...\"`",
+            )
         })?;
         let name = name.ok_or_else(|| {
             syn::Error::new(proc_macro2::Span::call_site(), "missing `name = \"...\"`")
@@ -299,7 +304,7 @@ pub fn event_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         let maybe_inventory_registrar = match (ctx, ctx_fn) {
             (Some(ctx_expr), None) => quote! {
-                fn #inventory_register_fn_name(api: &mut ::enginelib::api::EngineAPI) {
+                fn #inventory_register_fn_name(api: &mut ::enginelib::api::ServerAPI) {
                     let ctx: #ctx_type = (#ctx_expr);
                     #register_fn_name(api, ctx);
                 }
@@ -312,7 +317,7 @@ pub fn event_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             },
             (None, Some(ctx_fn)) => quote! {
-                fn #inventory_register_fn_name(api: &mut ::enginelib::api::EngineAPI) {
+                fn #inventory_register_fn_name(api: &mut ::enginelib::api::ServerAPI) {
                     let ctx: #ctx_type = #ctx_fn(api);
                     #register_fn_name(api, ctx);
                 }
@@ -358,7 +363,7 @@ pub fn event_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #receive_cancelled_impl
             }
 
-            pub fn #register_fn_name(api: &mut enginelib::api::EngineAPI, ctx: #ctx_type) {
+            pub fn #register_fn_name(api: &mut enginelib::api::ServerAPI, ctx: #ctx_type) {
                 api.event_bus.register_handler(
                     #handler_name::with_ctx(ctx),
                     (#namespace.to_string(), #name.to_string()),
@@ -400,7 +405,7 @@ pub fn event_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #receive_cancelled_impl
             }
 
-            pub fn #register_fn_name(api: &mut enginelib::api::EngineAPI) {
+            pub fn #register_fn_name(api: &mut enginelib::api::ServerAPI) {
                 api.event_bus.register_handler(
                     #handler_name,
                     (#namespace.to_string(), #name.to_string()),

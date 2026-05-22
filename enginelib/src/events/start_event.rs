@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use macros::Event;
 
-use crate::{Identifier, api::EngineAPI, plugin::LibraryMetadata};
+use crate::{Identifier, api::ServerAPI, plugin::LibraryMetadata};
 
 #[derive(Clone, Debug, Event)]
 #[event(namespace = "core", name = "start_event")]
@@ -13,7 +13,7 @@ pub struct StartEvent {
 }
 
 impl StartEvent {
-    pub fn fire(api: &mut EngineAPI) {
+    pub fn fire(api: &mut ServerAPI) {
         let modules = api
             .lib_manager
             .libraries

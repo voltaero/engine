@@ -1,4 +1,4 @@
-use crate::{Identifier, api::EngineAPI};
+use crate::{Identifier, api::ServerAPI};
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -8,19 +8,19 @@ pub use tracing::{debug, error, event, info, warn};
 
 pub struct EventRegistrar {
     pub origin: &'static str,
-    pub func: fn(&mut EngineAPI), // function signature
+    pub func: fn(&mut ServerAPI), // function signature
 }
 inventory::collect!(EventRegistrar);
 
-pub fn register_inventory_handlers(api: &mut EngineAPI) {
+pub fn register_inventory_handlers(api: &mut ServerAPI) {
     register_inventory_handlers_inner(api, None);
 }
 
-pub fn register_inventory_handlers_for_origin(api: &mut EngineAPI, origin: &'static str) {
+pub fn register_inventory_handlers_for_origin(api: &mut ServerAPI, origin: &'static str) {
     register_inventory_handlers_inner(api, Some(origin));
 }
 
-fn register_inventory_handlers_inner(api: &mut EngineAPI, origin: Option<&'static str>) {
+fn register_inventory_handlers_inner(api: &mut ServerAPI, origin: Option<&'static str>) {
     for item in inventory::iter::<EventRegistrar> {
         if let Some(origin) = origin {
             if item.origin != origin {

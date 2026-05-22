@@ -22,10 +22,7 @@ pub struct LeasedTask {
 pub struct TaskQueue {
     pub tasks: HashMap<Identifier, ArrayQueue<StoredTask>>,
 }
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct SolvedTasks {
-    pub tasks: HashMap<Identifier, Vec<StoredTask>>,
-}
+
 #[derive(Debug, Default, Clone)]
 pub struct LeasedTaskQueue {
     pub tasks: HashMap<Identifier, Vec<LeasedTask>>,

@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 use macros::{Event, event_handler};
 use sled::Db;
 
-use crate::{Identifier, api::EngineAPI};
+use crate::{Identifier, api::ServerAPI};
 
 #[derive(Clone, Debug, Event)]
 #[event(namespace = "core", name = "admin_auth_event", cancellable)]
@@ -19,7 +19,7 @@ pub struct AdminAuthEvent {
 
 impl AdminAuthEvent {
     pub fn fire(
-        api: &mut EngineAPI,
+        api: &mut ServerAPI,
         payload: String,
         target: Identifier,
         db: Db,
@@ -35,7 +35,7 @@ impl AdminAuthEvent {
         });
     }
 
-    pub fn check(api: &mut EngineAPI, payload: String, target: Identifier, db: Db) -> bool {
+    pub fn check(api: &mut ServerAPI, payload: String, target: Identifier, db: Db) -> bool {
         let output = Arc::new(RwLock::new(false));
         Self::fire(api, payload, target, db, output.clone());
         *output.read().unwrap()

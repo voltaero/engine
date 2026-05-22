@@ -20,7 +20,7 @@ use std::sync::{Arc, RwLock};
 
 use sled::Db;
 
-use crate::{Identifier, api::EngineAPI};
+use crate::{Identifier, api::ServerAPI};
 
 pub fn ID(namespace: &str, id: &str) -> Identifier {
     (namespace.to_string(), id.to_string())
@@ -30,18 +30,23 @@ pub struct Events;
 
 #[allow(non_snake_case)]
 impl Events {
-    pub fn init_auth(_api: &mut EngineAPI) {}
+    pub fn init_auth(_api: &mut ServerAPI) {}
 
-    pub fn CheckAuth(api: &mut EngineAPI, uid: String, challenge: String, db: Db) -> bool {
+    pub fn CheckAuth(api: &mut ServerAPI, uid: String, challenge: String, db: Db) -> bool {
         auth_event::AuthEvent::check(api, uid, challenge, db)
     }
 
-    pub fn CheckAdminAuth(api: &mut EngineAPI, payload: String, target: Identifier, db: Db) -> bool {
+    pub fn CheckAdminAuth(
+        api: &mut ServerAPI,
+        payload: String,
+        target: Identifier,
+        db: Db,
+    ) -> bool {
         admin_auth_event::AdminAuthEvent::check(api, payload, target, db)
     }
 
     pub fn CgrpcEvent(
-        api: &mut EngineAPI,
+        api: &mut ServerAPI,
         handler_id: Identifier,
         payload: Vec<u8>,
         output: Arc<RwLock<Vec<u8>>>,
@@ -49,24 +54,24 @@ impl Events {
         cgrpc_event::CgrpcEvent::fire(api, handler_id, payload, output)
     }
 
-    pub fn StartEvent(api: &mut EngineAPI) {
+    pub fn StartEvent(api: &mut ServerAPI) {
         start_event::StartEvent::fire(api)
     }
 
-    pub fn ClientStart(api: &EngineAPI) {
+    pub fn ClientStart(api: &ServerAPI) {
         client_start_event::ClientStartEvent::fire(api)
     }
 
-    pub fn ClientAuthPrepare(api: &EngineAPI, headers: Arc<RwLock<HashMap<String, String>>>) {
+    pub fn ClientAuthPrepare(api: &ServerAPI, headers: Arc<RwLock<HashMap<String, String>>>) {
         client_auth_prepare_event::ClientAuthPrepareEvent::fire(api, headers)
     }
 
-    pub fn BeforeTaskAcquire(api: &EngineAPI, task_id: String) -> bool {
+    pub fn BeforeTaskAcquire(api: &ServerAPI, task_id: String) -> bool {
         before_task_acquire_event::BeforeTaskAcquireEvent::check(api, task_id)
     }
 
     pub fn TaskAcquired(
-        api: &EngineAPI,
+        api: &ServerAPI,
         task_id: String,
         instance_id: String,
         payload: Arc<RwLock<Vec<u8>>>,
@@ -75,7 +80,7 @@ impl Events {
     }
 
     pub fn BeforeTaskExecute(
-        api: &EngineAPI,
+        api: &ServerAPI,
         task_id: String,
         instance_id: String,
         payload: Arc<RwLock<Vec<u8>>>,
@@ -84,7 +89,7 @@ impl Events {
     }
 
     pub fn BeforeTaskPublish(
-        api: &EngineAPI,
+        api: &ServerAPI,
         task_id: String,
         instance_id: String,
         payload: Arc<RwLock<Vec<u8>>>,
@@ -92,12 +97,12 @@ impl Events {
         before_task_publish_event::BeforeTaskPublishEvent::check(api, task_id, instance_id, payload)
     }
 
-    pub fn ServerStart(api: &EngineAPI) {
+    pub fn ServerStart(api: &ServerAPI) {
         server_start_event::ServerStartEvent::fire(api)
     }
 
     pub fn ServerBeforeTaskCreate(
-        api: &EngineAPI,
+        api: &ServerAPI,
         task_id: String,
         payload: Arc<RwLock<Vec<u8>>>,
     ) -> bool {
@@ -105,7 +110,7 @@ impl Events {
     }
 
     pub fn ServerTaskCreated(
-        api: &EngineAPI,
+        api: &ServerAPI,
         task_id: String,
         instance_id: String,
         payload: Arc<RwLock<Vec<u8>>>,
@@ -113,21 +118,16 @@ impl Events {
         server_task_created_event::ServerTaskCreatedEvent::fire(api, task_id, instance_id, payload)
     }
 
-    pub fn ServerBeforeTaskAcquire(api: &EngineAPI, uid: String, task_id: String) -> bool {
+    pub fn ServerBeforeTaskAcquire(api: &ServerAPI, uid: String, task_id: String) -> bool {
         server_before_task_acquire_event::ServerBeforeTaskAcquireEvent::check(api, uid, task_id)
     }
 
-    pub fn ServerTaskAcquired(
-        api: &EngineAPI,
-        uid: String,
-        task_id: String,
-        instance_id: String,
-    ) {
+    pub fn ServerTaskAcquired(api: &ServerAPI, uid: String, task_id: String, instance_id: String) {
         server_task_acquired_event::ServerTaskAcquiredEvent::fire(api, uid, task_id, instance_id)
     }
 
     pub fn ServerBeforeTaskPublish(
-        api: &EngineAPI,
+        api: &ServerAPI,
         uid: String,
         task_id: String,
         instance_id: String,
@@ -142,7 +142,7 @@ impl Events {
         )
     }
 
-    pub fn ServerTaskPublished(api: &EngineAPI, uid: String, task_id: String, instance_id: String) {
+    pub fn ServerTaskPublished(api: &ServerAPI, uid: String, task_id: String, instance_id: String) {
         server_task_published_event::ServerTaskPublishedEvent::fire(api, uid, task_id, instance_id)
     }
 }

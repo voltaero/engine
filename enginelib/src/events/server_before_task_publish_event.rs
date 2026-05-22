@@ -2,7 +2,7 @@ use std::sync::{Arc, RwLock};
 
 use macros::Event;
 
-use crate::{Identifier, api::EngineAPI};
+use crate::{Identifier, api::ServerAPI};
 
 #[derive(Clone, Debug, Event)]
 #[event(namespace = "server", name = "before_task_publish", cancellable)]
@@ -17,7 +17,7 @@ pub struct ServerBeforeTaskPublishEvent {
 
 impl ServerBeforeTaskPublishEvent {
     pub fn fire(
-        api: &EngineAPI,
+        api: &ServerAPI,
         uid: String,
         task_id: String,
         instance_id: String,
@@ -36,7 +36,7 @@ impl ServerBeforeTaskPublishEvent {
     }
 
     pub fn check(
-        api: &EngineAPI,
+        api: &ServerAPI,
         uid: String,
         task_id: String,
         instance_id: String,

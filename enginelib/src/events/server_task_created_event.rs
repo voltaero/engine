@@ -2,7 +2,7 @@ use std::sync::{Arc, RwLock};
 
 use macros::Event;
 
-use crate::{Identifier, api::EngineAPI};
+use crate::{Identifier, api::ServerAPI};
 
 #[derive(Clone, Debug, Event)]
 #[event(namespace = "server", name = "task_created")]
@@ -16,7 +16,7 @@ pub struct ServerTaskCreatedEvent {
 
 impl ServerTaskCreatedEvent {
     pub fn fire(
-        api: &EngineAPI,
+        api: &ServerAPI,
         task_id: String,
         instance_id: String,
         payload: Arc<RwLock<Vec<u8>>>,

@@ -2,7 +2,7 @@ use std::sync::{Arc, RwLock};
 
 use macros::Event;
 
-use crate::{Identifier, api::EngineAPI};
+use crate::{Identifier, api::ServerAPI};
 
 #[derive(Clone, Debug, Event)]
 #[event(namespace = "core", name = "cgrpc_event", cancellable)]
@@ -16,7 +16,7 @@ pub struct CgrpcEvent {
 
 impl CgrpcEvent {
     pub fn fire(
-        api: &mut EngineAPI,
+        api: &mut ServerAPI,
         handler_id: Identifier,
         payload: Vec<u8>,
         output: Arc<RwLock<Vec<u8>>>,

@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 
 use macros::Event;
 
-use crate::{Identifier, api::EngineAPI};
+use crate::{Identifier, api::ServerAPI};
 
 #[derive(Clone, Debug, Event)]
 #[event(namespace = "client", name = "auth_prepare")]
@@ -14,7 +14,7 @@ pub struct ClientAuthPrepareEvent {
 }
 
 impl ClientAuthPrepareEvent {
-    pub fn fire(api: &EngineAPI, headers: Arc<RwLock<HashMap<String, String>>>) {
+    pub fn fire(api: &ServerAPI, headers: Arc<RwLock<HashMap<String, String>>>) {
         let mut event = ClientAuthPrepareEvent {
             cancelled: false,
             id: ("client".to_string(), "auth_prepare".to_string()),

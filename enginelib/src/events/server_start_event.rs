@@ -1,6 +1,6 @@
 use macros::Event;
 
-use crate::{Identifier, api::EngineAPI};
+use crate::{Identifier, api::ServerAPI};
 
 #[derive(Clone, Debug, Event)]
 #[event(namespace = "server", name = "start")]
@@ -10,7 +10,7 @@ pub struct ServerStartEvent {
 }
 
 impl ServerStartEvent {
-    pub fn fire(api: &EngineAPI) {
+    pub fn fire(api: &ServerAPI) {
         let mut event = ServerStartEvent {
             cancelled: false,
             id: ("server".to_string(), "start".to_string()),

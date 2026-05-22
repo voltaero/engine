@@ -4,7 +4,7 @@ pub use macros;
 pub use macros::{Event, Verifiable, event_handler, metadata, module};
 pub use tracing::{debug, error, info, instrument, warn};
 
-pub use crate::api::EngineAPI;
+pub use crate::api::ServerAPI;
 pub use crate::config::Config;
 pub use crate::event::{
     Event, EventBus, EventCTX, EventHandler, EventRegistrar, register_inventory_handlers,

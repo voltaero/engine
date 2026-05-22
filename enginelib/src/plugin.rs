@@ -1,4 +1,4 @@
-use crate::api::EngineAPI;
+use crate::api::ServerAPI;
 use libloading::{Library, Symbol};
 use oxifs::OxiFS;
 use serde::{Deserialize, Serialize};
@@ -58,13 +58,13 @@ pub struct LibraryManager {
 }
 
 impl LibraryManager {
-    pub fn drop(self, api: EngineAPI) {
-        debug!("Dropping LibraryManager and EngineAPI");
+    pub fn drop(self, api: ServerAPI) {
+        debug!("Dropping LibraryManager and ServerAPI");
         drop(api);
         drop(self);
     }
 
-    pub fn load_modules(&mut self, api: &mut EngineAPI) {
+    pub fn load_modules(&mut self, api: &mut ServerAPI) {
         let dir_path = "./mods";
         let mut files: Vec<String> = Vec::new();
 
@@ -96,7 +96,7 @@ impl LibraryManager {
         }
     }
 
-    pub fn load_module(&mut self, path: &str, api: &mut EngineAPI) {
+    pub fn load_module(&mut self, path: &str, api: &mut ServerAPI) {
         info!("Loading module from path: {}", path);
         let fs = OxiFS::new(path);
 
@@ -119,7 +119,7 @@ impl LibraryManager {
         //std::mem::forget(fs);
     }
 
-    pub fn load_library(&mut self, path: &str, api: &mut EngineAPI) -> Result<(), String> {
+    pub fn load_library(&mut self, path: &str, api: &mut ServerAPI) -> Result<(), String> {
         debug!("Attempting to load library: {}", path);
 
         let (lib, metadata): (Library, LibraryMetadata) = unsafe {
@@ -160,7 +160,7 @@ impl LibraryManager {
         if let Err(e) = unsafe {
             lib.get(b"run")
                 .map_err(|e| format!("Failed to get run symbol: {}", e))
-                .map(|run: Symbol<unsafe extern "Rust" fn(reg: &mut EngineAPI)>| run(api))
+                .map(|run: Symbol<unsafe extern "Rust" fn(reg: &mut ServerAPI)>| run(api))
         } {
             error!("Failed to execute module's run function: {}", e);
             return Err(e);
