@@ -7,13 +7,17 @@ use crate::{
     config::Config,
     event::{EngineEventHandlerRegistry, EventBus},
     plugin::LibraryManager,
-    task::{ExecutingTaskQueue, SolvedTasks, StoredTask, Task, TaskQueue},
+    task::{ExecutingTaskQueue, SolvedTasks, StoredExecutingTask, StoredTask, Task, TaskQueue},
 };
 pub use postcard;
 pub use postcard::from_bytes;
 pub use postcard::to_allocvec;
-use std::{collections::HashMap, sync::Arc, time::Duration};
-pub struct EngineAPI {
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
+pub struct ServerAPI {
     pub cfg: Config,
     pub task_queue: TaskQueue,
     pub executing_tasks: ExecutingTaskQueue,
@@ -25,7 +29,7 @@ pub struct EngineAPI {
     pub client: bool,
 }
 
-impl Default for EngineAPI {
+impl Default for ServerAPI {
     fn default() -> Self {
         Self {
             cfg: Config::default(),
@@ -44,24 +48,24 @@ impl Default for EngineAPI {
         }
     }
 }
-impl EngineAPI {
-    pub fn default_client() -> Self {
-        Self {
-            cfg: Config::default(),
-            task_queue: TaskQueue::default(),
-            db: sled::open("engine_client_db").unwrap(),
-            lib_manager: LibraryManager::default(),
-            task_registry: EngineTaskRegistry::default(),
-            event_bus: EventBus {
-                event_handler_registry: EngineEventHandlerRegistry {
-                    event_handlers: HashMap::new(),
-                },
-            },
-            solved_tasks: SolvedTasks::default(),
-            executing_tasks: ExecutingTaskQueue::default(),
-            client: true,
-        }
-    }
+impl ServerAPI {
+    // pub fn default_client() -> Self {
+    //     Self {
+    //         cfg: Config::default(),
+    //         task_queue: TaskQueue::default(),
+    //         db: sled::open("engine_client_db").unwrap(),
+    //         lib_manager: LibraryManager::default(),
+    //         task_registry: EngineTaskRegistry::default(),
+    //         event_bus: EventBus {
+    //             event_handler_registry: EngineEventHandlerRegistry {
+    //                 event_handlers: HashMap::new(),
+    //             },
+    //         },
+    //         solved_tasks: SolvedTasks::default(),
+    //         executing_tasks: ExecutingTaskQueue::default(),
+    //         client: true,
+    //     }
+    //}
     pub fn test_default() -> Self {
         // `sled::Config::temporary(true)` defaults to `/dev/shm` on Linux when no path is set.
         // Some environments deny writes there, so force a unique temp path.
@@ -132,49 +136,184 @@ impl EngineAPI {
         let t = api.try_read().unwrap().cfg.config_toml.clean_tasks;
         spawn(clear_sled_periodically(api, t));
     }
-    pub fn sync_db(api: &mut EngineAPI) {
-        // IF THIS FN CAUSES PANIC SOMETHING IS VERY BROKEN
+    const TASKS_PREFIX: &'static str = "q:tasks:";
+    const EXECUTING_PREFIX: &'static str = "q:executing:";
+    const SOLVED_PREFIX: &'static str = "q:solved:";
 
-        let tasks_db = postcard::to_allocvec(&api.task_queue.clone()).unwrap();
-        api.db.insert("tasks", tasks_db).unwrap();
-
-        let executing_tasks_db = postcard::to_allocvec(&api.executing_tasks.clone()).unwrap();
-        api.db
-            .insert("executing_tasks", executing_tasks_db)
-            .unwrap();
-
-        let solved_tasks_db = postcard::to_allocvec(&api.solved_tasks.clone()).unwrap();
-        api.db.insert("solved_tasks", solved_tasks_db).unwrap();
-        debug!("Synced In memory db to File db");
+    fn state_key(prefix: &str, id: &Identifier) -> Vec<u8> {
+        format!("{}{}\u{1f}{}", prefix, id.0, id.1).into_bytes()
     }
-    fn init_db(api: &mut EngineAPI) {
+
+    fn parse_state_key(prefix: &str, key: &[u8]) -> Option<Identifier> {
+        let key = std::str::from_utf8(key).ok()?;
+        let rest = key.strip_prefix(prefix)?;
+        let (namespace, task) = rest.split_once('\u{1f}')?;
+        Some((namespace.to_string(), task.to_string()))
+    }
+
+    pub fn apply_batch_entries(
+        db: &sled::Db,
+        entries: Vec<(&'static str, Vec<u8>)>,
+    ) -> sled::Result<()> {
+        let mut batch = sled::Batch::default();
+        for (key, value) in entries {
+            batch.insert(key, value);
+        }
+        db.apply_batch(batch)
+    }
+
+    pub fn apply_batch_ops(
+        db: &sled::Db,
+        ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    ) -> sled::Result<()> {
+        let mut batch = sled::Batch::default();
+        for (key, value) in ops {
+            match value {
+                Some(v) => batch.insert(key, v),
+                None => batch.remove(key),
+            }
+        }
+        db.apply_batch(batch)
+    }
+
+    pub fn state_op_tasks(
+        id: &Identifier,
+        value: &Vec<StoredTask>,
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>), postcard::Error> {
+        if value.is_empty() {
+            Ok((Self::state_key(Self::TASKS_PREFIX, id), None))
+        } else {
+            Ok((
+                Self::state_key(Self::TASKS_PREFIX, id),
+                Some(postcard::to_allocvec(value)?),
+            ))
+        }
+    }
+
+    pub fn state_op_executing(
+        id: &Identifier,
+        value: &Vec<StoredExecutingTask>,
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>), postcard::Error> {
+        if value.is_empty() {
+            Ok((Self::state_key(Self::EXECUTING_PREFIX, id), None))
+        } else {
+            Ok((
+                Self::state_key(Self::EXECUTING_PREFIX, id),
+                Some(postcard::to_allocvec(value)?),
+            ))
+        }
+    }
+
+    pub fn state_op_solved(
+        id: &Identifier,
+        value: &Vec<StoredTask>,
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>), postcard::Error> {
+        if value.is_empty() {
+            Ok((Self::state_key(Self::SOLVED_PREFIX, id), None))
+        } else {
+            Ok((
+                Self::state_key(Self::SOLVED_PREFIX, id),
+                Some(postcard::to_allocvec(value)?),
+            ))
+        }
+    }
+
+    pub fn sync_db(api: &mut ServerAPI) {
+        // IF THIS FN CAUSES PANIC SOMETHING IS VERY BROKEN
+        let mut ops: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+
+        for prefix in [
+            Self::TASKS_PREFIX,
+            Self::EXECUTING_PREFIX,
+            Self::SOLVED_PREFIX,
+        ] {
+            for item in api.db.scan_prefix(prefix.as_bytes()) {
+                if let Ok((key, _)) = item {
+                    ops.push((key.to_vec(), None));
+                }
+            }
+        }
+
+        for (id, tasks) in &api.task_queue.tasks {
+            ops.push(Self::state_op_tasks(id, tasks).unwrap());
+        }
+        for (id, tasks) in &api.executing_tasks.tasks {
+            ops.push(Self::state_op_executing(id, tasks).unwrap());
+        }
+        for (id, tasks) in &api.solved_tasks.tasks {
+            ops.push(Self::state_op_solved(id, tasks).unwrap());
+        }
+
+        Self::apply_batch_ops(&api.db, ops).unwrap();
+        debug!("Synced in-memory state to keyed sled storage");
+    }
+
+    fn init_db(api: &mut ServerAPI) {
+        api.task_queue = TaskQueue::default();
+        api.executing_tasks = ExecutingTaskQueue::default();
+        api.solved_tasks = SolvedTasks::default();
+
+        let mut found_keyed_state = false;
+
+        for item in api.db.scan_prefix(Self::TASKS_PREFIX.as_bytes()) {
+            if let Ok((key, value)) = item {
+                if let Some(id) = Self::parse_state_key(Self::TASKS_PREFIX, &key) {
+                    if let Ok(tasks) = postcard::from_bytes::<Vec<StoredTask>>(&value) {
+                        api.task_queue.tasks.insert(id, tasks);
+                        found_keyed_state = true;
+                    }
+                }
+            }
+        }
+
+        for item in api.db.scan_prefix(Self::EXECUTING_PREFIX.as_bytes()) {
+            if let Ok((key, value)) = item {
+                if let Some(id) = Self::parse_state_key(Self::EXECUTING_PREFIX, &key) {
+                    if let Ok(tasks) = postcard::from_bytes::<Vec<StoredExecutingTask>>(&value) {
+                        api.executing_tasks.tasks.insert(id, tasks);
+                        found_keyed_state = true;
+                    }
+                }
+            }
+        }
+
+        for item in api.db.scan_prefix(Self::SOLVED_PREFIX.as_bytes()) {
+            if let Ok((key, value)) = item {
+                if let Some(id) = Self::parse_state_key(Self::SOLVED_PREFIX, &key) {
+                    if let Ok(tasks) = postcard::from_bytes::<Vec<StoredTask>>(&value) {
+                        api.solved_tasks.tasks.insert(id, tasks);
+                        found_keyed_state = true;
+                    }
+                }
+            }
+        }
+
+        if found_keyed_state {
+            return;
+        }
+
+        // Legacy fallback migration path.
         let tasks = api.db.get("tasks");
         let exec_tasks = api.db.get("executing_tasks");
         let solved_tasks = api.db.get("solved_tasks");
-        if tasks.is_err() || tasks.unwrap().is_none() {
-            let store = postcard::to_allocvec(&api.task_queue.clone()).unwrap();
-            api.db.insert("tasks", store).unwrap();
-        } else {
-            let store = api.db.get("tasks").unwrap().unwrap();
+
+        if let Ok(Some(store)) = tasks {
             let res: TaskQueue = postcard::from_bytes(&store).unwrap();
             api.task_queue = res;
         }
-        if exec_tasks.is_err() || exec_tasks.unwrap().is_none() {
-            let store = postcard::to_allocvec(&api.executing_tasks.clone()).unwrap();
-            api.db.insert("executing_tasks", store).unwrap();
-        } else {
-            let store = api.db.get("executing_tasks").unwrap().unwrap();
+
+        if let Ok(Some(store)) = exec_tasks {
             let res: ExecutingTaskQueue = postcard::from_bytes(&store).unwrap();
             api.executing_tasks = res;
-        };
-        if solved_tasks.is_err() || solved_tasks.unwrap().is_none() {
-            let store = postcard::to_allocvec(&api.solved_tasks.clone()).unwrap();
-            api.db.insert("solved_tasks", store).unwrap();
-        } else {
-            let store = api.db.get("solved_tasks").unwrap().unwrap();
+        }
+
+        if let Ok(Some(store)) = solved_tasks {
             let res: SolvedTasks = postcard::from_bytes(&store).unwrap();
             api.solved_tasks = res;
-        };
+        }
+
+        // Migrate legacy snapshot into keyed storage.
+        Self::sync_db(api);
     }
 
     pub fn setup_logger() {
@@ -219,77 +358,88 @@ impl Registry<dyn Task> for EngineTaskRegistry {
     }
 }
 
-pub async fn clear_sled_periodically(api: Arc<RwLock<EngineAPI>>, n_minutes: u64) {
-    //EngineAPI::setup_logger();
+pub async fn clear_sled_periodically(api: Arc<ServerAPI>, n_minutes: u64) {
     info!("Sled Cron Job Started");
     let mut interval = interval(Duration::from_secs(n_minutes * 60));
     loop {
-        interval.tick().await; // Wait for the interval
+        interval.tick().await;
         info!("Purging Unsolved Tasks");
-        let now = Utc::now().timestamp(); // Current timestamp in seconds
-        let mut moved_tasks: Vec<(String, String, StoredTask)> = Vec::new();
+
+        let now = Utc::now().timestamp();
         let mut rw_api = api.write().await;
-        let db = rw_api.db.clone();
-        // Load "executing_tasks"
-        if let Ok(Some(tsks)) = db.get("executing_tasks") {
-            if let Ok(mut s) = postcard::from_bytes::<ExecutingTaskQueue>(&tsks) {
-                for ((key1, key2), task_list) in s.tasks.iter_mut() {
-                    task_list.retain(|info| {
-                        let age = now - info.given_at.timestamp();
-                        if age > 3600 {
-                            info!("Task {:?} is older than an hour! Moving...", info);
-                            moved_tasks.push((
-                                key1.clone(),
-                                key2.clone(),
-                                StoredTask {
-                                    id: info.id.clone(),
-                                    bytes: info.bytes.clone(),
-                                },
-                            ));
-                            false // Remove old tasks
-                        } else {
-                            true // Keep tasks that are less than an hour old
-                        }
-                    });
-                }
 
-                // Save updated "executing_tasks"
-                if let Ok(updated) = postcard::to_allocvec(&s) {
-                    if let Err(e) = db.insert("executing_tasks", updated) {
-                        error!("Failed to update executing_tasks in Sled: {:?}", e);
-                    }
+        let mut moved_tasks: Vec<(Identifier, StoredTask)> = Vec::new();
+        let mut touched_exec: HashSet<Identifier> = HashSet::new();
+
+        for (id, task_list) in rw_api.executing_tasks.tasks.iter_mut() {
+            let before_len = task_list.len();
+            task_list.retain(|info| {
+                let age = now - info.given_at.timestamp();
+                if age > 3600 {
+                    info!("Task {:?} is older than an hour! Moving...", info);
+                    moved_tasks.push((
+                        id.clone(),
+                        StoredTask {
+                            id: info.id.clone(),
+                            bytes: info.bytes.clone(),
+                        },
+                    ));
+                    false
+                } else {
+                    true
                 }
+            });
+
+            if task_list.len() != before_len {
+                touched_exec.insert(id.clone());
             }
         }
 
-        // Merge moved tasks into "tasks"
-        if !moved_tasks.is_empty() {
-            let mut saved_tasks = TaskQueue {
-                tasks: HashMap::new(),
-            };
+        let mut touched_tasks: HashSet<Identifier> = HashSet::new();
+        for (id, task) in moved_tasks {
+            rw_api
+                .task_queue
+                .tasks
+                .entry(id.clone())
+                .or_default()
+                .push(task);
+            touched_tasks.insert(id);
+        }
 
-            if let Ok(Some(saved_tsks)) = db.get("tasks") {
-                if let Ok(existing_tasks) = postcard::from_bytes::<TaskQueue>(&saved_tsks) {
-                    saved_tasks = existing_tasks;
-                }
-            }
+        if touched_exec.is_empty() && touched_tasks.is_empty() {
+            continue;
+        }
 
-            // Add moved tasks
-            for (key1, key2, task) in moved_tasks {
-                saved_tasks
-                    .tasks
-                    .entry((key1, key2))
-                    .or_default()
-                    .push(task);
-            }
+        let mut ops: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
 
-            // Save updated "tasks" queue
-            if let Ok(updated) = postcard::to_allocvec(&saved_tasks) {
-                if let Err(e) = db.insert("tasks", updated) {
-                    error!("Failed to update tasks in Sled: {:?}", e);
-                }
+        for id in touched_exec {
+            let value = rw_api
+                .executing_tasks
+                .tasks
+                .get(&id)
+                .cloned()
+                .unwrap_or_default();
+            match ServerAPI::state_op_executing(&id, &value) {
+                Ok(op) => ops.push(op),
+                Err(e) => error!("Failed to serialize executing_tasks entry: {:?}", e),
             }
         }
-        EngineAPI::init_db(&mut rw_api);
+
+        for id in touched_tasks {
+            let value = rw_api
+                .task_queue
+                .tasks
+                .get(&id)
+                .cloned()
+                .unwrap_or_default();
+            match ServerAPI::state_op_tasks(&id, &value) {
+                Ok(op) => ops.push(op),
+                Err(e) => error!("Failed to serialize tasks entry: {:?}", e),
+            }
+        }
+
+        if let Err(e) = ServerAPI::apply_batch_ops(&rw_api.db, ops) {
+            error!("Failed to update task state in Sled batch: {:?}", e);
+        }
     }
 }

@@ -1,5 +1,4 @@
 use engine::{get_auth, get_uid};
-use enginelib::api::postcard;
 use enginelib::plugin::LibraryMetadata;
 use enginelib::{
     Identifier, RawIdentifier, Registry,
@@ -420,231 +419,245 @@ impl Engine for EngineService {
         request: tonic::Request<proto::TaskRequest>,
     ) -> Result<tonic::Response<proto::Task>, tonic::Status> {
         let challenge = get_auth(&request);
-        let input = request.get_ref();
-        let task_id = input.task_id.clone();
+        let task_id = request.get_ref().task_id.clone();
         let uid = get_uid(&request);
         info!(
             "Task acquisition request received from user: {} for task: {}",
             uid, task_id
         );
 
-        let mut api = self.EngineAPI.write().await;
-        let db = api.db.clone();
-        debug!("Validating authentication for task acquisition");
-        if !Events::CheckAuth(&mut api, uid.clone(), challenge, db) {
-            info!(
-                "Task acquisition denied - invalid authentication for user: {}",
-                uid
-            );
-            return Err(Status::permission_denied("Invalid authentication"));
-        };
+        {
+            let mut api = self.EngineAPI.write().await;
+            let db = api.db.clone();
+            debug!("Validating authentication for task acquisition");
+            if !Events::CheckAuth(&mut api, uid.clone(), challenge, db) {
+                info!(
+                    "Task acquisition denied - invalid authentication for user: {}",
+                    uid
+                );
+                return Err(Status::permission_denied("Invalid authentication"));
+            };
+        }
 
-        // Todo: check for wrong input to not cause a Panic out of bounds.
-        let alen = &task_id.split(":").collect::<Vec<&str>>().len();
-        if *alen != 2 {
+        let (namespace, task_name) = task_id.split_once(':').ok_or_else(|| {
             info!("Invalid task ID format: {}", task_id);
-            return Err(Status::invalid_argument(
-                "Invalid task ID format, expected 'namespace:name",
-            ));
-        }
-        let namespace = &task_id.split(":").collect::<Vec<&str>>()[0];
-        let task_name = &task_id.split(":").collect::<Vec<&str>>()[1];
+            Status::invalid_argument("Invalid task ID format, expected 'namespace:task'")
+        })?;
+
         debug!("Looking up task definition for {}:{}", namespace, task_name);
-        let tsx = api
-            .task_registry
-            .get(&(namespace.to_string(), task_name.to_string()));
-        if tsx.is_none() {
-            warn!(
-                "Task acquisition failed - task does not exist: {}:{}",
-                namespace, task_name
-            );
-            return Err(Status::invalid_argument("Task Does not Exist"));
-        }
-        if Events::ServerBeforeTaskAcquire(&api, uid.clone(), task_id.clone()) {
-            info!(
-                "ServerBeforeTaskAcquire cancelled for user: {} task: {}",
-                uid, task_id
-            );
-            return Err(Status::aborted(
-                "Task acquire cancelled by server event handler",
-            ));
+        let key = ID(namespace, task_name);
+
+        {
+            let api = self.EngineAPI.read().await;
+            if api.task_registry.get(&key).is_none() {
+                warn!(
+                    "Task acquisition failed - task does not exist: {}:{}",
+                    namespace, task_name
+                );
+                return Err(Status::invalid_argument("Task Does not Exist"));
+            }
+            if Events::ServerBeforeTaskAcquire(&api, uid.clone(), task_id.clone()) {
+                info!(
+                    "ServerBeforeTaskAcquire cancelled for user: {} task: {}",
+                    uid, task_id
+                );
+                return Err(Status::aborted(
+                    "Task acquire cancelled by server event handler",
+                ));
+            }
         }
 
-        let key = ID(namespace, task_name);
-        let mut map = match api.task_queue.tasks.get(&key) {
-            Some(v) if !v.is_empty() => v.clone(),
-            _ => {
+        let (ttask, tasks_key_state, exec_key_state, db) = {
+            let mut api = self.EngineAPI.write().await;
+
+            let queue = api
+                .task_queue
+                .tasks
+                .get_mut(&key)
+                .ok_or_else(|| Status::not_found("No queued tasks available"))?;
+
+            if queue.is_empty() {
                 info!("No queued tasks for {}:{}", namespace, task_name);
                 return Err(Status::not_found("No queued tasks available"));
             }
+
+            let ttask = queue.remove(0);
+            let task_payload = ttask.bytes.clone();
+
+            api.executing_tasks
+                .tasks
+                .entry(key.clone())
+                .or_default()
+                .push(enginelib::task::StoredExecutingTask {
+                    bytes: task_payload,
+                    user_id: uid.clone(),
+                    given_at: Utc::now(),
+                    id: ttask.id.clone(),
+                });
+
+            let tasks_key_state = api.task_queue.tasks.get(&key).cloned().unwrap_or_default();
+            let exec_key_state = api
+                .executing_tasks
+                .tasks
+                .get(&key)
+                .cloned()
+                .unwrap_or_default();
+            let db = api.db.clone();
+            (ttask, tasks_key_state, exec_key_state, db)
         };
-        let ttask = map.remove(0);
-        let task_payload = ttask.bytes.clone();
-        // Get Task and remove it from queue
-        api.task_queue.tasks.insert(key.clone(), map);
-        match postcard::to_allocvec(&api.task_queue.clone()) {
-            Ok(store) => {
-                if let Err(e) = api.db.insert("tasks", store) {
-                    return Err(Status::internal(format!("DB insert error: {}", e)));
-                }
-            }
-            Err(e) => {
-                return Err(Status::internal(format!("Serialization error: {}", e)));
-            }
+
+        let tasks_op = EngineAPI::state_op_tasks(&key, &tasks_key_state)
+            .map_err(|e| Status::internal(format!("Serialization error: {}", e)))?;
+        let exec_op = EngineAPI::state_op_executing(&key, &exec_key_state)
+            .map_err(|e| Status::internal(format!("Serialization error: {}", e)))?;
+
+        EngineAPI::apply_batch_ops(&db, vec![tasks_op, exec_op])
+            .map_err(|e| Status::internal(format!("DB insert error: {}", e)))?;
+
+        {
+            let api = self.EngineAPI.read().await;
+            Events::ServerTaskAcquired(&api, uid.clone(), task_id.clone(), ttask.id.clone());
         }
-        // Move it to exec queue
-        let mut exec_tsks = api
-            .executing_tasks
-            .tasks
-            .get(&key)
-            .cloned()
-            .unwrap_or_default();
-        exec_tsks.push(enginelib::task::StoredExecutingTask {
-            bytes: task_payload.clone(),
-            user_id: uid.clone(),
-            given_at: Utc::now(),
-            id: ttask.id.clone(),
-        });
-        api.executing_tasks.tasks.insert(key.clone(), exec_tsks);
-        match postcard::to_allocvec(&api.executing_tasks.clone()) {
-            Ok(store) => {
-                if let Err(e) = api.db.insert("executing_tasks", store) {
-                    return Err(Status::internal(format!("DB insert error: {}", e)));
-                }
-            }
-            Err(e) => {
-                return Err(Status::internal(format!("Serialization error: {}", e)));
-            }
-        }
-        let response = proto::Task {
-            id: ttask.id.clone(),
-            task_id: input.task_id.clone(),
-            task_payload,
+
+        Ok(tonic::Response::new(proto::Task {
+            id: ttask.id,
+            task_id,
+            task_payload: ttask.bytes,
             payload: Vec::new(),
-        };
-        Events::ServerTaskAcquired(&api, uid, input.task_id.clone(), ttask.id.clone());
-        Ok(tonic::Response::new(response))
+        }))
     }
     async fn publish_task(
         &self,
         request: tonic::Request<proto::Task>,
     ) -> Result<tonic::Response<proto::Empty>, tonic::Status> {
-        let mut api = self.EngineAPI.write().await;
         let challenge = get_auth(&request);
         let uid = get_uid(&request);
-        let db = api.db.clone();
 
         let task_id = request.get_ref().task_id.clone();
         let instance_id = request.get_ref().id.clone();
         let payload_for_event = Arc::new(std::sync::RwLock::new(
             request.get_ref().task_payload.clone(),
         ));
-        if Events::ServerBeforeTaskPublish(
-            &api,
-            uid.clone(),
-            task_id.clone(),
-            request.get_ref().id.clone(),
-            payload_for_event.clone(),
-        ) {
-            info!(
-                "ServerBeforeTaskPublish cancelled for user: {} task: {}",
-                uid, task_id
-            );
-            return Err(Status::aborted(
-                "Task publish cancelled by server event handler",
-            ));
+
+        {
+            let mut api = self.EngineAPI.write().await;
+            let db = api.db.clone();
+            if !Events::CheckAuth(&mut api, uid.clone(), challenge, db) {
+                info!("Aquire Task denied due to Invalid Auth");
+                return Err(Status::permission_denied("Invalid authentication"));
+            };
         }
+
+        {
+            let api = self.EngineAPI.read().await;
+            if Events::ServerBeforeTaskPublish(
+                &api,
+                uid.clone(),
+                task_id.clone(),
+                instance_id.clone(),
+                payload_for_event.clone(),
+            ) {
+                info!(
+                    "ServerBeforeTaskPublish cancelled for user: {} task: {}",
+                    uid, task_id
+                );
+                return Err(Status::aborted(
+                    "Task publish cancelled by server event handler",
+                ));
+            }
+        }
+
         let publish_payload = payload_for_event
             .read()
             .map(|p| p.clone())
             .map_err(|_| Status::internal("Task publish payload lock poisoned"))?;
 
-        let alen = &task_id.split(":").collect::<Vec<&str>>().len();
-        if *alen != 2 {
-            return Err(Status::invalid_argument("Invalid Params"));
-        }
-        let namespace = &task_id.split(":").collect::<Vec<&str>>()[0];
-        let task_name = &task_id.split(":").collect::<Vec<&str>>()[1];
-
-        if !Events::CheckAuth(&mut api, uid.clone(), challenge, db) {
-            info!("Aquire Task denied due to Invalid Auth");
-            return Err(Status::permission_denied("Invalid authentication"));
-        };
-        if !api
-            .task_registry
-            .tasks
-            .contains_key(&ID(namespace, task_name))
-        {
-            warn!(
-                "Task acquisition failed - task does not exist: {}:{}",
-                namespace, task_name
-            );
-            return Err(Status::invalid_argument("Task Does not Exist"));
-        }
+        let (namespace, task_name) = task_id
+            .split_once(':')
+            .ok_or_else(|| Status::invalid_argument("Invalid Params"))?;
         let key = ID(namespace, task_name);
-        let mem_tsk = api
-            .executing_tasks
-            .tasks
-            .get(&key)
-            .cloned()
-            .unwrap_or_default();
-        let tsk_opt = mem_tsk
-            .iter()
-            .find(|f| f.id == instance_id && f.user_id == uid.clone());
-        if let Some(tsk) = tsk_opt {
-            let reg_tsk = match api.task_registry.get(&key) {
-                Some(r) => r.clone(),
+
+        let reg_tsk = {
+            let api = self.EngineAPI.read().await;
+            if !api.task_registry.tasks.contains_key(&key) {
+                warn!(
+                    "Task acquisition failed - task does not exist: {}:{}",
+                    namespace, task_name
+                );
+                return Err(Status::invalid_argument("Task Does not Exist"));
+            }
+
+            match api.task_registry.get(&key) {
+                Some(r) => r,
                 None => {
                     warn!("Task registry missing for {}:{}", namespace, task_name);
                     return Err(Status::invalid_argument("Task Does not Exist"));
                 }
+            }
+        };
+
+        if !reg_tsk.verify(publish_payload.clone()) {
+            info!("Failed to parse task");
+            return Err(Status::invalid_argument("Failed to parse given task bytes"));
+        }
+
+        let (solved_id, exec_key_state, solved_key_state, db) = {
+            let mut api = self.EngineAPI.write().await;
+
+            let solved_id = {
+                let exec_tasks = api
+                    .executing_tasks
+                    .tasks
+                    .get_mut(&key)
+                    .ok_or_else(|| tonic::Status::not_found("Invalid taskid or userid"))?;
+
+                let idx = exec_tasks
+                    .iter()
+                    .position(|f| f.id == instance_id && f.user_id == uid)
+                    .ok_or_else(|| tonic::Status::not_found("Invalid taskid or userid"))?;
+
+                exec_tasks.remove(idx).id
             };
-            if !reg_tsk.verify(publish_payload.clone()) {
-                info!("Failed to parse task");
-                return Err(Status::invalid_argument("Failed to parse given task bytes"));
-            }
-            // Exec Tasks -> DB
-            let mut nmem_tsk = mem_tsk.clone();
-            nmem_tsk.retain(|f| !(f.id == instance_id && f.user_id == uid.clone()));
-            api.executing_tasks
+
+            api.solved_tasks.tasks.entry(key.clone()).or_default().push(
+                enginelib::task::StoredTask {
+                    bytes: publish_payload.clone(),
+                    id: solved_id.clone(),
+                },
+            );
+
+            let exec_key_state = api
+                .executing_tasks
                 .tasks
-                .insert(key.clone(), nmem_tsk.clone());
-            let t_mem_execs = api.executing_tasks.clone();
-            match postcard::to_allocvec(&t_mem_execs) {
-                Ok(store) => {
-                    if let Err(e) = api.db.insert("executing_tasks", store) {
-                        return Err(Status::internal(format!("DB insert error: {}", e)));
-                    }
-                }
-                Err(e) => return Err(Status::internal(format!("Serialization error: {}", e))),
-            }
-            // tsk-> solved Tsks
-            let mut mem_solv = api
+                .get(&key)
+                .cloned()
+                .unwrap_or_default();
+            let solved_key_state = api
                 .solved_tasks
                 .tasks
                 .get(&key)
                 .cloned()
                 .unwrap_or_default();
-            mem_solv.push(enginelib::task::StoredTask {
-                bytes: publish_payload.clone(),
-                id: tsk.id.clone(),
-            });
-            api.solved_tasks.tasks.insert(key.clone(), mem_solv);
-            // Solved tsks -> DB
-            match postcard::to_allocvec(&api.solved_tasks.tasks) {
-                Ok(e_solv) => {
-                    if let Err(e) = api.db.insert("solved_tasks", e_solv) {
-                        return Err(Status::internal(format!("DB insert error: {}", e)));
-                    }
-                }
-                Err(e) => return Err(Status::internal(format!("Serialization error: {}", e))),
-            }
-            info!("Task published successfully: {} by user: {}", task_id, uid);
-            Events::ServerTaskPublished(&api, uid.clone(), task_id.clone(), tsk.id.clone());
-            return Ok(tonic::Response::new(proto::Empty {}));
-        } else {
-            return Err(tonic::Status::not_found("Invalid taskid or userid"));
+            let db = api.db.clone();
+
+            (solved_id, exec_key_state, solved_key_state, db)
+        };
+
+        let exec_op = EngineAPI::state_op_executing(&key, &exec_key_state)
+            .map_err(|e| Status::internal(format!("Serialization error: {}", e)))?;
+        let solved_op = EngineAPI::state_op_solved(&key, &solved_key_state)
+            .map_err(|e| Status::internal(format!("Serialization error: {}", e)))?;
+
+        EngineAPI::apply_batch_ops(&db, vec![exec_op, solved_op])
+            .map_err(|e| Status::internal(format!("DB insert error: {}", e)))?;
+
+        {
+            let api = self.EngineAPI.read().await;
+            Events::ServerTaskPublished(&api, uid.clone(), task_id.clone(), solved_id);
         }
+
+        info!("Task published successfully: {} by user: {}", task_id, uid);
+        Ok(tonic::Response::new(proto::Empty {}))
     }
     async fn create_task(
         &self,
@@ -690,18 +703,17 @@ impl Engine for EngineService {
                 bytes: task_payload.clone(),
                 id: druid::Druid::default().to_hex(),
             };
-            let mut mem_tsks = api.task_queue.clone();
-            let mut mem_tsk = mem_tsks.tasks.get(&id).cloned().unwrap_or_default();
-            mem_tsk.push(tbp_tsk.clone());
-            mem_tsks.tasks.insert(id.clone(), mem_tsk);
-            api.task_queue = mem_tsks;
-            match postcard::to_allocvec(&api.task_queue.clone()) {
-                Ok(store) => {
-                    if let Err(e) = api.db.insert("tasks", store) {
-                        return Err(Status::internal(format!("DB insert error: {}", e)));
-                    }
-                }
-                Err(e) => return Err(Status::internal(format!("Serialization error: {}", e))),
+            api.task_queue
+                .tasks
+                .entry(id.clone())
+                .or_default()
+                .push(tbp_tsk.clone());
+
+            let tasks_key_state = api.task_queue.tasks.get(&id).cloned().unwrap_or_default();
+            let task_op = EngineAPI::state_op_tasks(&id, &tasks_key_state)
+                .map_err(|e| Status::internal(format!("Serialization error: {}", e)))?;
+            if let Err(e) = EngineAPI::apply_batch_ops(&api.db, vec![task_op]) {
+                return Err(Status::internal(format!("DB insert error: {}", e)));
             }
             Events::ServerTaskCreated(
                 &api,
