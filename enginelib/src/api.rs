@@ -110,7 +110,7 @@ impl ServerAPI {
         api.lib_manager = new_lib_manager;
         for (id, _tsk) in api.task_registry.tasks.iter() {
             api.task_queue.tasks.entry(id.clone()).or_default();
-            api.executing_tasks.tasks.entry(id.clone()).or_default();
+            api.leased_tasks.tasks.entry(id.clone()).or_default();
             api.solved_tasks.tasks.entry(id.clone()).or_default();
         }
 

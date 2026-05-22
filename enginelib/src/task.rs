@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use std::fmt::Debug;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::Identifier;
 use chrono::{DateTime, Utc};
@@ -14,8 +14,7 @@ pub struct StoredTask {
 }
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct LeasedTask {
-    pub bytes: Vec<u8>,
-    pub id: String,
+    pub stored_task: Arc<StoredTask>,
     pub user_id: String,
     pub given_at: DateTime<Utc>,
 }
