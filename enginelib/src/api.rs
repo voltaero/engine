@@ -126,11 +126,6 @@ impl ServerAPI {
     fn init_events(api: &mut Self) {
         crate::event::register_inventory_handlers(api);
     }
-    pub fn init_packer(api: &mut Self) {
-        Self::setup_logger();
-        let mut newLibManager = LibraryManager::default();
-        newLibManager.load_modules(api);
-    }
     pub fn init_chron(api: Arc<RwLock<Self>>) {
         let t = api.try_read().unwrap().cfg.config_toml.clean_tasks;
         spawn(clear_sled_periodically(api, t));
