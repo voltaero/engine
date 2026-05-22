@@ -8,7 +8,7 @@ use crate::{
     config::Config,
     event::{EngineEventHandlerRegistry, EventBus},
     plugin::LibraryManager,
-    task::{LeasedTaskQueue, SolvedTasks, StoredTask, Task, TaskQueue},
+    task::{LeasedTaskQueue, StoredTask, Task, TaskQueue},
 };
 pub use postcard;
 pub use postcard::from_bytes;
@@ -23,7 +23,6 @@ pub struct ServerAPI {
     pub cfg: Config,                       // RW
     pub task_queue: TaskQueue,             // RW
     pub leased_tasks: LeasedTaskQueue,     // RW
-    pub solved_tasks: SolvedTasks,         // RW
     pub task_registry: EngineTaskRegistry, // RW
     pub event_bus: EventBus,               // RW
     pub db: sled::Db,                      // R
@@ -44,7 +43,6 @@ impl Default for ServerAPI {
                     event_handlers: HashMap::new(),
                 },
             },
-            solved_tasks: SolvedTasks::default(),
             leased_tasks: LeasedTaskQueue::default(),
             client: false,
         }
@@ -130,18 +128,19 @@ impl ServerAPI {
         let t = api.try_read().unwrap().cfg.config_toml.clean_tasks;
         spawn(clear_sled_periodically(api, t));
     }
-    const TASKS_PREFIX: &'static str = "q:tasks:";
-    const LEASING_PREFIX: &'static str = "q:executing:";
-    const SOLVED_PREFIX: &'static str = "q:solved:";
+    const TASKS_PREFIX: &'static str = "tasks:";
+    const LEASING_PREFIX: &'static str = "leasing:";
+    const SOLVED_PREFIX: &'static str = "solved:";
 
-    fn state_key(prefix: &str, id: &Identifier) -> Vec<u8> {
-        format!("{}{}\u{1f}{}", prefix, id.0, id.1).into_bytes()
+    fn state_key(prefix: &str, task_id: &Identifier, id: String) -> Vec<u8> {
+        format!("{}{}\u{1f}{}:{}", prefix, task_id.0, task_id.1, id).into_bytes()
     }
 
     fn parse_state_key(prefix: &str, key: &[u8]) -> Option<Identifier> {
         let key = std::str::from_utf8(key).ok()?;
         let rest = key.strip_prefix(prefix)?;
-        let (namespace, task) = rest.split_once('\u{1f}')?;
+        let (task_id, id) = rest.split_once(":")?;
+        let (namespace, task) = task_id.split_once('\u{1f}')?;
         Some((namespace.to_string(), task.to_string()))
     }
 
