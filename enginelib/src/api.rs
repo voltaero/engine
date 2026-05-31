@@ -176,16 +176,6 @@ impl ServerAPI {
     fn init_db(api: &mut ServerAPI) {
         api.task_queue = TaskQueue::default();
         api.leased_tasks = LeasedTaskQueue::default();
-
-        for item in api.db.scan_prefix(Self::TASKS_PREFIX.as_bytes()) {
-            if let Ok((key, value)) = item {
-                if let Some(id) = Self::parse_state_key(Self::TASKS_PREFIX, &key) {
-                    if let Ok(tasks) = postcard::from_bytes::<StoredTask>(&value) {
-                        api.task_queue.tasks.get(&id).unwrap().push(Arc::new(tasks));
-                    }
-                }
-            }
-        }
     }
 
     pub fn setup_logger() {

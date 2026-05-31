@@ -1,4 +1,4 @@
-use enginelib::{Registry, api::EngineAPI, events::ID, task::Verifiable};
+use enginelib::{Registry, api::ServerAPI, events::ID, task::Verifiable};
 use macros::Verifiable;
 use std::sync::Arc;
 use tracing_test::traced_test;
@@ -35,7 +35,7 @@ fn id() {
 #[traced_test]
 #[test]
 fn test_event_registration_and_handling() {
-    let mut api = EngineAPI::test_default();
+    let mut api = ServerAPI::test_default();
 
     let mut test_event = TestEvent {
         value: 0,
@@ -51,7 +51,7 @@ fn test_event_registration_and_handling() {
 #[traced_test]
 #[test]
 fn test_stateful_event_auto_registration() {
-    let mut api = EngineAPI::test_default();
+    let mut api = ServerAPI::test_default();
 
     enginelib::event::register_inventory_handlers(&mut api);
 
@@ -96,7 +96,7 @@ fn test_task_registration() {
             return Box::new(self.clone());
         }
     }
-    let mut api = EngineAPI::test_default();
+    let mut api = ServerAPI::test_default();
     let task_id = ID("test", "test_task");
 
     // Register the task type
