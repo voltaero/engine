@@ -27,7 +27,6 @@ pub struct ServerAPI {
     pub event_bus: EventBus,               // RW
     pub db: sled::Db,                      // R
     pub lib_manager: LibraryManager,       // RW
-    pub client: bool,                      // RW
 }
 
 impl Default for ServerAPI {
@@ -49,23 +48,6 @@ impl Default for ServerAPI {
     }
 }
 impl ServerAPI {
-    // pub fn default_client() -> Self {
-    //     Self {
-    //         cfg: Config::default(),
-    //         task_queue: TaskQueue::default(),
-    //         db: sled::open("engine_client_db").unwrap(),
-    //         lib_manager: LibraryManager::default(),
-    //         task_registry: EngineTaskRegistry::default(),
-    //         event_bus: EventBus {
-    //             event_handler_registry: EngineEventHandlerRegistry {
-    //                 event_handlers: HashMap::new(),
-    //             },
-    //         },
-    //         solved_tasks: SolvedTasks::default(),
-    //         executing_tasks: ExecutingTaskQueue::default(),
-    //         client: true,
-    //     }
-    //}
     pub fn test_default() -> Self {
         // `sled::Config::temporary(true)` defaults to `/dev/shm` on Linux when no path is set.
         // Some environments deny writes there, so force a unique temp path.
@@ -80,7 +62,6 @@ impl ServerAPI {
         ));
 
         Self {
-            client: false,
             cfg: Config::new(),
             leased_tasks: LeasedTaskQueue::default(),
             task_queue: TaskQueue::default(),
@@ -141,103 +122,6 @@ impl ServerAPI {
         let (namespace, task) = task_id.split_once('\u{1f}')?;
         Some((namespace.to_string(), task.to_string()))
     }
-
-    // pub fn apply_batch_entries(
-    //     db: &sled::Db,
-    //     entries: Vec<(&'static str, Vec<u8>)>,
-    // ) -> sled::Result<()> {
-    //     let mut batch = sled::Batch::default();
-    //     for (key, value) in entries {
-    //         batch.insert(key, value);
-    //     }
-    //     db.apply_batch(batch)
-    // }
-
-    // pub fn apply_batch_ops(
-    //     db: &sled::Db,
-    //     ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-    // ) -> sled::Result<()> {
-    //     let mut batch = sled::Batch::default();
-    //     for (key, value) in ops {
-    //         match value {
-    //             Some(v) => batch.insert(key, v),
-    //             None => batch.remove(key),
-    //         }
-    //     }
-    //     db.apply_batch(batch)
-    // }
-
-    // pub fn state_op_tasks(
-    //     id: &Identifier,
-    //     value: &Vec<StoredTask>,
-    // ) -> Result<(Vec<u8>, Option<Vec<u8>>), postcard::Error> {
-    //     if value.is_empty() {
-    //         Ok((Self::state_key(Self::TASKS_PREFIX, id), None))
-    //     } else {
-    //         Ok((
-    //             Self::state_key(Self::TASKS_PREFIX, id),
-    //             Some(postcard::to_allocvec(value)?),
-    //         ))
-    //     }
-    // }
-
-    // pub fn state_op_executing(
-    //     id: &Identifier,
-    //     value: &Vec<StoredExecutingTask>,
-    // ) -> Result<(Vec<u8>, Option<Vec<u8>>), postcard::Error> {
-    //     if value.is_empty() {
-    //         Ok((Self::state_key(Self::LEASING_PREFIX, id), None))
-    //     } else {
-    //         Ok((
-    //             Self::state_key(Self::LEASING_PREFIX, id),
-    //             Some(postcard::to_allocvec(value)?),
-    //         ))
-    //     }
-    // }
-
-    // pub fn state_op_solved(
-    //     id: &Identifier,
-    //     value: &Vec<StoredTask>,
-    // ) -> Result<(Vec<u8>, Option<Vec<u8>>), postcard::Error> {
-    //     if value.is_empty() {
-    //         Ok((Self::state_key(Self::SOLVED_PREFIX, id), None))
-    //     } else {
-    //         Ok((
-    //             Self::state_key(Self::SOLVED_PREFIX, id),
-    //             Some(postcard::to_allocvec(value)?),
-    //         ))
-    //     }
-    // }
-
-    // pub fn sync_db(api: &mut ServerAPI) {
-    //     // IF THIS FN CAUSES PANIC SOMETHING IS VERY BROKEN
-    //     let mut ops: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
-
-    //     for prefix in [
-    //         Self::TASKS_PREFIX,
-    //         Self::LEASING_PREFIX,
-    //         Self::SOLVED_PREFIX,
-    //     ] {
-    //         for item in api.db.scan_prefix(prefix.as_bytes()) {
-    //             if let Ok((key, _)) = item {
-    //                 ops.push((key.to_vec(), None));
-    //             }
-    //         }
-    //     }
-
-    //     for (id, tasks) in &api.task_queue.tasks {
-    //         ops.push(Self::state_op_tasks(id, tasks).unwrap());
-    //     }
-    //     for (id, tasks) in &api.executing_tasks.tasks {
-    //         ops.push(Self::state_op_executing(id, tasks).unwrap());
-    //     }
-    //     for (id, tasks) in &api.solved_tasks.tasks {
-    //         ops.push(Self::state_op_solved(id, tasks).unwrap());
-    //     }
-
-    //     Self::apply_batch_ops(&api.db, ops).unwrap();
-    //     debug!("Synced in-memory state to keyed sled storage");
-    // }
 
     fn init_db(api: &mut ServerAPI) {
         api.task_queue = TaskQueue::default();

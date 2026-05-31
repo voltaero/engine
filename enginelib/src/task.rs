@@ -4,6 +4,7 @@ use std::{collections::HashMap, sync::Arc};
 use crate::Identifier;
 use chrono::{DateTime, Utc};
 use crossbeam::queue::ArrayQueue;
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{error, instrument, warn};
 
@@ -20,12 +21,12 @@ pub struct LeasedTask {
 }
 #[derive(Debug, Default)]
 pub struct TaskQueue {
-    pub tasks: HashMap<Identifier, ArrayQueue<Arc<StoredTask>>>,
+    pub tasks: DashMap<Identifier, ArrayQueue<Arc<StoredTask>>>,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct LeasedTaskQueue {
-    pub tasks: HashMap<Identifier, Vec<LeasedTask>>,
+    pub tasks: DashMap<Identifier, Vec<LeasedTask>>,
 }
 
 pub trait Verifiable {
