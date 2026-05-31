@@ -121,11 +121,19 @@ impl ServerAPI {
 
     fn fill_queue(api: &ServerAPI, task_id: Identifier) {
         let max_block = api.cfg.config_toml.task_block_size.max(1) as usize;
+        let max_queue = api.cfg.config_toml.task_queue_size as usize;
 
         let Some(channel) = api.task_queue.tasks.get(&task_id) else {
             return;
         };
         let sender = &channel.1;
+
+        // Soft size lock: bail out if the channel is already at its configured cap.
+        // The cap is advisory — a partially-built trailing block may still push us
+        // one block past the limit, but no full block is enqueued once we hit it.
+        if sender.len() >= max_queue {
+            return;
+        }
 
         // Build a leased-id set once per call — O(L) instead of O(N·L) per scan item.
         let leased: HashSet<String> = api
@@ -153,6 +161,9 @@ impl ServerAPI {
                 let full = std::mem::replace(&mut block, Vec::with_capacity(max_block));
                 if sender.try_send(StoredTaskBlock { tasks: full }).is_err() {
                     return; // receiver dropped
+                }
+                if sender.len() >= max_queue {
+                    return;
                 }
             }
         }
