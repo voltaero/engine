@@ -38,7 +38,6 @@ pub struct TaskQueue {
 #[derive(Debug, Default, Clone)]
 pub struct LeasedTaskQueue {
     pub tasks: DashMap<Identifier, Vec<LeasedTask>>,
-    pub tasks_set: DashMap<Identifier, DashSet<LeasedTask>>,
 }
 
 pub trait Verifiable {

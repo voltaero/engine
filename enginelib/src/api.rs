@@ -9,7 +9,7 @@ use crate::{
     config::Config,
     event::{EngineEventHandlerRegistry, EventBus},
     plugin::LibraryManager,
-    task::{LeasedTaskQueue, StoredTask, Task, TaskQueue},
+    task::{LeasedTaskQueue, StoredTask, StoredTaskBlock, Task, TaskQueue},
 };
 pub use postcard;
 pub use postcard::from_bytes;
@@ -103,8 +103,8 @@ impl ServerAPI {
         let t = api.try_read().unwrap().cfg.config_toml.clean_tasks;
         spawn(clear_sled_periodically(api, t));
     }
+    // type:namespace:task:id
     const TASKS_PREFIX: &'static str = "tasks:";
-    const LEASING_PREFIX: &'static str = "leasing:";
     const SOLVED_PREFIX: &'static str = "solved:";
 
     fn state_key(prefix: &str, task_id: &Identifier, id: String) -> Vec<u8> {
@@ -119,24 +119,46 @@ impl ServerAPI {
         Some((namespace.to_string(), task.to_string()))
     }
 
-    fn fill_queue(api: &mut ServerAPI, task_id: Identifier) {
-        let max_cached = api.cfg.config_toml.task_block_size.max(1) as usize;
-        for item in api.db.scan_prefix(Self::TASKS_PREFIX.as_bytes()) {
-            if let Ok((key, value)) = item {
-                if let Some(id) = Self::parse_state_key(Self::TASKS_PREFIX, &key) {
-                    if let Ok(tasks) = postcard::from_bytes::<StoredTask>(&value) {
-                        let is_leased = api
-                            .leased_tasks
-                            .tasks
-                            .get(&id)
-                            .map(|leased| leased.contains_key(&tasks.id))
-                            .unwrap_or(false);
-                        if !is_leased {
-                            //add to queue
-                        }
-                    }
+    fn fill_queue(api: &ServerAPI, task_id: Identifier) {
+        let max_block = api.cfg.config_toml.task_block_size.max(1) as usize;
+
+        let Some(channel) = api.task_queue.tasks.get(&task_id) else {
+            return;
+        };
+        let sender = &channel.1;
+
+        // Build a leased-id set once per call — O(L) instead of O(N·L) per scan item.
+        let leased: HashSet<String> = api
+            .leased_tasks
+            .tasks
+            .get(&task_id)
+            .map(|v| v.iter().map(|l| l.stored_task.id.clone()).collect())
+            .unwrap_or_default();
+
+        // Narrower prefix: only this task's records, not every TASKS_PREFIX row.
+        let prefix = format!("{}{}\u{1f}{}:", Self::TASKS_PREFIX, task_id.0, task_id.1);
+        let mut block: Vec<StoredTask> = Vec::with_capacity(max_block);
+
+        for item in api.db.scan_prefix(prefix.as_bytes()) {
+            let Ok((_, value)) = item else { continue };
+            let Ok(task) = postcard::from_bytes::<StoredTask>(&value) else {
+                continue;
+            };
+            if leased.contains(&task.id) {
+                continue;
+            }
+
+            block.push(task);
+            if block.len() == max_block {
+                let full = std::mem::replace(&mut block, Vec::with_capacity(max_block));
+                if sender.try_send(StoredTaskBlock { tasks: full }).is_err() {
+                    return; // receiver dropped
                 }
             }
+        }
+
+        if !block.is_empty() {
+            let _ = sender.try_send(StoredTaskBlock { tasks: block });
         }
     }
 
