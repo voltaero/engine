@@ -22,9 +22,9 @@ pub use crate::events::server_before_task_acquire_event::ServerBeforeTaskAcquire
 pub use crate::events::server_before_task_create_event::ServerBeforeTaskCreateEvent;
 pub use crate::events::server_before_task_publish_event::ServerBeforeTaskPublishEvent;
 pub use crate::events::server_start_event::ServerStartEvent;
-pub use crate::events::server_task_acquired_event::ServerTaskAcquiredEvent;
-pub use crate::events::server_task_created_event::ServerTaskCreatedEvent;
-pub use crate::events::server_task_published_event::ServerTaskPublishedEvent;
+pub use crate::events::server_task_block_acquired_event::ServerTaskBlockAcquiredEvent;
+pub use crate::events::server_task_block_created_event::ServerTaskBlockCreatedEvent;
+pub use crate::events::server_task_block_published_event::ServerTaskBlockPublishedEvent;
 pub use crate::events::start_event::StartEvent;
 pub use crate::events::task_acquired_event::TaskAcquiredEvent;
 pub use crate::events::{Events, ID};

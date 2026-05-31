@@ -429,9 +429,9 @@ impl Engine for EngineService {
         );
 
         {
-            let mut api = self.EngineAPI.write().await;
+            let api = self.EngineAPI.read().await;
             let db = api.db.clone();
-            if !Events::CheckAuth(&mut api, uid.clone(), challenge, db) {
+            if !Events::CheckAuth(&api, uid.clone(), challenge, db) {
                 info!(
                     "Task acquisition denied - invalid authentication for user: {}",
                     uid
@@ -479,12 +479,14 @@ impl Engine for EngineService {
             .await
             .map_err(|_| Status::unavailable("Task queue closed"))?;
 
-        // Lease every task in the block and fire post-acquire events.
-        {
+        // Lease the block and fire one per-block acquire event.
+        let instance_ids: Vec<String> = {
             let api = self.EngineAPI.read().await;
             let mut entry = api.leased_tasks.tasks.entry(key.clone()).or_default();
             let now = Utc::now();
+            let mut ids = Vec::with_capacity(block.tasks.len());
             for task in &block.tasks {
+                ids.push(task.id.clone());
                 entry.push(LeasedTask {
                     stored_task: Arc::new(task.clone()),
                     user_id: uid.clone(),
@@ -492,10 +494,10 @@ impl Engine for EngineService {
                 });
             }
             drop(entry);
-            for task in &block.tasks {
-                Events::ServerTaskAcquired(&api, uid.clone(), task_id.clone(), task.id.clone());
-            }
-        }
+            Events::ServerTaskBlockAcquired(&api, uid.clone(), task_id.clone(), ids.clone());
+            ids
+        };
+        let _ = instance_ids;
 
         let tasks = block
             .tasks
@@ -524,9 +526,9 @@ impl Engine for EngineService {
         ));
 
         {
-            let mut api = self.EngineAPI.write().await;
+            let api = self.EngineAPI.read().await;
             let db = api.db.clone();
-            if !Events::CheckAuth(&mut api, uid.clone(), challenge, db) {
+            if !Events::CheckAuth(&api, uid.clone(), challenge, db) {
                 info!("Aquire Task denied due to Invalid Auth");
                 return Err(Status::permission_denied("Invalid authentication"));
             };
@@ -637,7 +639,12 @@ impl Engine for EngineService {
 
         {
             let api = self.EngineAPI.read().await;
-            Events::ServerTaskPublished(&api, uid.clone(), task_id.clone(), solved_id);
+            Events::ServerTaskBlockPublished(
+                &api,
+                uid.clone(),
+                task_id.clone(),
+                vec![solved_id],
+            );
         }
 
         info!("Task published successfully: {} by user: {}", task_id, uid);
@@ -647,11 +654,11 @@ impl Engine for EngineService {
         &self,
         request: tonic::Request<proto::Task>,
     ) -> Result<tonic::Response<proto::Task>, tonic::Status> {
-        let mut api = self.EngineAPI.write().await;
+        let api = self.EngineAPI.read().await;
         let challenge = get_auth(&request);
         let uid = get_uid(&request);
         let db = api.db.clone();
-        if !Events::CheckAuth(&mut api, uid, challenge, db) {
+        if !Events::CheckAuth(&api, uid, challenge, db) {
             //TODO: change to AdminSpecific Auth
             info!("Create Task denied due to Invalid Auth");
             return Err(Status::permission_denied("Invalid authentication"));
@@ -699,11 +706,11 @@ impl Engine for EngineService {
             if let Err(e) = EngineAPI::apply_batch_ops(&api.db, vec![task_op]) {
                 return Err(Status::internal(format!("DB insert error: {}", e)));
             }
-            Events::ServerTaskCreated(
+            Events::ServerTaskBlockCreated(
                 &api,
                 task_id.clone(),
-                tbp_tsk.id.clone(),
-                Arc::new(std::sync::RwLock::new(tbp_tsk.bytes.clone())),
+                vec![tbp_tsk.id.clone()],
+                vec![Arc::new(std::sync::RwLock::new(tbp_tsk.bytes.clone()))],
             );
             return Ok(tonic::Response::new(proto::Task {
                 id: tbp_tsk.id.clone(),

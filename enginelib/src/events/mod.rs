@@ -10,9 +10,9 @@ pub mod server_before_task_acquire_event;
 pub mod server_before_task_create_event;
 pub mod server_before_task_publish_event;
 pub mod server_start_event;
-pub mod server_task_acquired_event;
-pub mod server_task_created_event;
-pub mod server_task_published_event;
+pub mod server_task_block_acquired_event;
+pub mod server_task_block_created_event;
+pub mod server_task_block_published_event;
 pub mod start_event;
 pub mod task_acquired_event;
 use std::collections::HashMap;
@@ -32,12 +32,12 @@ pub struct Events;
 impl Events {
     pub fn init_auth(_api: &mut ServerAPI) {}
 
-    pub fn CheckAuth(api: &mut ServerAPI, uid: String, challenge: String, db: Db) -> bool {
+    pub fn CheckAuth(api: &ServerAPI, uid: String, challenge: String, db: Db) -> bool {
         auth_event::AuthEvent::check(api, uid, challenge, db)
     }
 
     pub fn CheckAdminAuth(
-        api: &mut ServerAPI,
+        api: &ServerAPI,
         payload: String,
         target: Identifier,
         db: Db,
@@ -109,21 +109,36 @@ impl Events {
         server_before_task_create_event::ServerBeforeTaskCreateEvent::check(api, task_id, payload)
     }
 
-    pub fn ServerTaskCreated(
+    pub fn ServerTaskBlockCreated(
         api: &ServerAPI,
         task_id: String,
-        instance_id: String,
-        payload: Arc<RwLock<Vec<u8>>>,
+        instance_ids: Vec<String>,
+        payloads: Vec<Arc<RwLock<Vec<u8>>>>,
     ) {
-        server_task_created_event::ServerTaskCreatedEvent::fire(api, task_id, instance_id, payload)
+        server_task_block_created_event::ServerTaskBlockCreatedEvent::fire(
+            api,
+            task_id,
+            instance_ids,
+            payloads,
+        )
     }
 
     pub fn ServerBeforeTaskAcquire(api: &ServerAPI, uid: String, task_id: String) -> bool {
         server_before_task_acquire_event::ServerBeforeTaskAcquireEvent::check(api, uid, task_id)
     }
 
-    pub fn ServerTaskAcquired(api: &ServerAPI, uid: String, task_id: String, instance_id: String) {
-        server_task_acquired_event::ServerTaskAcquiredEvent::fire(api, uid, task_id, instance_id)
+    pub fn ServerTaskBlockAcquired(
+        api: &ServerAPI,
+        uid: String,
+        task_id: String,
+        instance_ids: Vec<String>,
+    ) {
+        server_task_block_acquired_event::ServerTaskBlockAcquiredEvent::fire(
+            api,
+            uid,
+            task_id,
+            instance_ids,
+        )
     }
 
     pub fn ServerBeforeTaskPublish(
@@ -142,7 +157,17 @@ impl Events {
         )
     }
 
-    pub fn ServerTaskPublished(api: &ServerAPI, uid: String, task_id: String, instance_id: String) {
-        server_task_published_event::ServerTaskPublishedEvent::fire(api, uid, task_id, instance_id)
+    pub fn ServerTaskBlockPublished(
+        api: &ServerAPI,
+        uid: String,
+        task_id: String,
+        instance_ids: Vec<String>,
+    ) {
+        server_task_block_published_event::ServerTaskBlockPublishedEvent::fire(
+            api,
+            uid,
+            task_id,
+            instance_ids,
+        )
     }
 }

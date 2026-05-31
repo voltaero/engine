@@ -16,7 +16,7 @@ pub struct AuthEvent {
 }
 impl AuthEvent {
     pub fn fire(
-        api: &mut ServerAPI,
+        api: &ServerAPI,
         uid: String,
         challenge: String,
         db: Db,
@@ -32,7 +32,7 @@ impl AuthEvent {
         });
     }
 
-    pub fn check(api: &mut ServerAPI, uid: String, challenge: String, db: Db) -> bool {
+    pub fn check(api: &ServerAPI, uid: String, challenge: String, db: Db) -> bool {
         let output = Arc::new(RwLock::new(false));
         Self::fire(api, uid, challenge, db, output.clone());
         *output.read().unwrap()

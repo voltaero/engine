@@ -19,7 +19,7 @@ pub struct AdminAuthEvent {
 
 impl AdminAuthEvent {
     pub fn fire(
-        api: &mut ServerAPI,
+        api: &ServerAPI,
         payload: String,
         target: Identifier,
         db: Db,
@@ -35,7 +35,7 @@ impl AdminAuthEvent {
         });
     }
 
-    pub fn check(api: &mut ServerAPI, payload: String, target: Identifier, db: Db) -> bool {
+    pub fn check(api: &ServerAPI, payload: String, target: Identifier, db: Db) -> bool {
         let output = Arc::new(RwLock::new(false));
         Self::fire(api, payload, target, db, output.clone());
         *output.read().unwrap()
