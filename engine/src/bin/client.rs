@@ -1,10 +1,5 @@
 use enginelib::{
-    Registry,
-    api::EngineAPI,
-    events::Events,
-    event::info,
-    plugin::LibraryInstance,
-    prelude::debug,
+    Registry, api::EngineAPI, event::info, events::Events, plugin::LibraryInstance, prelude::debug,
 };
 use proto::engine_client;
 use std::{collections::HashMap, error::Error, sync::Arc};
@@ -88,14 +83,18 @@ async fn worker_loop(
                     continue;
                 }
                 Err(status) => {
-                    debug!("worker {}: acquire failed for {}: {:?}", worker_id, task_id, status);
+                    debug!(
+                        "worker {}: acquire failed for {}: {:?}",
+                        worker_id, task_id, status
+                    );
                     continue;
                 }
             };
 
             let task_payload = task_req.get_mut();
 
-            let acquired_payload = Arc::new(std::sync::RwLock::new(task_payload.task_payload.clone()));
+            let acquired_payload =
+                Arc::new(std::sync::RwLock::new(task_payload.task_payload.clone()));
             Events::TaskAcquired(
                 api.as_ref(),
                 task_id.clone(),

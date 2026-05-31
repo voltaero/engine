@@ -11,12 +11,11 @@ fn default_clean_tasks() -> u64 {
     60
 }
 fn default_task_block_size() -> u32 {
-    256
+    256_000
 }
 fn default_pagination_limit() -> u32 {
     u32::MAX
 }
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ConfigTomlServer {
     #[serde(default)]
