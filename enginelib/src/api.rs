@@ -43,7 +43,6 @@ impl Default for ServerAPI {
                 },
             },
             leased_tasks: LeasedTaskQueue::default(),
-            client: false,
         }
     }
 }
@@ -174,7 +173,7 @@ impl ServerAPI {
             let _ = tracing_subscriber::FmtSubscriber::builder()
                 // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
                 // will be written to stdout.
-                .with_max_level(Level::INFO)
+                .with_max_level(Level::ERROR)
                 // builds the subscriber.
                 .try_init();
         });
@@ -235,53 +234,6 @@ pub async fn clear_sled_periodically(api: Arc<RwLock<ServerAPI>>, n_minutes: u64
             if task_list.len() != before_len {
                 touched_exec.insert(id.clone());
             }
-        }
-
-        let mut touched_tasks: HashSet<Identifier> = HashSet::new();
-        for (id, task) in moved_tasks {
-            rw_api
-                .task_queue
-                .tasks
-                .entry(id.clone())
-                .or_default()
-                .push(task);
-            touched_tasks.insert(id);
-        }
-
-        if touched_exec.is_empty() && touched_tasks.is_empty() {
-            continue;
-        }
-
-        let mut ops: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
-
-        for id in touched_exec {
-            let value = rw_api
-                .executing_tasks
-                .tasks
-                .get(&id)
-                .cloned()
-                .unwrap_or_default();
-            match ServerAPI::state_op_executing(&id, &value) {
-                Ok(op) => ops.push(op),
-                Err(e) => error!("Failed to serialize executing_tasks entry: {:?}", e),
-            }
-        }
-
-        for id in touched_tasks {
-            let value = rw_api
-                .task_queue
-                .tasks
-                .get(&id)
-                .cloned()
-                .unwrap_or_default();
-            match ServerAPI::state_op_tasks(&id, &value) {
-                Ok(op) => ops.push(op),
-                Err(e) => error!("Failed to serialize tasks entry: {:?}", e),
-            }
-        }
-
-        if let Err(e) = ServerAPI::apply_batch_ops(&rw_api.db, ops) {
-            error!("Failed to update task state in Sled batch: {:?}", e);
         }
     }
 }
