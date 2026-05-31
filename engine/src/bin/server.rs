@@ -79,7 +79,7 @@ impl Engine for EngineService {
         };
         return Ok(tonic::Response::new(proto::Empty {}));
     }
-    async fn delete_task(
+    async fn delete_task_block(
         &self,
         request: tonic::Request<proto::TaskSelector>,
     ) -> Result<Response<proto::Empty>, Status> {
@@ -414,7 +414,7 @@ impl Engine for EngineService {
         Ok(tonic::Response::new(response))
     }
 
-    async fn aquire_task(
+    async fn aquire_task_block(
         &self,
         request: tonic::Request<proto::TaskRequest>,
     ) -> Result<tonic::Response<proto::Task>, tonic::Status> {
@@ -526,7 +526,7 @@ impl Engine for EngineService {
             payload: Vec::new(),
         }))
     }
-    async fn publish_task(
+    async fn publish_task_block(
         &self,
         request: tonic::Request<proto::Task>,
     ) -> Result<tonic::Response<proto::Empty>, tonic::Status> {
@@ -659,7 +659,7 @@ impl Engine for EngineService {
         info!("Task published successfully: {} by user: {}", task_id, uid);
         Ok(tonic::Response::new(proto::Empty {}))
     }
-    async fn create_task(
+    async fn create_task_block(
         &self,
         request: tonic::Request<proto::Task>,
     ) -> Result<tonic::Response<proto::Task>, tonic::Status> {
