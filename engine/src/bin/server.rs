@@ -1,5 +1,7 @@
 use engine::{get_auth, get_uid};
+use enginelib::api::ServerAPI;
 use enginelib::plugin::LibraryMetadata;
+use enginelib::task::LeasedTask;
 use enginelib::{
     Identifier, RawIdentifier, Registry,
     api::EngineAPI,
@@ -416,8 +418,8 @@ impl Engine for EngineService {
 
     async fn aquire_task_block(
         &self,
-        request: tonic::Request<proto::TaskRequest>,
-    ) -> Result<tonic::Response<proto::Task>, tonic::Status> {
+        request: tonic::Request<proto::TaskBlockRequest>,
+    ) -> Result<tonic::Response<proto::TaskBlock>, tonic::Status> {
         let challenge = get_auth(&request);
         let task_id = request.get_ref().task_id.clone();
         let uid = get_uid(&request);
@@ -429,7 +431,6 @@ impl Engine for EngineService {
         {
             let mut api = self.EngineAPI.write().await;
             let db = api.db.clone();
-            debug!("Validating authentication for task acquisition");
             if !Events::CheckAuth(&mut api, uid.clone(), challenge, db) {
                 info!(
                     "Task acquisition denied - invalid authentication for user: {}",
@@ -440,91 +441,74 @@ impl Engine for EngineService {
         }
 
         let (namespace, task_name) = task_id.split_once(':').ok_or_else(|| {
-            info!("Invalid task ID format: {}", task_id);
             Status::invalid_argument("Invalid task ID format, expected 'namespace:task'")
         })?;
-
-        debug!("Looking up task definition for {}:{}", namespace, task_name);
         let key = ID(namespace, task_name);
 
         {
             let api = self.EngineAPI.read().await;
             if api.task_registry.get(&key).is_none() {
-                warn!(
-                    "Task acquisition failed - task does not exist: {}:{}",
-                    namespace, task_name
-                );
                 return Err(Status::invalid_argument("Task Does not Exist"));
             }
             if Events::ServerBeforeTaskAcquire(&api, uid.clone(), task_id.clone()) {
-                info!(
-                    "ServerBeforeTaskAcquire cancelled for user: {} task: {}",
-                    uid, task_id
-                );
                 return Err(Status::aborted(
                     "Task acquire cancelled by server event handler",
                 ));
             }
         }
 
-        let (ttask, tasks_key_state, exec_key_state, db) = {
-            let mut api = self.EngineAPI.write().await;
-
-            let queue = api
-                .task_queue
-                .tasks
-                .get_mut(&key)
-                .ok_or_else(|| Status::not_found("No queued tasks available"))?;
-
-            if queue.is_empty() {
-                info!("No queued tasks for {}:{}", namespace, task_name);
-                return Err(Status::not_found("No queued tasks available"));
-            }
-
-            let ttask = queue.remove(0);
-            let task_payload = ttask.bytes.clone();
-
-            api.executing_tasks
-                .tasks
-                .entry(key.clone())
-                .or_default()
-                .push(enginelib::task::StoredExecutingTask {
-                    bytes: task_payload,
-                    user_id: uid.clone(),
-                    given_at: Utc::now(),
-                    id: ttask.id.clone(),
-                });
-
-            let tasks_key_state = api.task_queue.tasks.get(&key).cloned().unwrap_or_default();
-            let exec_key_state = api
-                .executing_tasks
+        // Resolve the receiver, refill from sled if drained, then await a block.
+        // recv blocks until a producer (fill_queue or create_task_block) pushes one,
+        // so callers should use a gRPC deadline if they need an upper bound.
+        let receiver = {
+            let api = self.EngineAPI.read().await;
+            api.task_queue
                 .tasks
                 .get(&key)
-                .cloned()
-                .unwrap_or_default();
-            let db = api.db.clone();
-            (ttask, tasks_key_state, exec_key_state, db)
+                .map(|entry| entry.0.clone())
+                .ok_or_else(|| Status::not_found("Unknown task type"))?
         };
 
-        let tasks_op = EngineAPI::state_op_tasks(&key, &tasks_key_state)
-            .map_err(|e| Status::internal(format!("Serialization error: {}", e)))?;
-        let exec_op = EngineAPI::state_op_executing(&key, &exec_key_state)
-            .map_err(|e| Status::internal(format!("Serialization error: {}", e)))?;
-
-        EngineAPI::apply_batch_ops(&db, vec![tasks_op, exec_op])
-            .map_err(|e| Status::internal(format!("DB insert error: {}", e)))?;
-
-        {
+        if receiver.is_empty() {
             let api = self.EngineAPI.read().await;
-            Events::ServerTaskAcquired(&api, uid.clone(), task_id.clone(), ttask.id.clone());
+            ServerAPI::fill_queue(&api, key.clone());
         }
 
-        Ok(tonic::Response::new(proto::Task {
-            id: ttask.id,
-            task_id,
-            task_payload: ttask.bytes,
-            payload: Vec::new(),
-        }))
+        let block = receiver
+            .recv()
+            .await
+            .map_err(|_| Status::unavailable("Task queue closed"))?;
+
+        // Lease every task in the block and fire post-acquire events.
+        {
+            let api = self.EngineAPI.read().await;
+            let mut entry = api.leased_tasks.tasks.entry(key.clone()).or_default();
+            let now = Utc::now();
+            for task in &block.tasks {
+                entry.push(LeasedTask {
+                    stored_task: Arc::new(task.clone()),
+                    user_id: uid.clone(),
+                    given_at: now,
+                });
+            }
+            drop(entry);
+            for task in &block.tasks {
+                Events::ServerTaskAcquired(&api, uid.clone(), task_id.clone(), task.id.clone());
+            }
+        }
+
+        let tasks = block
+            .tasks
+            .into_iter()
+            .map(|t| proto::Task {
+                id: t.id,
+                task_id: task_id.clone(),
+                task_payload: t.bytes,
+                payload: Vec::new(),
+            })
+            .collect();
+
+        Ok(tonic::Response::new(proto::TaskBlock { tasks }))
     }
     async fn publish_task_block(
         &self,

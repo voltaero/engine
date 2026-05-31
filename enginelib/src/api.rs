@@ -119,7 +119,7 @@ impl ServerAPI {
         Some((namespace.to_string(), task.to_string()))
     }
 
-    fn fill_queue(api: &ServerAPI, task_id: Identifier) {
+    pub fn fill_queue(api: &ServerAPI, task_id: Identifier) {
         let max_block = api.cfg.config_toml.task_block_size.max(1) as usize;
         let max_queue = api.cfg.config_toml.task_queue_size as usize;
 
