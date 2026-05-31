@@ -4,16 +4,16 @@ use std::{collections::HashMap, sync::Arc};
 use crate::Identifier;
 use chrono::{DateTime, Utc};
 use crossbeam::queue::ArrayQueue;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use serde::{Deserialize, Serialize};
 use tracing::{error, instrument, warn};
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct StoredTask {
     pub bytes: Vec<u8>,
     pub id: String,
 }
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct LeasedTask {
     pub stored_task: Arc<StoredTask>,
     pub user_id: String,
@@ -38,6 +38,7 @@ pub struct TaskQueue {
 #[derive(Debug, Default, Clone)]
 pub struct LeasedTaskQueue {
     pub tasks: DashMap<Identifier, Vec<LeasedTask>>,
+    pub tasks_set: DashMap<Identifier, DashSet<LeasedTask>>,
 }
 
 pub trait Verifiable {

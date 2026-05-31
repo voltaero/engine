@@ -119,7 +119,7 @@ impl ServerAPI {
         Some((namespace.to_string(), task.to_string()))
     }
 
-    fn fill_queue(api: &mut ServerAPI) {
+    fn fill_queue(api: &mut ServerAPI, task_id: Identifier) {
         let max_cached = api.cfg.config_toml.task_block_size.max(1) as usize;
         for item in api.db.scan_prefix(Self::TASKS_PREFIX.as_bytes()) {
             if let Ok((key, value)) = item {
