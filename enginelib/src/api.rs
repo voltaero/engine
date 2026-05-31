@@ -87,13 +87,9 @@ impl ServerAPI {
         let mut new_lib_manager = LibraryManager::default();
         new_lib_manager.load_modules(api);
         api.lib_manager = new_lib_manager;
-        for (id, _tsk) in api.task_registry.tasks.iter() {
-            api.task_queue
-                .tasks
-                .entry(id.clone())
-                .insert_entry(ArrayQueue::new(
-                    api.cfg.config_toml.task_block_size as usize,
-                ));
+        for (id, _tsk) in api.task_registry.tasks.clone() {
+            let (s, r) = async_channel::unbounded();
+            api.task_queue.tasks.entry(id.clone()).insert((r, s));
             api.leased_tasks.tasks.entry(id.clone()).or_default();
         }
 

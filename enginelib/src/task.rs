@@ -21,7 +21,13 @@ pub struct LeasedTask {
 }
 #[derive(Debug, Default)]
 pub struct TaskQueue {
-    pub tasks: DashMap<Identifier, ArrayQueue<Arc<StoredTask>>>,
+    pub tasks: DashMap<
+        Identifier,
+        (
+            async_channel::Receiver<StoredTask>,
+            async_channel::Sender<StoredTask>,
+        ),
+    >,
 }
 
 #[derive(Debug, Default, Clone)]
