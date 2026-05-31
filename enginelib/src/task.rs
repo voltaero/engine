@@ -19,13 +19,18 @@ pub struct LeasedTask {
     pub user_id: String,
     pub given_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct StoredTaskBlock {
+    pub tasks: Vec<StoredTask>,
+}
 #[derive(Debug, Default)]
 pub struct TaskQueue {
     pub tasks: DashMap<
         Identifier,
         (
-            async_channel::Receiver<StoredTask>,
-            async_channel::Sender<StoredTask>,
+            async_channel::Receiver<StoredTaskBlock>,
+            async_channel::Sender<StoredTaskBlock>,
         ),
     >,
 }

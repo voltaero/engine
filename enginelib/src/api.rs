@@ -119,6 +119,27 @@ impl ServerAPI {
         Some((namespace.to_string(), task.to_string()))
     }
 
+    fn fill_queue(api: &mut ServerAPI) {
+        let max_cached = api.cfg.config_toml.task_block_size.max(1) as usize;
+        for item in api.db.scan_prefix(Self::TASKS_PREFIX.as_bytes()) {
+            if let Ok((key, value)) = item {
+                if let Some(id) = Self::parse_state_key(Self::TASKS_PREFIX, &key) {
+                    if let Ok(tasks) = postcard::from_bytes::<StoredTask>(&value) {
+                        let is_leased = api
+                            .leased_tasks
+                            .tasks
+                            .get(&id)
+                            .map(|leased| leased.contains_key(&tasks.id))
+                            .unwrap_or(false);
+                        if !is_leased {
+                            //add to queue
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn init_db(api: &mut ServerAPI) {
         api.task_queue = TaskQueue::default();
         api.leased_tasks = LeasedTaskQueue::default();
