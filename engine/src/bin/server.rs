@@ -70,7 +70,7 @@ impl Engine for EngineService {
         request: tonic::Request<proto::Empty>,
     ) -> Result<Response<proto::Empty>, Status> {
         let challenge = get_auth(&request);
-        let mut api = self.EngineAPI.write().await;
+        let mut api = self.EngineAPI.read().await;
         let db = api.db.clone();
         let output = Events::CheckAdminAuth(&mut api, challenge, ("".into(), "".into()), db);
         if !output {

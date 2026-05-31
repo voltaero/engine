@@ -1,12 +1,12 @@
 syntax = "proto3";
 package engine;
 service Engine {
-  rpc AquireTask(TaskRequest) returns (Task);
+  rpc AquireTaskBlock(TaskBlockRequest) returns (TaskBlock);
   rpc AquireTaskReg(empty) returns (TaskRegistry);
-  rpc PublishTask(Task) returns (empty);
+  rpc PublishTaskBlock(TaskBlock) returns (empty);
   rpc cgrpc(cgrpcmsg) returns (cgrpcmsg);
-  rpc CreateTask(Task) returns (Task);
-  rpc DeleteTask(TaskSelector) returns (empty);
+  rpc CreateTaskBlock(TaskBlock) returns (Task);
+  rpc DeleteTaskBlock(TaskSelector) returns (empty);
   rpc GetTasks(TaskPageRequest) returns (TaskPage);
   rpc CheckAuth(empty) returns (empty);
   rpc GetMetadata(empty) returns (ServerMetadata);
@@ -27,11 +27,13 @@ message TaskSelector {
   string task = 3;
   string id = 4;
 }
+message TaskBlockSelector {
+  repeated TaskBlockSelector selector = 1;
+}
 message empty {}
 enum TaskState {
   QUEUED = 0;
-  PROCESSING = 1;
-  SOLVED = 2;
+  SOLVED = 1;
 }
 message TaskPageRequest {
   string namespace = 1;
@@ -59,13 +61,16 @@ message TaskRegistry {
   repeated string tasks = 1; // namespace:task
 }
 
-message TaskRequest {
+message TaskBlockRequest {
   string task_id = 1; // namespace:task
-  // bytes payload = 2;
+  uint32 block_size = 2;
 }
 message Task {
   string id = 4; // the task unique identifier
   bytes task_payload = 1;
   string task_id = 2; // namespace:task
   bytes payload = 3;
+}
+message TaskBlock {
+  repeated Task tasks = 1;
 }

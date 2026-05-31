@@ -1,5 +1,6 @@
 use chrono::Utc;
 use crossbeam::queue::ArrayQueue;
+use dashmap::DashMap;
 use tokio::{spawn, sync::RwLock, time::interval};
 use tracing::{Level, debug, error, info, instrument};
 
@@ -135,26 +136,6 @@ impl ServerAPI {
                 }
             }
         }
-
-        for item in api.db.scan_prefix(Self::LEASING_PREFIX.as_bytes()) {
-            if let Ok((key, value)) = item {
-                if let Some(id) = Self::parse_state_key(Self::LEASING_PREFIX, &key) {
-                    if let Ok(tasks) = postcard::from_bytes::<Vec<StoredExecutingTask>>(&value) {
-                        api.executing_tasks.tasks.insert(id, tasks);
-                    }
-                }
-            }
-        }
-
-        for item in api.db.scan_prefix(Self::SOLVED_PREFIX.as_bytes()) {
-            if let Ok((key, value)) = item {
-                if let Some(id) = Self::parse_state_key(Self::SOLVED_PREFIX, &key) {
-                    if let Ok(tasks) = postcard::from_bytes::<Vec<StoredTask>>(&value) {
-                        api.solved_tasks.tasks.insert(id, tasks);
-                    }
-                }
-            }
-        }
     }
 
     pub fn setup_logger() {
@@ -181,7 +162,7 @@ impl ServerAPI {
 }
 #[derive(Default, Clone, Debug)]
 pub struct EngineTaskRegistry {
-    pub tasks: HashMap<Identifier, Arc<dyn Task>>,
+    pub tasks: DashMap<Identifier, Arc<dyn Task>>,
 }
 impl Registry<dyn Task> for EngineTaskRegistry {
     #[instrument]
@@ -202,38 +183,38 @@ impl Registry<dyn Task> for EngineTaskRegistry {
 pub async fn clear_sled_periodically(api: Arc<RwLock<ServerAPI>>, n_minutes: u64) {
     info!("Sled Cron Job Started");
     let mut interval = interval(Duration::from_secs(n_minutes * 60));
-    loop {
-        interval.tick().await;
-        info!("Purging Unsolved Tasks");
+    // loop {
+    //     interval.tick().await;
+    //     info!("Purging Unsolved Tasks");
 
-        let now = Utc::now().timestamp();
-        let mut rw_api = api.write().await;
+    //     let now = Utc::now().timestamp();
+    //     let mut rw_api = api.write().await;
 
-        let mut moved_tasks: Vec<(Identifier, StoredTask)> = Vec::new();
-        let mut touched_exec: HashSet<Identifier> = HashSet::new();
+    //     let mut moved_tasks: Vec<(Identifier, StoredTask)> = Vec::new();
+    //     let mut touched_exec: HashSet<Identifier> = HashSet::new();
 
-        for (id, task_list) in rw_api.executing_tasks.tasks.iter_mut() {
-            let before_len = task_list.len();
-            task_list.retain(|info| {
-                let age = now - info.given_at.timestamp();
-                if age > 3600 {
-                    info!("Task {:?} is older than an hour! Moving...", info);
-                    moved_tasks.push((
-                        id.clone(),
-                        StoredTask {
-                            id: info.id.clone(),
-                            bytes: info.bytes.clone(),
-                        },
-                    ));
-                    false
-                } else {
-                    true
-                }
-            });
+    //     for (id, task_list) in rw_api.executing_tasks.tasks.iter_mut() {
+    //         let before_len = task_list.len();
+    //         task_list.retain(|info| {
+    //             let age = now - info.given_at.timestamp();
+    //             if age > 3600 {
+    //                 info!("Task {:?} is older than an hour! Moving...", info);
+    //                 moved_tasks.push((
+    //                     id.clone(),
+    //                     StoredTask {
+    //                         id: info.id.clone(),
+    //                         bytes: info.bytes.clone(),
+    //                     },
+    //                 ));
+    //                 false
+    //             } else {
+    //                 true
+    //             }
+    //         });
 
-            if task_list.len() != before_len {
-                touched_exec.insert(id.clone());
-            }
-        }
-    }
+    //         if task_list.len() != before_len {
+    //             touched_exec.insert(id.clone());
+    //         }
+    //     }
+    // }
 }
