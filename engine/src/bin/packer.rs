@@ -1,18 +1,15 @@
 use clap::{Args, CommandFactory, Subcommand, ValueEnum, ValueHint};
 use clap::{Command, Parser};
 use clap_complete::{Generator, Shell, generate};
-use colored::*;
-use enginelib::events::{Events, ID};
-// For coloring the output
 use enginelib::Registry;
 use enginelib::api::postcard;
+use enginelib::events::{Events, ID};
 use enginelib::prelude::error;
-use enginelib::task::{StoredTask, Task, TaskQueue};
-use enginelib::{api::EngineAPI, config::Config, event::info};
-use serde::Deserialize;
+use enginelib::task::StoredTask;
+use enginelib::{api::ServerAPI, config::Config, event::info};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::fs::File;
 use std::io::Write;
 use std::io::{self, BufReader, ErrorKind, Read};
@@ -114,7 +111,7 @@ impl StateArg {
     fn to_proto(&self) -> i32 {
         match self {
             StateArg::Queued => proto::TaskState::Queued as i32,
-            StateArg::Processing => proto::TaskState::Processing as i32,
+            StateArg::Processing => proto::TaskState::Leased as i32,
             StateArg::Solved => proto::TaskState::Solved as i32,
         }
     }
@@ -174,7 +171,7 @@ fn print_completions<G: Generator>(generator: G, cmd: &mut Command) {
     );
 }
 
-fn build_headers(api: &EngineAPI, admin: bool) -> HashMap<String, String> {
+fn build_headers(api: &ServerAPI, admin: bool) -> HashMap<String, String> {
     let headers = std::sync::Arc::new(std::sync::RwLock::new(HashMap::<String, String>::new()));
     Events::ClientAuthPrepare(api, headers.clone());
     let mut prepared_headers = headers.read().map(|h| h.clone()).unwrap_or_default();
@@ -199,6 +196,17 @@ struct ChunkedTaskRecord {
     task: String,
     id: String,
     payload: Vec<u8>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PackedTaskQueue {
+    tasks: BTreeMap<(String, String), Vec<StoredTask>>,
+}
+
+impl PackedTaskQueue {
+    fn push(&mut self, key: (String, String), task: StoredTask) {
+        self.tasks.entry(key).or_default().push(task);
+    }
 }
 
 fn write_chunked_header<W: Write>(writer: &mut W) -> io::Result<()> {
@@ -353,13 +361,10 @@ async fn main() {
         eprintln!("Generating completion file for {generator:?}...");
         print_completions(generator, &mut cmd);
     }
-    let mut api = EngineAPI::default_client();
-    EngineAPI::init_client(&mut api);
+    let mut api = ServerAPI::default_client();
+    ServerAPI::init_client(&mut api);
     // packer intentionally uses client init path; load config explicitly for host/admin token
     api.cfg = Config::new();
-    for (id, tsk) in api.task_registry.tasks.iter() {
-        api.task_queue.tasks.entry(id.clone()).or_default();
-    }
     if let Some(command) = cli.command {
         match command {
             Commands::Schema => {
@@ -411,8 +416,8 @@ async fn main() {
 
                     // Try to deserialize. Only on successful deserialization do we
                     // process entries and write the output TOML file.
-                    let maybe_queue: Option<TaskQueue> =
-                        match postcard::from_bytes::<TaskQueue>(&buf) {
+                    let maybe_queue: Option<PackedTaskQueue> =
+                        match postcard::from_bytes::<PackedTaskQueue>(&buf) {
                             Ok(k) => Some(k),
                             Err(e) => {
                                 error!("Failed to deserialize task queue: {}", e);
@@ -546,8 +551,11 @@ async fn main() {
                             payload: Vec::new(),
                         };
 
-                        match client.create_task(Request::new(req)).await {
-                            Ok(_) => uploaded += 1,
+                        match client
+                            .create_task_block(Request::new(proto::TaskBlock { tasks: vec![req] }))
+                            .await
+                        {
+                            Ok(resp) => uploaded += resp.into_inner().tasks.len(),
                             Err(e) => {
                                 failed += 1;
                                 error!("Failed to upload task {}: {}", task_id, e);
@@ -573,7 +581,8 @@ async fn main() {
                         }
                     }
 
-                    let queue: TaskQueue = match postcard::from_bytes::<TaskQueue>(&buf) {
+                    let queue: PackedTaskQueue = match postcard::from_bytes::<PackedTaskQueue>(&buf)
+                    {
                         Ok(q) => q,
                         Err(e) => {
                             error!("Failed to deserialize task queue: {}", e);
@@ -583,19 +592,25 @@ async fn main() {
 
                     for ((namespace, task), tasks) in queue.tasks {
                         let task_id = format!("{}:{}", namespace, task);
-                        for stored in tasks {
-                            let req = proto::Task {
+                        let requested = tasks.len();
+                        let requests: Vec<proto::Task> = tasks
+                            .into_iter()
+                            .map(|stored| proto::Task {
                                 id: stored.id,
                                 task_id: task_id.clone(),
                                 task_payload: stored.bytes,
                                 payload: Vec::new(),
-                            };
-                            match client.create_task(Request::new(req)).await {
-                                Ok(_) => uploaded += 1,
-                                Err(e) => {
-                                    failed += 1;
-                                    error!("Failed to upload task {}: {}", task_id, e);
-                                }
+                            })
+                            .collect();
+
+                        match client
+                            .create_task_block(Request::new(proto::TaskBlock { tasks: requests }))
+                            .await
+                        {
+                            Ok(resp) => uploaded += resp.into_inner().tasks.len(),
+                            Err(e) => {
+                                failed += requested;
+                                error!("Failed to upload task {}: {}", task_id, e);
                             }
                         }
                     }
@@ -790,7 +805,7 @@ async fn main() {
                     vec![args.state.clone()]
                 };
 
-                let mut out_queue = TaskQueue::default();
+                let mut out_queue = PackedTaskQueue::default();
                 let mut fetched = 0usize;
 
                 for task_id in task_ids {
@@ -825,13 +840,14 @@ async fn main() {
                                 break;
                             }
 
-                            let key = ID(namespace, task);
-                            let bucket = out_queue.tasks.entry(key).or_default();
                             for t in resp.tasks {
-                                bucket.push(StoredTask {
-                                    bytes: t.task_payload,
-                                    id: t.id,
-                                });
+                                out_queue.push(
+                                    ID(namespace, task),
+                                    StoredTask {
+                                        bytes: t.task_payload,
+                                        id: t.id,
+                                    },
+                                );
                                 fetched += 1;
                             }
 
@@ -899,7 +915,7 @@ async fn main() {
                     id: args.id.clone(),
                 };
 
-                match client.delete_task(Request::new(req)).await {
+                match client.delete_task_block(Request::new(req)).await {
                     Ok(_) => info!(
                         "Deleted task {} from {}:{} ({:?})",
                         args.id, args.namespace, args.task, args.state
@@ -915,6 +931,7 @@ async fn main() {
                             match toml::from_str::<RawDoc>(&toml_str) {
                                 Ok(raw) => {
                                     let entries = parse_entries(raw);
+                                    let mut out_queue = PackedTaskQueue::default();
                                     for entry in entries {
                                         match api
                                             .task_registry
@@ -928,17 +945,13 @@ async fn main() {
                                                             entry.namespace.as_str(),
                                                             entry.id.as_str(),
                                                         );
-                                                        let mut vec = api
-                                                            .task_queue
-                                                            .tasks
-                                                            .get(&key)
-                                                            .cloned()
-                                                            .unwrap_or_default();
-                                                        vec.push(StoredTask {
-                                                            id: "".into(), //ids are minted on the server
-                                                            bytes: t.to_bytes(),
-                                                        });
-                                                        api.task_queue.tasks.insert(key, vec);
+                                                        out_queue.push(
+                                                            key,
+                                                            StoredTask {
+                                                                id: "".into(), //ids are minted on the server
+                                                                bytes: t.to_bytes(),
+                                                            },
+                                                        );
                                                     }
                                                     Err(e) => {
                                                         error!(
@@ -968,9 +981,7 @@ async fn main() {
                                                 }
 
                                                 let mut wrote = 0usize;
-                                                for ((namespace, task), tasks) in
-                                                    &api.task_queue.tasks
-                                                {
+                                                for ((namespace, task), tasks) in &out_queue.tasks {
                                                     for stored in tasks {
                                                         let record = ChunkedTaskRecord {
                                                             namespace: namespace.clone(),
@@ -1012,7 +1023,7 @@ async fn main() {
                                             }
                                         }
                                     } else {
-                                        match postcard::to_allocvec(&api.task_queue) {
+                                        match postcard::to_allocvec(&out_queue) {
                                             Ok(data) => {
                                                 match File::create("output.rustforge.bin") {
                                                     Ok(mut file) => {

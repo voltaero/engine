@@ -85,6 +85,16 @@ impl ServerAPI {
             fill_locks: DashMap::new(),
         }
     }
+    /// Ensure the task_queue + leased_tasks entries exist for this Identifier.
+    /// Idempotent — calling repeatedly is a no-op once registered.
+    pub fn ensure_task_channel(&self, id: Identifier) {
+        self.task_queue.tasks.entry(id.clone()).or_insert_with(|| {
+            let (s, r) = async_channel::unbounded();
+            (r, s)
+        });
+        self.leased_tasks.tasks.entry(id).or_default();
+    }
+
     pub fn init(api: &mut Self) {
         Self::setup_logger();
         api.cfg = Config::new();
@@ -98,6 +108,46 @@ impl ServerAPI {
             api.leased_tasks.tasks.entry(id.clone()).or_default();
         }
 
+        Self::init_events(api);
+    }
+
+    /// Client-side ServerAPI with a temp sled (client doesn't use db/task_queue
+    /// at all; the temp dir is just to satisfy the struct field).
+    pub fn default_client() -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let db_id = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let db_path = std::env::temp_dir().join(format!(
+            "enginelib-client-db-{}-{}",
+            std::process::id(),
+            db_id
+        ));
+        Self {
+            cfg: Config::new(),
+            task_queue: TaskQueue::default(),
+            leased_tasks: LeasedTaskQueue::default(),
+            task_registry: EngineTaskRegistry::default(),
+            event_bus: EventBus {
+                event_handler_registry: EngineEventHandlerRegistry {
+                    event_handlers: HashMap::new(),
+                },
+            },
+            db: sled::Config::new()
+                .path(db_path)
+                .temporary(true)
+                .flush_every_ms(None)
+                .open()
+                .unwrap(),
+            lib_manager: LibraryManager::default(),
+            fill_locks: DashMap::new(),
+        }
+    }
+
+    /// Client init: logger + inventory event handlers. Skips load_modules
+    /// because client mods are loaded via a different path and module
+    /// validation happens against server metadata.
+    pub fn init_client(api: &mut Self) {
+        Self::setup_logger();
         Self::init_events(api);
     }
 

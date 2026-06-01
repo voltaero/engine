@@ -26,6 +26,12 @@ tonic = "0.14"
 tonic-prost = "0.14.5"
 
 tonic-reflection = "0.14"
+
+[[bench]]
+name = "engine_tps"
+path = "benches/engine_tps.rs"
+harness = false
+
 [build-dependencies]
 tonic-build = "0.14"
 tonic-prost-build = "0.14"

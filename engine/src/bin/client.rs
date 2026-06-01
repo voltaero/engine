@@ -1,5 +1,5 @@
 use enginelib::{
-    Registry, api::EngineAPI, event::info, events::Events, plugin::LibraryInstance, prelude::debug,
+    Registry, api::ServerAPI, event::info, events::Events, plugin::LibraryInstance, prelude::debug,
 };
 use proto::engine_client;
 use std::{collections::HashMap, error::Error, sync::Arc};
@@ -15,8 +15,8 @@ pub mod proto {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let mut api = EngineAPI::default_client();
-    EngineAPI::init_client(&mut api);
+    let mut api = ServerAPI::default_client();
+    ServerAPI::init_client(&mut api);
     Events::ClientStart(&api);
 
     compute_module(Arc::new(api)).await;
@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn make_interceptor(
-    api_for_interceptor: Arc<EngineAPI>,
+    api_for_interceptor: Arc<ServerAPI>,
 ) -> impl FnMut(Request<()>) -> Result<Request<()>, tonic::Status> + Clone {
     move |mut req: Request<()>| {
         let headers = Arc::new(std::sync::RwLock::new(HashMap::<String, String>::new()));
@@ -47,7 +47,7 @@ fn make_interceptor(
 
 async fn worker_loop(
     worker_id: usize,
-    api: Arc<EngineAPI>,
+    api: Arc<ServerAPI>,
     channel: tonic::transport::Channel,
     task_ids: Arc<Vec<String>>,
 ) {
@@ -58,20 +58,21 @@ async fn worker_loop(
         let mut got_any = false;
 
         for task_id in task_ids.iter() {
-            if Events::BeforeTaskAcquire(api.as_ref(), task_id.clone()) {
+            if Events::BeforeTaskBlockAcquire(api.as_ref(), vec![task_id.clone()]) {
                 continue;
             }
 
-            let task_resp = client
-                .aquire_task(Request::new(proto::TaskRequest {
+            let resp = client
+                .aquire_task_block(Request::new(proto::TaskBlockRequest {
                     task_id: task_id.clone(),
+                    block_size: 0,
                 }))
                 .await;
 
-            let mut task_req = match task_resp {
-                Ok(resp) => {
+            let block = match resp {
+                Ok(r) => {
                     got_any = true;
-                    resp
+                    r.into_inner()
                 }
                 Err(status) if status.code() == tonic::Code::NotFound => continue,
                 Err(status) if status.code() == tonic::Code::PermissionDenied => {
@@ -91,69 +92,86 @@ async fn worker_loop(
                 }
             };
 
-            let task_payload = task_req.get_mut();
-
-            let acquired_payload =
-                Arc::new(std::sync::RwLock::new(task_payload.task_payload.clone()));
-            Events::TaskAcquired(
-                api.as_ref(),
-                task_id.clone(),
-                task_payload.id.clone(),
-                acquired_payload.clone(),
-            );
-            if let Ok(payload) = acquired_payload.read() {
-                task_payload.task_payload = payload.clone();
-            }
-
-            let exec_payload = Arc::new(std::sync::RwLock::new(task_payload.task_payload.clone()));
-            if Events::BeforeTaskExecute(
-                api.as_ref(),
-                task_id.clone(),
-                task_payload.id.clone(),
-                exec_payload.clone(),
-            ) {
+            if block.tasks.is_empty() {
                 continue;
-            }
-            if let Ok(payload) = exec_payload.read() {
-                task_payload.task_payload = payload.clone();
             }
 
             let identifier = match task_id.split_once(':') {
-                Some(v) => v,
+                Some(v) => (v.0.to_string(), v.1.to_string()),
                 None => continue,
             };
-            let task = match api
-                .task_registry
-                .get(&(identifier.0.to_string(), identifier.1.to_string()))
-            {
+            let task_def = match api.task_registry.get(&identifier) {
                 Some(t) => t,
                 None => continue,
             };
-            let mut task = task.from_bytes(&task_payload.task_payload);
 
-            task.run_hip();
+            let instance_ids: Vec<String> = block.tasks.iter().map(|t| t.id.clone()).collect();
+            let acquired_payloads: Vec<Arc<std::sync::RwLock<Vec<u8>>>> = block
+                .tasks
+                .iter()
+                .map(|t| Arc::new(std::sync::RwLock::new(t.task_payload.clone())))
+                .collect();
 
-            let mut solv_task = proto::Task {
-                id: task_payload.id.clone(),
-                payload: Vec::new(),
-                task_id: task_id.clone(),
-                task_payload: task.to_bytes(),
-            };
-
-            let publish_payload = Arc::new(std::sync::RwLock::new(solv_task.task_payload.clone()));
-            if Events::BeforeTaskPublish(
+            Events::TaskBlockAcquired(
                 api.as_ref(),
                 task_id.clone(),
-                task_payload.id.clone(),
-                publish_payload.clone(),
+                instance_ids.clone(),
+                acquired_payloads.clone(),
+            );
+
+            if Events::BeforeTaskBlockExecute(
+                api.as_ref(),
+                task_id.clone(),
+                instance_ids.clone(),
+                acquired_payloads.clone(),
             ) {
                 continue;
             }
-            if let Ok(payload) = publish_payload.read() {
-                solv_task.task_payload = payload.clone();
+
+            let mut solved: Vec<proto::Task> = Vec::with_capacity(block.tasks.len());
+            let mut publish_payload_locks: Vec<Arc<std::sync::RwLock<Vec<u8>>>> =
+                Vec::with_capacity(block.tasks.len());
+            for (t, payload_lock) in block.tasks.iter().zip(acquired_payloads.iter()) {
+                let payload = match payload_lock.read() {
+                    Ok(p) => p.clone(),
+                    Err(_) => continue,
+                };
+                let mut tsk = task_def.clone().from_bytes(&payload);
+                tsk.run_hip();
+                let out_bytes = tsk.to_bytes();
+                publish_payload_locks.push(Arc::new(std::sync::RwLock::new(out_bytes.clone())));
+                solved.push(proto::Task {
+                    id: t.id.clone(),
+                    task_id: task_id.clone(),
+                    task_payload: out_bytes,
+                    payload: Vec::new(),
+                });
             }
 
-            if let Err(status) = client.publish_task(Request::new(solv_task)).await {
+            if solved.is_empty() {
+                continue;
+            }
+
+            if Events::BeforeTaskBlockPublish(
+                api.as_ref(),
+                task_id.clone(),
+                instance_ids,
+                publish_payload_locks.clone(),
+            ) {
+                continue;
+            }
+
+            // Sync any handler-modified payloads back into the outgoing block.
+            for (s, lock) in solved.iter_mut().zip(publish_payload_locks.iter()) {
+                if let Ok(p) = lock.read() {
+                    s.task_payload = p.clone();
+                }
+            }
+
+            if let Err(status) = client
+                .publish_task_block(Request::new(proto::TaskBlock { tasks: solved }))
+                .await
+            {
                 debug!(
                     "worker {}: publish failed for {}: {:?}",
                     worker_id, task_id, status
@@ -170,7 +188,7 @@ async fn worker_loop(
 // Compute Module
 // Verifies server and also is
 // Responsible for getting task, executing and publishing it.
-async fn compute_module(api: Arc<EngineAPI>) {
+async fn compute_module(api: Arc<ServerAPI>) {
     let url = "http://[::1]:50051";
     let endpoint = Endpoint::from_static(url)
         .tcp_nodelay(true)

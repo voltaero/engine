@@ -1,8 +1,8 @@
 pub mod admin_auth_event;
 pub mod auth_event;
-pub mod before_task_acquire_event;
-pub mod before_task_execute_event;
-pub mod before_task_publish_event;
+pub mod before_task_block_acquire_event;
+pub mod before_task_block_execute_event;
+pub mod before_task_block_publish_event;
 pub mod cgrpc_event;
 pub mod client_auth_prepare_event;
 pub mod client_start_event;
@@ -14,7 +14,7 @@ pub mod server_task_block_acquired_event;
 pub mod server_task_block_created_event;
 pub mod server_task_block_published_event;
 pub mod start_event;
-pub mod task_acquired_event;
+pub mod task_block_acquired_event;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -36,12 +36,7 @@ impl Events {
         auth_event::AuthEvent::check(api, uid, challenge, db)
     }
 
-    pub fn CheckAdminAuth(
-        api: &ServerAPI,
-        payload: String,
-        target: Identifier,
-        db: Db,
-    ) -> bool {
+    pub fn CheckAdminAuth(api: &ServerAPI, payload: String, target: Identifier, db: Db) -> bool {
         admin_auth_event::AdminAuthEvent::check(api, payload, target, db)
     }
 
@@ -66,35 +61,50 @@ impl Events {
         client_auth_prepare_event::ClientAuthPrepareEvent::fire(api, headers)
     }
 
-    pub fn BeforeTaskAcquire(api: &ServerAPI, task_id: String) -> bool {
-        before_task_acquire_event::BeforeTaskAcquireEvent::check(api, task_id)
+    pub fn BeforeTaskBlockAcquire(api: &ServerAPI, task_ids: Vec<String>) -> bool {
+        before_task_block_acquire_event::BeforeTaskBlockAcquireEvent::check(api, task_ids)
     }
 
-    pub fn TaskAcquired(
+    pub fn TaskBlockAcquired(
         api: &ServerAPI,
         task_id: String,
-        instance_id: String,
-        payload: Arc<RwLock<Vec<u8>>>,
+        instance_ids: Vec<String>,
+        payloads: Vec<Arc<RwLock<Vec<u8>>>>,
     ) {
-        task_acquired_event::TaskAcquiredEvent::fire(api, task_id, instance_id, payload)
+        task_block_acquired_event::TaskBlockAcquiredEvent::fire(
+            api,
+            task_id,
+            instance_ids,
+            payloads,
+        )
     }
 
-    pub fn BeforeTaskExecute(
+    pub fn BeforeTaskBlockExecute(
         api: &ServerAPI,
         task_id: String,
-        instance_id: String,
-        payload: Arc<RwLock<Vec<u8>>>,
+        instance_ids: Vec<String>,
+        payloads: Vec<Arc<RwLock<Vec<u8>>>>,
     ) -> bool {
-        before_task_execute_event::BeforeTaskExecuteEvent::check(api, task_id, instance_id, payload)
+        before_task_block_execute_event::BeforeTaskBlockExecuteEvent::check(
+            api,
+            task_id,
+            instance_ids,
+            payloads,
+        )
     }
 
-    pub fn BeforeTaskPublish(
+    pub fn BeforeTaskBlockPublish(
         api: &ServerAPI,
         task_id: String,
-        instance_id: String,
-        payload: Arc<RwLock<Vec<u8>>>,
+        instance_ids: Vec<String>,
+        payloads: Vec<Arc<RwLock<Vec<u8>>>>,
     ) -> bool {
-        before_task_publish_event::BeforeTaskPublishEvent::check(api, task_id, instance_id, payload)
+        before_task_block_publish_event::BeforeTaskBlockPublishEvent::check(
+            api,
+            task_id,
+            instance_ids,
+            payloads,
+        )
     }
 
     pub fn ServerStart(api: &ServerAPI) {
