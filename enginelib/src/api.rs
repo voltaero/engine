@@ -104,19 +104,67 @@ impl ServerAPI {
         spawn(clear_sled_periodically(api, t));
     }
     // type:namespace:task:id
-    const TASKS_PREFIX: &'static str = "tasks:";
-    const SOLVED_PREFIX: &'static str = "solved:";
+    pub const TASKS_PREFIX: &'static str = "tasks:";
+    pub const SOLVED_PREFIX: &'static str = "solved:";
 
-    fn state_key(prefix: &str, task_id: &Identifier, id: String) -> Vec<u8> {
+    fn state_key(prefix: &str, task_id: &Identifier, id: &str) -> Vec<u8> {
         format!("{}{}\u{1f}{}:{}", prefix, task_id.0, task_id.1, id).into_bytes()
     }
 
-    fn parse_state_key(prefix: &str, key: &[u8]) -> Option<Identifier> {
-        let key = std::str::from_utf8(key).ok()?;
-        let rest = key.strip_prefix(prefix)?;
-        let (task_id, id) = rest.split_once(":")?;
-        let (namespace, task) = task_id.split_once('\u{1f}')?;
-        Some((namespace.to_string(), task.to_string()))
+    fn state_prefix(prefix: &str, task_id: &Identifier) -> Vec<u8> {
+        format!("{}{}\u{1f}{}:", prefix, task_id.0, task_id.1).into_bytes()
+    }
+
+    pub fn task_key(task_id: &Identifier, id: &str) -> Vec<u8> {
+        Self::state_key(Self::TASKS_PREFIX, task_id, id)
+    }
+
+    pub fn solved_key(task_id: &Identifier, id: &str) -> Vec<u8> {
+        Self::state_key(Self::SOLVED_PREFIX, task_id, id)
+    }
+
+    pub fn task_prefix(task_id: &Identifier) -> Vec<u8> {
+        Self::state_prefix(Self::TASKS_PREFIX, task_id)
+    }
+
+    pub fn solved_prefix(task_id: &Identifier) -> Vec<u8> {
+        Self::state_prefix(Self::SOLVED_PREFIX, task_id)
+    }
+
+    pub fn put_queued(&self, task_id: &Identifier, task: &StoredTask) -> sled::Result<()> {
+        let bytes = postcard::to_allocvec(task)
+            .map_err(|e| sled::Error::Unsupported(format!("postcard: {e}")))?;
+        self.db.insert(Self::task_key(task_id, &task.id), bytes)?;
+        Ok(())
+    }
+
+    pub fn put_solved(&self, task_id: &Identifier, task: &StoredTask) -> sled::Result<()> {
+        let bytes = postcard::to_allocvec(task)
+            .map_err(|e| sled::Error::Unsupported(format!("postcard: {e}")))?;
+        self.db.insert(Self::solved_key(task_id, &task.id), bytes)?;
+        Ok(())
+    }
+
+    pub fn delete_queued(&self, task_id: &Identifier, id: &str) -> sled::Result<bool> {
+        Ok(self.db.remove(Self::task_key(task_id, id))?.is_some())
+    }
+
+    pub fn delete_solved(&self, task_id: &Identifier, id: &str) -> sled::Result<bool> {
+        Ok(self.db.remove(Self::solved_key(task_id, id))?.is_some())
+    }
+
+    pub fn scan_queued(&self, task_id: &Identifier) -> impl Iterator<Item = StoredTask> + '_ {
+        self.db
+            .scan_prefix(Self::task_prefix(task_id))
+            .filter_map(|item| item.ok())
+            .filter_map(|(_, value)| postcard::from_bytes::<StoredTask>(&value).ok())
+    }
+
+    pub fn scan_solved(&self, task_id: &Identifier) -> impl Iterator<Item = StoredTask> + '_ {
+        self.db
+            .scan_prefix(Self::solved_prefix(task_id))
+            .filter_map(|item| item.ok())
+            .filter_map(|(_, value)| postcard::from_bytes::<StoredTask>(&value).ok())
     }
 
     pub fn fill_queue(api: &ServerAPI, task_id: Identifier) {
@@ -143,11 +191,9 @@ impl ServerAPI {
             .map(|v| v.iter().map(|l| l.stored_task.id.clone()).collect())
             .unwrap_or_default();
 
-        // Narrower prefix: only this task's records, not every TASKS_PREFIX row.
-        let prefix = format!("{}{}\u{1f}{}:", Self::TASKS_PREFIX, task_id.0, task_id.1);
         let mut block: Vec<StoredTask> = Vec::with_capacity(max_block);
 
-        for item in api.db.scan_prefix(prefix.as_bytes()) {
+        for item in api.db.scan_prefix(Self::task_prefix(&task_id)) {
             let Ok((_, value)) = item else { continue };
             let Ok(task) = postcard::from_bytes::<StoredTask>(&value) else {
                 continue;

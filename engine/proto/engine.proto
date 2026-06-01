@@ -5,7 +5,7 @@ service Engine {
   rpc AquireTaskReg(empty) returns (TaskRegistry);
   rpc PublishTaskBlock(TaskBlock) returns (empty);
   rpc cgrpc(cgrpcmsg) returns (cgrpcmsg);
-  rpc CreateTaskBlock(TaskBlock) returns (Task);
+  rpc CreateTaskBlock(TaskBlock) returns (TaskBlock);
   rpc DeleteTaskBlock(TaskSelector) returns (empty);
   rpc GetTasks(TaskPageRequest) returns (TaskPage);
   rpc CheckAuth(empty) returns (empty);
@@ -34,6 +34,7 @@ message empty {}
 enum TaskState {
   QUEUED = 0;
   SOLVED = 1;
+  LEASED = 2;
 }
 message TaskPageRequest {
   string namespace = 1;
