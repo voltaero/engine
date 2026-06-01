@@ -21,15 +21,16 @@ use std::{
 };
 
 pub struct ServerAPI {
-    pub cfg: Config,                       // RW
-    pub task_queue: TaskQueue,             // RW
-    pub leased_tasks: LeasedTaskQueue,     // RW
+    pub cfg: Config,                   // RW
+    pub task_queue: TaskQueue,         // RW
+    pub leased_tasks: LeasedTaskQueue, // RW
+    pub active_task_ids: DashMap<Identifier, HashSet<String>>,
     pub task_registry: EngineTaskRegistry, // RW
     pub event_bus: EventBus,               // RW
     pub db: sled::Db,                      // R
     pub lib_manager: LibraryManager,       // RW
-    // Serializes fill_queue() calls per Identifier so concurrent acquires can't
-    // both refill an empty channel and double-enqueue the same StoredTaskBlock.
+    // Serializes only sled refills per Identifier. Active task ids keep refills
+    // from duplicating tasks already queued in memory or between recv+lease.
     pub fill_locks: DashMap<Identifier, Arc<tokio::sync::Mutex<()>>>,
 }
 
@@ -47,23 +48,31 @@ impl Default for ServerAPI {
                 },
             },
             leased_tasks: LeasedTaskQueue::default(),
+            active_task_ids: DashMap::new(),
             fill_locks: DashMap::new(),
         }
     }
 }
 impl ServerAPI {
-    pub fn test_default() -> Self {
-        // `sled::Config::temporary(true)` defaults to `/dev/shm` on Linux when no path is set.
-        // Some environments deny writes there, so force a unique temp path.
+    fn temporary_db_path(prefix: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
         let db_id = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let db_path = std::env::temp_dir().join(format!(
-            "enginelib-test-db-{}-{}",
-            std::process::id(),
-            db_id
-        ));
+        let root = std::env::var_os("ENGINE_TEST_DB_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| std::env::temp_dir())
+                    .join("target")
+                    .join("tmp")
+            });
+        let _ = std::fs::create_dir_all(&root);
+        root.join(format!("{}-{}-{}", prefix, std::process::id(), db_id))
+    }
+
+    pub fn test_default() -> Self {
+        let db_path = Self::temporary_db_path("enginelib-test-db");
 
         Self {
             cfg: Config::new(),
@@ -83,6 +92,7 @@ impl ServerAPI {
                 },
             },
             fill_locks: DashMap::new(),
+            active_task_ids: DashMap::new(),
         }
     }
     /// Ensure the task_queue + leased_tasks entries exist for this Identifier.
@@ -92,7 +102,8 @@ impl ServerAPI {
             let (s, r) = async_channel::unbounded();
             (r, s)
         });
-        self.leased_tasks.tasks.entry(id).or_default();
+        self.leased_tasks.tasks.entry(id.clone()).or_default();
+        self.active_task_ids.entry(id).or_default();
     }
 
     pub fn init(api: &mut Self) {
@@ -106,6 +117,7 @@ impl ServerAPI {
             let (s, r) = async_channel::unbounded();
             api.task_queue.tasks.entry(id.clone()).insert((r, s));
             api.leased_tasks.tasks.entry(id.clone()).or_default();
+            api.active_task_ids.entry(id.clone()).or_default();
         }
 
         Self::init_events(api);
@@ -114,14 +126,7 @@ impl ServerAPI {
     /// Client-side ServerAPI with a temp sled (client doesn't use db/task_queue
     /// at all; the temp dir is just to satisfy the struct field).
     pub fn default_client() -> Self {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let db_id = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let db_path = std::env::temp_dir().join(format!(
-            "enginelib-client-db-{}-{}",
-            std::process::id(),
-            db_id
-        ));
+        let db_path = Self::temporary_db_path("enginelib-client-db");
         Self {
             cfg: Config::new(),
             task_queue: TaskQueue::default(),
@@ -140,6 +145,7 @@ impl ServerAPI {
                 .unwrap(),
             lib_manager: LibraryManager::default(),
             fill_locks: DashMap::new(),
+            active_task_ids: DashMap::new(),
         }
     }
 
@@ -193,6 +199,16 @@ impl ServerAPI {
         Ok(())
     }
 
+    pub fn put_queued_batch(&self, task_id: &Identifier, tasks: &[StoredTask]) -> sled::Result<()> {
+        let mut batch = sled::Batch::default();
+        for task in tasks {
+            let bytes = postcard::to_allocvec(task)
+                .map_err(|e| sled::Error::Unsupported(format!("postcard: {e}")))?;
+            batch.insert(Self::task_key(task_id, &task.id), bytes);
+        }
+        self.db.apply_batch(batch)
+    }
+
     pub fn put_solved(&self, task_id: &Identifier, task: &StoredTask) -> sled::Result<()> {
         let bytes = postcard::to_allocvec(task)
             .map_err(|e| sled::Error::Unsupported(format!("postcard: {e}")))?;
@@ -222,8 +238,42 @@ impl ServerAPI {
             .filter_map(|(_, value)| postcard::from_bytes::<StoredTask>(&value).ok())
     }
 
-    pub fn fill_queue(api: &ServerAPI, task_id: Identifier) {
-        let max_block = api.cfg.config_toml.task_block_size.max(1) as usize;
+    pub fn mark_active_id(&self, task_id: &Identifier, id: String) {
+        self.active_task_ids
+            .entry(task_id.clone())
+            .or_default()
+            .insert(id);
+    }
+
+    pub fn mark_active_ids(&self, task_id: &Identifier, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+
+        let mut active = self.active_task_ids.entry(task_id.clone()).or_default();
+        for id in ids {
+            active.insert(id.clone());
+        }
+    }
+
+    pub fn clear_active_ids(&self, task_id: &Identifier, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+
+        if let Some(mut active) = self.active_task_ids.get_mut(task_id) {
+            for id in ids {
+                active.remove(id);
+            }
+        }
+    }
+
+    pub fn fill_queue(api: &ServerAPI, task_id: Identifier, requested_block_size: u32) {
+        let max_block = if requested_block_size > 0 {
+            requested_block_size as usize
+        } else {
+            api.cfg.config_toml.task_block_size.max(1) as usize
+        };
         let max_queue = api.cfg.config_toml.task_queue_size as usize;
 
         let Some(channel) = api.task_queue.tasks.get(&task_id) else {
@@ -245,6 +295,11 @@ impl ServerAPI {
             .get(&task_id)
             .map(|v| v.iter().map(|l| l.stored_task.id.clone()).collect())
             .unwrap_or_default();
+        let active: HashSet<String> = api
+            .active_task_ids
+            .get(&task_id)
+            .map(|v| v.iter().cloned().collect())
+            .unwrap_or_default();
 
         let mut block: Vec<StoredTask> = Vec::with_capacity(max_block);
 
@@ -253,14 +308,23 @@ impl ServerAPI {
             let Ok(task) = postcard::from_bytes::<StoredTask>(&value) else {
                 continue;
             };
-            if leased.contains(&task.id) {
+            let is_active = active.contains(&task.id)
+                || api
+                    .active_task_ids
+                    .get(&task_id)
+                    .map(|ids| ids.contains(&task.id))
+                    .unwrap_or(false);
+            if leased.contains(&task.id) || is_active {
                 continue;
             }
 
             block.push(task);
             if block.len() == max_block {
                 let full = std::mem::replace(&mut block, Vec::with_capacity(max_block));
+                let ids: Vec<String> = full.iter().map(|task| task.id.clone()).collect();
+                api.mark_active_ids(&task_id, &ids);
                 if sender.try_send(StoredTaskBlock { tasks: full }).is_err() {
+                    api.clear_active_ids(&task_id, &ids);
                     return; // receiver dropped
                 }
                 if sender.len() >= max_queue {
@@ -270,13 +334,18 @@ impl ServerAPI {
         }
 
         if !block.is_empty() {
-            let _ = sender.try_send(StoredTaskBlock { tasks: block });
+            let ids: Vec<String> = block.iter().map(|task| task.id.clone()).collect();
+            api.mark_active_ids(&task_id, &ids);
+            if sender.try_send(StoredTaskBlock { tasks: block }).is_err() {
+                api.clear_active_ids(&task_id, &ids);
+            }
         }
     }
 
     fn init_db(api: &mut ServerAPI) {
         api.task_queue = TaskQueue::default();
         api.leased_tasks = LeasedTaskQueue::default();
+        api.active_task_ids = DashMap::new();
     }
 
     pub fn setup_logger() {

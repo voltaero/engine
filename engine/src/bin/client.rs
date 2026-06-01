@@ -2,6 +2,7 @@ use enginelib::{
     Registry, api::ServerAPI, event::info, events::Events, plugin::LibraryInstance, prelude::debug,
 };
 use proto::engine_client;
+use rayon::prelude::*;
 use std::{collections::HashMap, error::Error, sync::Arc};
 use tonic::{
     Request,
@@ -63,17 +64,14 @@ async fn worker_loop(
             }
 
             let resp = client
-                .aquire_task_block(Request::new(proto::TaskBlockRequest {
+                .aquire_task_stream(Request::new(proto::TaskBlockRequest {
                     task_id: task_id.clone(),
                     block_size: 0,
                 }))
                 .await;
 
-            let block = match resp {
-                Ok(r) => {
-                    got_any = true;
-                    r.into_inner()
-                }
+            let mut task_stream = match resp {
+                Ok(r) => r.into_inner(),
                 Err(status) if status.code() == tonic::Code::NotFound => continue,
                 Err(status) if status.code() == tonic::Code::PermissionDenied => {
                     debug!(
@@ -92,9 +90,27 @@ async fn worker_loop(
                 }
             };
 
+            let mut tasks = Vec::new();
+            loop {
+                match task_stream.message().await {
+                    Ok(Some(task)) => tasks.push(task),
+                    Ok(None) => break,
+                    Err(status) => {
+                        debug!(
+                            "worker {}: acquire stream failed for {}: {:?}",
+                            worker_id, task_id, status
+                        );
+                        tasks.clear();
+                        break;
+                    }
+                }
+            }
+
+            let block = proto::TaskBlock { tasks };
             if block.tasks.is_empty() {
                 continue;
             }
+            got_any = true;
 
             let identifier = match task_id.split_once(':') {
                 Some(v) => (v.0.to_string(), v.1.to_string()),
@@ -128,25 +144,46 @@ async fn worker_loop(
                 continue;
             }
 
-            let mut solved: Vec<proto::Task> = Vec::with_capacity(block.tasks.len());
-            let mut publish_payload_locks: Vec<Arc<std::sync::RwLock<Vec<u8>>>> =
-                Vec::with_capacity(block.tasks.len());
-            for (t, payload_lock) in block.tasks.iter().zip(acquired_payloads.iter()) {
-                let payload = match payload_lock.read() {
-                    Ok(p) => p.clone(),
-                    Err(_) => continue,
-                };
-                let mut tsk = task_def.clone().from_bytes(&payload);
-                tsk.run_hip();
-                let out_bytes = tsk.to_bytes();
-                publish_payload_locks.push(Arc::new(std::sync::RwLock::new(out_bytes.clone())));
-                solved.push(proto::Task {
-                    id: t.id.clone(),
-                    task_id: task_id.clone(),
-                    task_payload: out_bytes,
-                    payload: Vec::new(),
-                });
-            }
+            let task_id_for_execute = task_id.clone();
+            let tasks_for_execute = block.tasks;
+            let payloads_for_execute = acquired_payloads.clone();
+            let task_def_for_execute = task_def.clone();
+            let execute_result = tokio::task::spawn_blocking(move || {
+                tasks_for_execute
+                    .into_par_iter()
+                    .zip(payloads_for_execute.into_par_iter())
+                    .filter_map(|(t, payload_lock)| {
+                        let payload = match payload_lock.read() {
+                            Ok(p) => p.clone(),
+                            Err(_) => return None,
+                        };
+                        let mut tsk = task_def_for_execute.clone().from_bytes(&payload);
+                        tsk.run_hip();
+                        let out_bytes = tsk.to_bytes();
+                        let publish_payload_lock =
+                            Arc::new(std::sync::RwLock::new(out_bytes.clone()));
+                        let solved = proto::Task {
+                            id: t.id,
+                            task_id: task_id_for_execute.clone(),
+                            task_payload: out_bytes,
+                            payload: Vec::new(),
+                        };
+                        Some((solved, publish_payload_lock))
+                    })
+                    .unzip::<_, _, Vec<_>, Vec<_>>()
+            })
+            .await;
+
+            let (mut solved, publish_payload_locks) = match execute_result {
+                Ok(result) => result,
+                Err(err) => {
+                    debug!(
+                        "worker {}: execute failed for {}: {:?}",
+                        worker_id, task_id, err
+                    );
+                    continue;
+                }
+            };
 
             if solved.is_empty() {
                 continue;
@@ -169,7 +206,7 @@ async fn worker_loop(
             }
 
             if let Err(status) = client
-                .publish_task_block(Request::new(proto::TaskBlock { tasks: solved }))
+                .publish_task_stream(Request::new(tokio_stream::iter(solved)))
                 .await
             {
                 debug!(
@@ -238,10 +275,20 @@ async fn compute_module(api: Arc<ServerAPI>) {
                 .map(|n| n.get())
                 .unwrap_or(4)
         });
+    let compute_worker_count = std::env::var("GE_CLIENT_COMPUTE_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(worker_count);
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(compute_worker_count)
+        .thread_name(|idx| format!("engine-client-cpu-{idx}"))
+        .build_global();
 
     info!(
-        "Starting {} client workers for {} task types",
+        "Starting {} client workers and {} compute workers for {} task types",
         worker_count,
+        compute_worker_count,
         task_ids.len()
     );
 

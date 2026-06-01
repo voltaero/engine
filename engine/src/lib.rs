@@ -6,8 +6,12 @@ use enginelib::{
     events::{Events, ID},
     task::{LeasedTask, StoredTask, StoredTaskBlock},
 };
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::RwLock;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+use tokio::sync::{RwLock, mpsc};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 pub mod proto {
@@ -50,6 +54,212 @@ impl EngineService {
 
     pub fn into_server(self) -> EngineServer<Self> {
         EngineServer::new(self)
+    }
+
+    async fn acquire_task_block_impl(
+        &self,
+        request: tonic::Request<proto::TaskBlockRequest>,
+    ) -> Result<proto::TaskBlock, Status> {
+        let challenge = get_auth(&request);
+        let task_id = request.get_ref().task_id.clone();
+        let requested_block_size = request.get_ref().block_size;
+        let uid = get_uid(&request);
+
+        {
+            let api = self.EngineAPI.read().await;
+            let db = api.db.clone();
+            if !Events::CheckAuth(&api, uid.clone(), challenge, db) {
+                return Err(Status::permission_denied("Invalid authentication"));
+            };
+        }
+
+        let (namespace, task_name) = task_id.split_once(':').ok_or_else(|| {
+            Status::invalid_argument("Invalid task ID format, expected 'namespace:task'")
+        })?;
+        let key = ID(namespace, task_name);
+
+        {
+            let api = self.EngineAPI.read().await;
+            if api.task_registry.get(&key).is_none() {
+                return Err(Status::invalid_argument("Task Does not Exist"));
+            }
+            if Events::ServerBeforeTaskAcquire(&api, uid.clone(), task_id.clone()) {
+                return Err(Status::aborted(
+                    "Task acquire cancelled by server event handler",
+                ));
+            }
+        }
+
+        let (receiver, lock_arc) = {
+            let api = self.EngineAPI.read().await;
+            let receiver = api
+                .task_queue
+                .tasks
+                .get(&key)
+                .map(|entry| entry.0.clone())
+                .ok_or_else(|| Status::not_found("Unknown task type"))?;
+            let lock_arc = api.fill_locks.entry(key.clone()).or_default().clone();
+            (receiver, lock_arc)
+        };
+
+        if receiver.is_empty() {
+            let _fill_guard = lock_arc.lock().await;
+            if receiver.is_empty() {
+                let api = self.EngineAPI.read().await;
+                ServerAPI::fill_queue(&api, key.clone(), requested_block_size);
+            }
+        }
+
+        let block = receiver
+            .recv()
+            .await
+            .map_err(|_| Status::unavailable("Task queue closed"))?;
+
+        {
+            let api = self.EngineAPI.read().await;
+            let mut entry = api.leased_tasks.tasks.entry(key.clone()).or_default();
+            let now = Utc::now();
+            let mut ids = Vec::with_capacity(block.tasks.len());
+            for task in &block.tasks {
+                ids.push(task.id.clone());
+                entry.push(LeasedTask {
+                    stored_task: Arc::new(task.clone()),
+                    user_id: uid.clone(),
+                    given_at: now,
+                });
+            }
+            drop(entry);
+            api.clear_active_ids(&key, &ids);
+            Events::ServerTaskBlockAcquired(&api, uid.clone(), task_id.clone(), ids);
+        }
+
+        let tasks = block
+            .tasks
+            .into_iter()
+            .map(|t| proto::Task {
+                id: t.id,
+                task_id: task_id.clone(),
+                task_payload: t.bytes,
+                payload: Vec::new(),
+            })
+            .collect();
+
+        Ok(proto::TaskBlock { tasks })
+    }
+
+    async fn publish_tasks_impl(
+        &self,
+        uid: String,
+        challenge: String,
+        tasks: Vec<proto::Task>,
+    ) -> Result<(), Status> {
+        if tasks.is_empty() {
+            return Ok(());
+        }
+
+        let api = self.EngineAPI.read().await;
+
+        {
+            let db = api.db.clone();
+            if !Events::CheckAuth(&api, uid.clone(), challenge, db) {
+                return Err(Status::permission_denied("Invalid authentication"));
+            };
+        }
+
+        let mut groups: HashMap<Identifier, Vec<proto::Task>> = HashMap::new();
+        for t in tasks {
+            let Some((ns, name)) = t.task_id.split_once(':') else {
+                info!("publish: skipping malformed task_id {}", t.task_id);
+                continue;
+            };
+            groups
+                .entry((ns.to_string(), name.to_string()))
+                .or_default()
+                .push(t);
+        }
+
+        for (key, tasks) in groups {
+            let task_id_str = format!("{}:{}", key.0, key.1);
+            let Some(reg_tsk) = api.task_registry.get(&key) else {
+                info!("publish: unknown task {}:{}, skipping group", key.0, key.1);
+                continue;
+            };
+
+            let mut candidates: Vec<(proto::Task, Vec<u8>)> = Vec::with_capacity(tasks.len());
+            let mut candidate_ids: HashSet<String> = HashSet::with_capacity(tasks.len());
+            let mut published_ids: Vec<String> = Vec::with_capacity(tasks.len());
+
+            for t in tasks {
+                let payload_for_event = Arc::new(std::sync::RwLock::new(t.task_payload.clone()));
+                if Events::ServerBeforeTaskPublish(
+                    &api,
+                    uid.clone(),
+                    task_id_str.clone(),
+                    t.id.clone(),
+                    payload_for_event.clone(),
+                ) {
+                    info!("publish: handler cancelled {}:{}", task_id_str, t.id);
+                    continue;
+                }
+
+                let payload = match payload_for_event.read() {
+                    Ok(p) => p.clone(),
+                    Err(_) => {
+                        info!("publish: payload lock poisoned for {}", t.id);
+                        continue;
+                    }
+                };
+
+                if !reg_tsk.clone().verify(payload.clone()) {
+                    info!("publish: verify failed for {}", t.id);
+                    continue;
+                }
+
+                candidate_ids.insert(t.id.clone());
+                candidates.push((t, payload));
+            }
+
+            let mut removed_ids: HashSet<String> = HashSet::with_capacity(candidates.len());
+            {
+                let mut leased = api.leased_tasks.tasks.entry(key.clone()).or_default();
+                leased.retain(|lease| {
+                    if lease.user_id == uid
+                        && candidate_ids.contains(&lease.stored_task.id)
+                        && !removed_ids.contains(&lease.stored_task.id)
+                    {
+                        removed_ids.insert(lease.stored_task.id.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+
+            for (t, payload) in candidates {
+                if !removed_ids.remove(&t.id) {
+                    info!("publish: no lease for {} held by {}", t.id, uid);
+                    continue;
+                }
+                let stored = StoredTask {
+                    id: t.id.clone(),
+                    bytes: payload,
+                };
+                if let Err(e) = api.put_solved(&key, &stored) {
+                    info!("publish: sled put_solved failed for {}: {}", t.id, e);
+                    continue;
+                }
+                if let Err(e) = api.delete_queued(&key, &t.id) {
+                    info!("publish: sled delete_queued failed for {}: {}", t.id, e);
+                }
+                published_ids.push(t.id);
+            }
+
+            if !published_ids.is_empty() {
+                Events::ServerTaskBlockPublished(&api, uid.clone(), task_id_str, published_ids);
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -303,90 +513,27 @@ impl Engine for EngineService {
         &self,
         request: tonic::Request<proto::TaskBlockRequest>,
     ) -> Result<tonic::Response<proto::TaskBlock>, tonic::Status> {
-        let challenge = get_auth(&request);
-        let task_id = request.get_ref().task_id.clone();
-        let uid = get_uid(&request);
-
-        {
-            let api = self.EngineAPI.read().await;
-            let db = api.db.clone();
-            if !Events::CheckAuth(&api, uid.clone(), challenge, db) {
-                return Err(Status::permission_denied("Invalid authentication"));
-            };
-        }
-
-        let (namespace, task_name) = task_id.split_once(':').ok_or_else(|| {
-            Status::invalid_argument("Invalid task ID format, expected 'namespace:task'")
-        })?;
-        let key = ID(namespace, task_name);
-
-        {
-            let api = self.EngineAPI.read().await;
-            if api.task_registry.get(&key).is_none() {
-                return Err(Status::invalid_argument("Task Does not Exist"));
-            }
-            if Events::ServerBeforeTaskAcquire(&api, uid.clone(), task_id.clone()) {
-                return Err(Status::aborted(
-                    "Task acquire cancelled by server event handler",
-                ));
-            }
-        }
-
-        let receiver = {
-            let api = self.EngineAPI.read().await;
-            api.task_queue
-                .tasks
-                .get(&key)
-                .map(|entry| entry.0.clone())
-                .ok_or_else(|| Status::not_found("Unknown task type"))?
-        };
-
-        if receiver.is_empty() {
-            let lock_arc = {
-                let api = self.EngineAPI.read().await;
-                api.fill_locks.entry(key.clone()).or_default().clone()
-            };
-            let _g = lock_arc.lock().await;
-            if receiver.is_empty() {
-                let api = self.EngineAPI.read().await;
-                ServerAPI::fill_queue(&api, key.clone());
-            }
-        }
-
-        let block = receiver
-            .recv()
+        self.acquire_task_block_impl(request)
             .await
-            .map_err(|_| Status::unavailable("Task queue closed"))?;
+            .map(Response::new)
+    }
 
-        {
-            let api = self.EngineAPI.read().await;
-            let mut entry = api.leased_tasks.tasks.entry(key.clone()).or_default();
-            let now = Utc::now();
-            let mut ids = Vec::with_capacity(block.tasks.len());
-            for task in &block.tasks {
-                ids.push(task.id.clone());
-                entry.push(LeasedTask {
-                    stored_task: Arc::new(task.clone()),
-                    user_id: uid.clone(),
-                    given_at: now,
-                });
+    type AquireTaskStreamStream = ReceiverStream<Result<proto::Task, Status>>;
+
+    async fn aquire_task_stream(
+        &self,
+        request: tonic::Request<proto::TaskBlockRequest>,
+    ) -> Result<tonic::Response<Self::AquireTaskStreamStream>, tonic::Status> {
+        let block = self.acquire_task_block_impl(request).await?;
+        let (tx, rx) = mpsc::channel(block.tasks.len().max(1));
+
+        for task in block.tasks {
+            if tx.send(Ok(task)).await.is_err() {
+                break;
             }
-            drop(entry);
-            Events::ServerTaskBlockAcquired(&api, uid.clone(), task_id.clone(), ids);
         }
 
-        let tasks = block
-            .tasks
-            .into_iter()
-            .map(|t| proto::Task {
-                id: t.id,
-                task_id: task_id.clone(),
-                task_payload: t.bytes,
-                payload: Vec::new(),
-            })
-            .collect();
-
-        Ok(tonic::Response::new(proto::TaskBlock { tasks }))
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     async fn publish_task_block(
@@ -395,90 +542,34 @@ impl Engine for EngineService {
     ) -> Result<tonic::Response<proto::Empty>, tonic::Status> {
         let challenge = get_auth(&request);
         let uid = get_uid(&request);
-        let api = self.EngineAPI.read().await;
+        self.publish_tasks_impl(uid, challenge, request.into_inner().tasks)
+            .await?;
+        Ok(tonic::Response::new(proto::Empty {}))
+    }
 
-        {
-            let db = api.db.clone();
-            if !Events::CheckAuth(&api, uid.clone(), challenge, db) {
-                return Err(Status::permission_denied("Invalid authentication"));
-            };
+    async fn publish_task_stream(
+        &self,
+        request: tonic::Request<tonic::Streaming<proto::Task>>,
+    ) -> Result<tonic::Response<proto::Empty>, tonic::Status> {
+        let challenge = get_auth(&request);
+        let uid = get_uid(&request);
+        let batch_size = {
+            let api = self.EngineAPI.read().await;
+            api.cfg.config_toml.task_block_size.max(1) as usize
+        };
+        let mut stream = request.into_inner();
+        let mut batch = Vec::with_capacity(batch_size.min(1024));
+
+        while let Some(task) = stream.message().await? {
+            batch.push(task);
+            if batch.len() >= batch_size {
+                self.publish_tasks_impl(uid.clone(), challenge.clone(), std::mem::take(&mut batch))
+                    .await?;
+            }
         }
 
-        let mut groups: HashMap<Identifier, Vec<proto::Task>> = HashMap::new();
-        for t in request.into_inner().tasks {
-            let Some((ns, name)) = t.task_id.split_once(':') else {
-                info!("publish: skipping malformed task_id {}", t.task_id);
-                continue;
-            };
-            groups
-                .entry((ns.to_string(), name.to_string()))
-                .or_default()
-                .push(t);
-        }
-
-        for (key, tasks) in groups {
-            let task_id_str = format!("{}:{}", key.0, key.1);
-            let Some(reg_tsk) = api.task_registry.get(&key) else {
-                info!("publish: unknown task {}:{}, skipping group", key.0, key.1);
-                continue;
-            };
-
-            let mut published_ids: Vec<String> = Vec::with_capacity(tasks.len());
-
-            for t in tasks {
-                let payload_for_event = Arc::new(std::sync::RwLock::new(t.task_payload.clone()));
-                if Events::ServerBeforeTaskPublish(
-                    &api,
-                    uid.clone(),
-                    task_id_str.clone(),
-                    t.id.clone(),
-                    payload_for_event.clone(),
-                ) {
-                    info!("publish: handler cancelled {}:{}", task_id_str, t.id);
-                    continue;
-                }
-
-                let payload = match payload_for_event.read() {
-                    Ok(p) => p.clone(),
-                    Err(_) => {
-                        info!("publish: payload lock poisoned for {}", t.id);
-                        continue;
-                    }
-                };
-
-                if !reg_tsk.clone().verify(payload.clone()) {
-                    info!("publish: verify failed for {}", t.id);
-                    continue;
-                }
-
-                let mut leased = api.leased_tasks.tasks.entry(key.clone()).or_default();
-                let Some(idx) = leased
-                    .iter()
-                    .position(|l| l.stored_task.id == t.id && l.user_id == uid)
-                else {
-                    info!("publish: no lease for {} held by {}", t.id, uid);
-                    continue;
-                };
-                leased.remove(idx);
-                drop(leased);
-
-                let stored = StoredTask {
-                    id: t.id.clone(),
-                    bytes: payload,
-                };
-                if let Err(e) = api.put_solved(&key, &stored) {
-                    info!("publish: sled put_solved failed for {}: {}", t.id, e);
-                    continue;
-                }
-                if let Err(e) = api.delete_queued(&key, &t.id) {
-                    info!("publish: sled delete_queued failed for {}: {}", t.id, e);
-                }
-                published_ids.push(t.id);
-            }
-
-            if !published_ids.is_empty() {
-                Events::ServerTaskBlockPublished(&api, uid.clone(), task_id_str, published_ids);
-            }
+        if !batch.is_empty() {
+            self.publish_tasks_impl(uid, challenge, batch).await?;
         }
 
         Ok(tonic::Response::new(proto::Empty {}))
@@ -526,11 +617,22 @@ impl Engine for EngineService {
                     task_id_str
                 )));
             };
+            let enqueue_to_memory = api
+                .task_queue
+                .tasks
+                .get(&key)
+                .map(|channel| {
+                    channel.1.len() < api.cfg.config_toml.task_queue_size.max(1) as usize
+                })
+                .unwrap_or(false);
 
             let mut block_tasks: Vec<StoredTask> = Vec::with_capacity(tasks.len());
             let mut instance_ids: Vec<String> = Vec::with_capacity(tasks.len());
+            let mut active_ids: Vec<String> = Vec::with_capacity(tasks.len());
             let mut payloads: Vec<Arc<std::sync::RwLock<Vec<u8>>>> =
                 Vec::with_capacity(tasks.len());
+            let mut created_for_group: Vec<proto::Task> = Vec::with_capacity(tasks.len());
+            let mut stored_for_group: Vec<StoredTask> = Vec::with_capacity(tasks.len());
 
             for t in tasks {
                 let payload_for_event = Arc::new(std::sync::RwLock::new(t.task_payload.clone()));
@@ -557,24 +659,42 @@ impl Engine for EngineService {
                     id: druid::Druid::default().to_hex(),
                     bytes: payload,
                 };
-                if let Err(e) = api.put_queued(&key, &stored) {
-                    info!("create: sled put_queued failed for {}: {}", stored.id, e);
-                    continue;
+                if enqueue_to_memory {
+                    api.mark_active_id(&key, stored.id.clone());
+                    active_ids.push(stored.id.clone());
                 }
                 instance_ids.push(stored.id.clone());
                 payloads.push(payload_for_event);
-                created.push(proto::Task {
+                created_for_group.push(proto::Task {
                     id: stored.id.clone(),
                     task_id: task_id_str.clone(),
                     task_payload: stored.bytes.clone(),
                     payload: Vec::new(),
                 });
-                block_tasks.push(stored);
+                if enqueue_to_memory {
+                    block_tasks.push(stored.clone());
+                }
+                stored_for_group.push(stored);
             }
 
-            if !block_tasks.is_empty() {
+            if !instance_ids.is_empty() {
+                if let Err(e) = api.put_queued_batch(&key, &stored_for_group) {
+                    api.clear_active_ids(&key, &active_ids);
+                    info!("create: sled batch failed for {}: {}", task_id_str, e);
+                    continue;
+                }
+
+                created.extend(created_for_group);
                 if let Some(channel) = api.task_queue.tasks.get(&key) {
-                    let _ = channel.1.try_send(StoredTaskBlock { tasks: block_tasks });
+                    if enqueue_to_memory
+                        && !block_tasks.is_empty()
+                        && channel
+                            .1
+                            .try_send(StoredTaskBlock { tasks: block_tasks })
+                            .is_err()
+                    {
+                        api.clear_active_ids(&key, &active_ids);
+                    }
                 }
                 Events::ServerTaskBlockCreated(&api, task_id_str, instance_ids, payloads);
             }

@@ -2,8 +2,10 @@ syntax = "proto3";
 package engine;
 service Engine {
   rpc AquireTaskBlock(TaskBlockRequest) returns (TaskBlock);
+  rpc AquireTaskStream(TaskBlockRequest) returns (stream Task);
   rpc AquireTaskReg(empty) returns (TaskRegistry);
   rpc PublishTaskBlock(TaskBlock) returns (empty);
+  rpc PublishTaskStream(stream Task) returns (empty);
   rpc cgrpc(cgrpcmsg) returns (cgrpcmsg);
   rpc CreateTaskBlock(TaskBlock) returns (TaskBlock);
   rpc DeleteTaskBlock(TaskSelector) returns (empty);
