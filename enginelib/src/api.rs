@@ -28,6 +28,9 @@ pub struct ServerAPI {
     pub event_bus: EventBus,               // RW
     pub db: sled::Db,                      // R
     pub lib_manager: LibraryManager,       // RW
+    // Serializes fill_queue() calls per Identifier so concurrent acquires can't
+    // both refill an empty channel and double-enqueue the same StoredTaskBlock.
+    pub fill_locks: DashMap<Identifier, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl Default for ServerAPI {
@@ -44,6 +47,7 @@ impl Default for ServerAPI {
                 },
             },
             leased_tasks: LeasedTaskQueue::default(),
+            fill_locks: DashMap::new(),
         }
     }
 }
@@ -78,6 +82,7 @@ impl ServerAPI {
                     event_handlers: HashMap::new(),
                 },
             },
+            fill_locks: DashMap::new(),
         }
     }
     pub fn init(api: &mut Self) {
@@ -267,40 +272,21 @@ impl Registry<dyn Task> for EngineTaskRegistry {
 }
 
 pub async fn clear_sled_periodically(api: Arc<RwLock<ServerAPI>>, n_minutes: u64) {
-    info!("Sled Cron Job Started");
+    info!("Lease GC started ({}m interval)", n_minutes);
     let mut interval = interval(Duration::from_secs(n_minutes * 60));
-    // loop {
-    //     interval.tick().await;
-    //     info!("Purging Unsolved Tasks");
-
-    //     let now = Utc::now().timestamp();
-    //     let mut rw_api = api.write().await;
-
-    //     let mut moved_tasks: Vec<(Identifier, StoredTask)> = Vec::new();
-    //     let mut touched_exec: HashSet<Identifier> = HashSet::new();
-
-    //     for (id, task_list) in rw_api.executing_tasks.tasks.iter_mut() {
-    //         let before_len = task_list.len();
-    //         task_list.retain(|info| {
-    //             let age = now - info.given_at.timestamp();
-    //             if age > 3600 {
-    //                 info!("Task {:?} is older than an hour! Moving...", info);
-    //                 moved_tasks.push((
-    //                     id.clone(),
-    //                     StoredTask {
-    //                         id: info.id.clone(),
-    //                         bytes: info.bytes.clone(),
-    //                     },
-    //                 ));
-    //                 false
-    //             } else {
-    //                 true
-    //             }
-    //         });
-
-    //         if task_list.len() != before_len {
-    //             touched_exec.insert(id.clone());
-    //         }
-    //     }
-    // }
+    let ttl = chrono::Duration::seconds(3600);
+    loop {
+        interval.tick().await;
+        let api = api.read().await;
+        let now = Utc::now();
+        let mut expired: u64 = 0;
+        for mut entry in api.leased_tasks.tasks.iter_mut() {
+            let before = entry.len();
+            entry.retain(|l| now.signed_duration_since(l.given_at) < ttl);
+            expired += (before - entry.len()) as u64;
+        }
+        if expired > 0 {
+            info!("Lease GC: expired {} stale lease(s)", expired);
+        }
+    }
 }

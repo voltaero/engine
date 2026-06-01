@@ -373,8 +373,18 @@ impl Engine for EngineService {
         };
 
         if receiver.is_empty() {
-            let api = self.EngineAPI.read().await;
-            ServerAPI::fill_queue(&api, key.clone());
+            // Serialize concurrent refills for this Identifier — without this,
+            // two acquires that both see an empty channel will both scan sled
+            // and push duplicate StoredTaskBlocks (P1 TOCTOU).
+            let lock_arc = {
+                let api = self.EngineAPI.read().await;
+                api.fill_locks.entry(key.clone()).or_default().clone()
+            };
+            let _g = lock_arc.lock().await;
+            if receiver.is_empty() {
+                let api = self.EngineAPI.read().await;
+                ServerAPI::fill_queue(&api, key.clone());
+            }
         }
 
         let block = receiver
@@ -499,6 +509,9 @@ impl Engine for EngineService {
                 if let Err(e) = api.put_solved(&key, &stored) {
                     info!("publish: sled put_solved failed for {}: {}", t.id, e);
                     continue;
+                }
+                if let Err(e) = api.delete_queued(&key, &t.id) {
+                    info!("publish: sled delete_queued failed for {}: {}", t.id, e);
                 }
                 published_ids.push(t.id);
             }

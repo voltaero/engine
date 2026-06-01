@@ -27,9 +27,6 @@ message TaskSelector {
   string task = 3;
   string id = 4;
 }
-message TaskBlockSelector {
-  repeated TaskBlockSelector selector = 1;
-}
 message empty {}
 enum TaskState {
   QUEUED = 0;
