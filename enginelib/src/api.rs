@@ -68,6 +68,7 @@ impl Default for ServerAPI {
             task_registry: EngineTaskRegistry::default(),
         };
         LibraryManager::load_modules(&mut k);
+        crate::event::register_inventory_handlers(&mut k);
         k
     }
 }
