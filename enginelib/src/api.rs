@@ -6,11 +6,11 @@ use crate::{
     plugin::LibraryManager,
 };
 use chrono::{DateTime, Utc};
-use serde::{Serialize,Deserialize}
 use dashmap::{DashMap, DashSet};
 pub use postcard;
 pub use postcard::from_bytes;
 pub use postcard::to_allocvec;
+use serde::{Deserialize, Serialize};
 use std::clone;
 use std::{
     collections::HashMap,
@@ -29,8 +29,8 @@ pub struct ServerAPI {
     pub event_bus: EventBus,         // RW
     pub lib_manager: LibraryManager, // RW
     pub db: rust_rocksdb::DB,
-    pub task_queue: TaskQueue, // RW
-    // pub leased_tasks: LeasedTaskQueue,     // RW
+    pub task_queue: TaskQueue,             // RW
+    pub leased_tasks: LeasedTaskQueue,     // RW
     pub task_registry: EngineTaskRegistry, // RW
 }
 
@@ -69,6 +69,7 @@ impl Default for ServerAPI {
             db: db,
             task_registry: EngineTaskRegistry::default(),
             task_queue: TaskQueue::default(),
+            leased_tasks: LeasedTaskQueue::default(),
         };
         LibraryManager::load_modules(&mut k);
         crate::event::register_inventory_handlers(&mut k);
@@ -97,7 +98,13 @@ impl Registry<dyn Task> for EngineTaskRegistry {
 }
 #[derive(Debug, Default, Clone)]
 struct TaskQueue {
-    pub tasks: DashMap<Identifier, (async_channel::Sender<StoredTask>, async_channel::Receiver<StoredTask>)>,
+    pub tasks: DashMap<
+        Identifier,
+        (
+            async_channel::Sender<StoredTask>,
+            async_channel::Receiver<StoredTask>,
+        ),
+    >,
 }
 #[derive(Debug, Default, Clone)]
 pub struct LeasedTaskQueue {
