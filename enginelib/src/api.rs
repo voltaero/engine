@@ -3,7 +3,7 @@ use dashmap::{DashMap, DashSet};
 use tokio::{spawn, time::interval};
 use tracing::{Level, debug, info, instrument};
 
-use crate::Task;
+use crate::task::Task;
 use crate::{
     Identifier, Registry,
     config::Config,
@@ -69,11 +69,7 @@ impl Default for ServerAPI {
         }
     }
 }
-impl ServerAPI {
-    pub fn init(api: &mut Self) {
-        api.lib_manager.load_modules(api);
-    }
-}
+
 #[derive(Default, Clone, Debug)]
 pub struct EngineTaskRegistry {
     pub tasks: HashMap<Identifier, Arc<dyn Task>>,

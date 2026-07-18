@@ -5,8 +5,8 @@ use crate::{Identifier, api::ServerAPI, task::Task};
 // f:namespace:task_name:<id> -> Finished Task Record
 pub fn submit(api: Arc<ServerAPI>, task_bytes: &[u8], task_id: Identifier) {
     // deserialize
-    let task = Task::verify(task_bytes);
+
     // Verify Task
     // upload Task
-    let mut db = api.db.put("t", value)
+    //let mut db = api.db.put("t", value)
 }
