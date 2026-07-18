@@ -22,6 +22,7 @@ inventory = "0.3.22"
 crossbeam = "0.8.4"
 dashmap = "6.2.1"
 async-channel = "2.5.0"
+druid = {git="https://github.com/voltaero/druid.git"}
 [build-dependencies]
 vergen-gix = { version = "9.1.0", features = ["build", "cargo", "rustc"] }
 # Profiles moved to the workspace root Cargo.toml — Cargo ignores profile

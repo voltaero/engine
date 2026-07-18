@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, instrument, warn};
 
 pub trait Verifiable {
-    fn verify(&self, b: Vec<u8>) -> bool;
+    fn verify(&self, b: &[u8]) -> bool;
 }
 pub trait Task: Debug + Sync + Send + Verifiable {
     fn get_id(&self) -> Identifier;

@@ -1,12 +1,34 @@
 use std::sync::Arc;
 
-use crate::{Identifier, api::ServerAPI, task::Task};
+use crate::{
+    Identifier, Registry,
+    api::ServerAPI,
+    error::{Error, ErrorKind},
+    task::Task,
+};
 // t:namespace:task_name:<id> -> Serialized Task Record
 // f:namespace:task_name:<id> -> Finished Task Record
-pub fn submit(api: Arc<ServerAPI>, task_bytes: &[u8], task_id: Identifier) {
+pub fn submit(api: Arc<ServerAPI>, task_bytes: &[u8], task_id: Identifier) -> Result<(), Error> {
     // deserialize
 
-    // Verify Task
-    // upload Task
-    //let mut db = api.db.put("t", value)
+    let task = api
+        .task_registry
+        .get(&task_id)
+        .ok_or(Error::new("Not found".into()))?;
+    if task.verify(task_bytes) {
+        let res = api.db.put(
+            format!(
+                "t:{}:{}:{}",
+                task_id.0,
+                task_id.1,
+                druid::Druid::default().to_hex()
+            ),
+            task_bytes,
+        );
+        if res.is_err() {
+            return Err(Error::new(res.err().unwrap().to_string()));
+        }
+    }
+
+    Ok(())
 }
