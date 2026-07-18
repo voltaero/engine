@@ -1,6 +1,6 @@
 use crate::{Identifier, api::ServerAPI};
+use dashmap::DashMap;
 use std::any::Any;
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use tracing::instrument;
@@ -80,7 +80,7 @@ pub trait EventHandler: Any + Send + Sync {
 
 #[derive(Clone, Default)]
 pub struct EngineEventHandlerRegistry {
-    pub event_handlers: HashMap<Identifier, Vec<Arc<dyn EventHandler>>>,
+    pub event_handlers: DashMap<Identifier, Vec<Arc<dyn EventHandler>>>,
 }
 
 impl EngineEventHandlerRegistry {
@@ -90,7 +90,7 @@ impl EngineEventHandlerRegistry {
         identifier: Identifier,
     ) {
         let handler = Arc::new(handler);
-        let handlers = self.event_handlers.entry(identifier.clone()).or_default();
+        let mut handlers = self.event_handlers.entry(identifier.clone()).or_default();
         handlers.push(handler);
         debug!(
             "EventBus: Registered handler for event {}.{}",
@@ -123,7 +123,7 @@ impl EventBus {
         debug!("EventBus: Firing event {}.{}", id.0, id.1);
 
         if let Some(handlers) = self.event_handler_registry.event_handlers.get(&id) {
-            for handler in handlers {
+            for handler in handlers.iter() {
                 if event.is_cancelled() && !handler.receive_cancelled() {
                     continue;
                 }

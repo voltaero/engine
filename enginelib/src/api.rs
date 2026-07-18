@@ -1,27 +1,13 @@
 use crate::task::Task;
-use crate::{
-    Identifier, Registry,
-    config::Config,
-    event::{EngineEventHandlerRegistry, EventBus},
-    plugin::LibraryManager,
-};
+use crate::{Identifier, Registry, config::Config, event::EventBus, plugin::LibraryManager};
 use chrono::{DateTime, Utc};
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 pub use postcard;
 pub use postcard::from_bytes;
 pub use postcard::to_allocvec;
 use serde::{Deserialize, Serialize};
-use std::clone;
-use std::{
-    collections::HashMap,
-    sync::RwLock,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
-use tokio::{spawn, time::interval};
+use std::sync::Arc;
+
 use tracing::{Level, debug, info, instrument};
 
 pub struct ServerAPI {
@@ -79,7 +65,7 @@ impl Default for ServerAPI {
 
 #[derive(Default, Clone, Debug)]
 pub struct EngineTaskRegistry {
-    pub tasks: HashMap<Identifier, Arc<dyn Task>>,
+    pub tasks: DashMap<Identifier, Arc<dyn Task>>,
 }
 impl Registry<dyn Task> for EngineTaskRegistry {
     #[instrument]
@@ -97,7 +83,7 @@ impl Registry<dyn Task> for EngineTaskRegistry {
     }
 }
 #[derive(Debug, Default, Clone)]
-struct TaskQueue {
+pub struct TaskQueue {
     pub tasks: DashMap<
         Identifier,
         (
