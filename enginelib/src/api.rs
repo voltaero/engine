@@ -14,6 +14,7 @@ pub use postcard::from_bytes;
 pub use postcard::to_allocvec;
 use std::{
     collections::HashMap,
+    sync::RwLock,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -22,7 +23,8 @@ use std::{
 };
 
 pub struct ServerAPI {
-    pub cfg: Config,                 // RW
+    pub cfg: RwLock<Config>,         // RW
     pub event_bus: EventBus,         // RW
     pub lib_manager: LibraryManager, // RW
+    pub db: sled::Db,
 }
