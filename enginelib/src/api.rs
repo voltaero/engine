@@ -13,6 +13,7 @@ use crate::{
 pub use postcard;
 pub use postcard::from_bytes;
 pub use postcard::to_allocvec;
+use std::clone;
 use std::{
     collections::HashMap,
     sync::RwLock,
@@ -24,14 +25,15 @@ use std::{
 };
 
 pub struct ServerAPI {
-    pub cfg: RwLock<Config>,         // RW
+    pub cfg: Config,                 // RW
     pub event_bus: EventBus,         // RW
     pub lib_manager: LibraryManager, // RW
     pub db: rust_rocksdb::DB,
-    // pub task_queue: TaskQueue,             // RW
+    pub task_queue: TaskQueue, // RW
     // pub leased_tasks: LeasedTaskQueue,     // RW
     pub task_registry: EngineTaskRegistry, // RW
 }
+
 impl Default for ServerAPI {
     fn default() -> Self {
         let path = "./engine_db";
@@ -61,11 +63,12 @@ impl Default for ServerAPI {
         });
 
         let mut k = Self {
-            cfg: RwLock::new(Config::default()),
+            cfg: Config::default(),
             event_bus: EventBus::default(),
             lib_manager: LibraryManager::default(),
             db: db,
             task_registry: EngineTaskRegistry::default(),
+            task_queue: TaskQueue::default(),
         };
         LibraryManager::load_modules(&mut k);
         crate::event::register_inventory_handlers(&mut k);
@@ -92,3 +95,5 @@ impl Registry<dyn Task> for EngineTaskRegistry {
         self.tasks.get(identifier).map(|obj| obj.clone_box())
     }
 }
+#[derive(Debug, Default, Clone)]
+struct TaskQueue {}

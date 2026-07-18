@@ -11,11 +11,14 @@ fn default_host() -> String {
 pub struct ConfigTomlServer {
     #[serde(default = "default_host")]
     pub host: String,
+
+    pub auth_token: Option<String>,
 }
 impl Default for ConfigTomlServer {
     fn default() -> Self {
         Self {
             host: default_host(),
+            auth_token: Option::None,
         }
     }
 }

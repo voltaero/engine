@@ -18,6 +18,8 @@ pub mod task_block_acquired_event;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use rust_rocksdb::DB;
+
 use crate::{Identifier, api::ServerAPI};
 
 pub fn ID(namespace: &str, id: &str) -> Identifier {
@@ -39,9 +41,9 @@ impl Events {
         auth_event::AuthEvent::check(api, uid, challenge, db)
     }
 
-    // pub fn CheckAdminAuth(api: &ServerAPI, payload: String, target: Identifier, db: Db) -> bool {
-    //     admin_auth_event::AdminAuthEvent::check(api, payload, target, db)
-    // }
+    pub fn CheckAdminAuth(api: &ServerAPI, payload: String, target: Identifier, db: DB) -> bool {
+        admin_auth_event::AdminAuthEvent::check(api, payload, target, Arc::new(db))
+    }
 
     pub fn CgrpcEvent(
         api: &ServerAPI,
