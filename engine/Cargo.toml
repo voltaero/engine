@@ -9,32 +9,5 @@ description = "A Blazingly fast distributed task system"
 default = []
 dev = []
 [dependencies]
-clap = { version = "4.5.60", features = ["derive"] }
-clap_complete = "4.5.66"
-colored = "3.1.1"
-# directories = "5.0.1"
-druid = { git = "https://github.com/GrandEngineering/druid.git" }
+
 enginelib = { path = "../enginelib" }
-# libloading = "0.8.6"
-prost = "0.14"
-rayon = "1.10"
-serde = { workspace = true }
-sha2 = "0.10"
-# serde = "1.0.219"
-tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros"] }
-tokio-stream = "0.1.17"
-toml = { workspace = true }
-# toml = "0.8.19"
-tonic = "0.14"
-tonic-prost = "0.14.5"
-
-tonic-reflection = "0.14"
-
-[[bench]]
-name = "engine_tps"
-path = "benches/engine_tps.rs"
-harness = false
-
-[build-dependencies]
-tonic-build = "0.14"
-tonic-prost-build = "0.14"

@@ -1,44 +1,11 @@
 use std::fmt::Debug;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use crate::Identifier;
 use chrono::{DateTime, Utc};
-use crossbeam::queue::ArrayQueue;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{error, instrument, warn};
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct StoredTask {
-    pub bytes: Vec<u8>,
-    pub id: String,
-}
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct LeasedTask {
-    pub stored_task: Arc<StoredTask>,
-    pub user_id: String,
-    pub given_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct StoredTaskBlock {
-    pub tasks: Vec<StoredTask>,
-}
-#[derive(Debug, Default)]
-pub struct TaskQueue {
-    pub tasks: DashMap<
-        Identifier,
-        (
-            async_channel::Receiver<StoredTaskBlock>,
-            async_channel::Sender<StoredTaskBlock>,
-        ),
-    >,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct LeasedTaskQueue {
-    pub tasks: DashMap<Identifier, Vec<LeasedTask>>,
-}
 
 pub trait Verifiable {
     fn verify(&self, b: Vec<u8>) -> bool;

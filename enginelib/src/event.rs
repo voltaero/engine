@@ -100,6 +100,14 @@ impl EngineEventHandlerRegistry {
 }
 
 impl EventBus {
+    pub fn has_handlers(&self, identifier: &Identifier) -> bool {
+        self.event_handler_registry
+            .event_handlers
+            .get(identifier)
+            .map(|handlers| !handlers.is_empty())
+            .unwrap_or(false)
+    }
+
     pub fn register_handler<H: EventHandler + Send + Sync + 'static>(
         &mut self,
         handler: H,

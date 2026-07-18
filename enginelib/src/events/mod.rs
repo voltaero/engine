@@ -41,7 +41,7 @@ impl Events {
     }
 
     pub fn CgrpcEvent(
-        api: &mut ServerAPI,
+        api: &ServerAPI,
         handler_id: Identifier,
         payload: Vec<u8>,
         output: Arc<RwLock<Vec<u8>>>,
