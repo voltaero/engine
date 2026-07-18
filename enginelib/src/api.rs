@@ -60,13 +60,15 @@ impl Default for ServerAPI {
                 .try_init();
         });
 
-        Self {
+        let mut k = Self {
             cfg: RwLock::new(Config::default()),
             event_bus: EventBus::default(),
             lib_manager: LibraryManager::default(),
             db: db,
             task_registry: EngineTaskRegistry::default(),
-        }
+        };
+        LibraryManager::load_modules(&mut k);
+        k
     }
 }
 

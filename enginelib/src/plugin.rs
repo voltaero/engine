@@ -64,7 +64,8 @@ impl LibraryManager {
         drop(self);
     }
 
-    pub fn load_modules(&mut self, api: &mut ServerAPI) {
+    pub fn load_modules(api: &mut ServerAPI) {
+        let mut library_manager = LibraryManager::default();
         let dir_path = "./mods";
         let mut files: Vec<String> = Vec::new();
 
@@ -92,8 +93,9 @@ impl LibraryManager {
 
         info!("Found {} module(s) to load", files.len());
         for file in files {
-            self.load_module(&file, api);
+            library_manager.load_module(&file, api);
         }
+        api.lib_manager = library_manager;
     }
 
     pub fn load_module(&mut self, path: &str, api: &mut ServerAPI) {
