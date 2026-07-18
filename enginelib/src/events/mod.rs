@@ -22,6 +22,7 @@ use rust_rocksdb::DB;
 
 use crate::{Identifier, api::ServerAPI};
 
+#[allow(non_snake_case)]
 pub fn ID(namespace: &str, id: &str) -> Identifier {
     (namespace.to_string(), id.to_string())
 }

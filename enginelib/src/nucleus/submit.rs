@@ -1,13 +1,9 @@
 use std::sync::Arc;
 
-use crate::{
-    Identifier, Registry,
-    api::ServerAPI,
-    error::{Error, ErrorKind},
-    task::Task,
-};
+use crate::{Identifier, Registry, api::ServerAPI, error::Error};
 // t:namespace:task_name:<id> -> Serialized Task Record
 // f:namespace:task_name:<id> -> Finished Task Record
+#[allow(dead_code)]
 pub fn submit(api: Arc<ServerAPI>, task_bytes: &[u8], task_id: Identifier) -> Result<(), Error> {
     // deserialize
 

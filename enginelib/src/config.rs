@@ -1,4 +1,4 @@
-use std::{fs, io::Error, u32};
+use std::{fs, io::Error};
 
 use serde::{Deserialize, Serialize};
 use tracing::{error, instrument};
@@ -33,9 +33,9 @@ impl Config {
     pub fn new() -> Self {
         let mut content: String = "".to_owned();
         let result: Result<String, Error> = fs::read_to_string("config.toml");
-        if result.is_ok() {
-            content = result.unwrap();
-        };
+        if let Ok(file_content) = result {
+            content = file_content;
+        }
         let config_toml: ConfigTomlServer = toml::from_str(&content).unwrap_or_else(|err| {
             error!("Failed to parse config file.");
             error!("{:#?}", err);

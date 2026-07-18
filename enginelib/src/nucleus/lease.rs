@@ -2,4 +2,5 @@ use std::sync::Arc;
 
 use crate::api::ServerAPI;
 
-fn lease(api: Arc<ServerAPI>) {}
+#[allow(dead_code)]
+fn lease(_api: Arc<ServerAPI>) {}

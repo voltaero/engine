@@ -1,10 +1,6 @@
 use std::fmt::Debug;
-use std::sync::Arc;
 
 use crate::Identifier;
-use chrono::{DateTime, Utc};
-use dashmap::DashMap;
-use serde::{Deserialize, Serialize};
 use tracing::{error, instrument, warn};
 
 pub trait Verifiable {
@@ -40,6 +36,7 @@ pub trait Task: Debug + Sync + Send + Verifiable {
     fn to_bytes(&self) -> Vec<u8>;
     #[allow(clippy::wrong_self_convention)]
     fn from_bytes(&self, bytes: &[u8]) -> Box<dyn Task>;
+    #[allow(clippy::wrong_self_convention)]
     fn from_toml(&self, d: String) -> Box<dyn Task>;
     fn to_toml(&self) -> String;
 }

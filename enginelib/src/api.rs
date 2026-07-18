@@ -8,7 +8,7 @@ pub use postcard::to_allocvec;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use tracing::{Level, debug, info, instrument};
+use tracing::{Level, debug, instrument};
 
 pub struct ServerAPI {
     pub cfg: Config,                 // RW
@@ -52,7 +52,7 @@ impl Default for ServerAPI {
             cfg: Config::default(),
             event_bus: EventBus::default(),
             lib_manager: LibraryManager::default(),
-            db: db,
+            db,
             task_registry: EngineTaskRegistry::default(),
             task_queue: TaskQueue::default(),
             leased_tasks: LeasedTaskQueue::default(),

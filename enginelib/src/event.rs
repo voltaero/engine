@@ -22,10 +22,10 @@ pub fn register_inventory_handlers_for_origin(api: &mut ServerAPI, origin: &'sta
 
 fn register_inventory_handlers_inner(api: &mut ServerAPI, origin: Option<&'static str>) {
     for item in inventory::iter::<EventRegistrar> {
-        if let Some(origin) = origin {
-            if item.origin != origin {
-                continue;
-            }
+        if let Some(origin) = origin
+            && item.origin != origin
+        {
+            continue;
         }
         (item.func)(api);
     }
@@ -51,6 +51,7 @@ pub trait EventCTX<C: Event>: EventHandler {
         self.handleCTX(event);
     }
 
+    #[allow(non_snake_case)]
     fn handleCTX(&self, event: &mut C);
 }
 #[derive(Default, Clone)]

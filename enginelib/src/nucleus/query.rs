@@ -2,4 +2,5 @@ use std::sync::Arc;
 
 use crate::api::ServerAPI;
 
-fn query(api: Arc<ServerAPI>) {}
+#[allow(dead_code)]
+fn query(_api: Arc<ServerAPI>) {}
