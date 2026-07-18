@@ -26,5 +26,20 @@ pub struct ServerAPI {
     pub cfg: RwLock<Config>,         // RW
     pub event_bus: EventBus,         // RW
     pub lib_manager: LibraryManager, // RW
-    pub db: sled::Db,
+    pub db: rust_rocksdb::DB,
+}
+impl Default for ServerAPI {
+    fn default() -> Self {
+        let path = "./engine_db";
+        let mut opts = rust_rocksdb::Options::default();
+        opts.create_if_missing(true);
+
+        let db = rust_rocksdb::DB::open(&opts, path).unwrap();
+        Self {
+            cfg: RwLock::new(Config::default()),
+            event_bus: EventBus::default(),
+            lib_manager: LibraryManager::default(),
+            db: db,
+        }
+    }
 }

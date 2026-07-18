@@ -18,8 +18,6 @@ pub mod task_block_acquired_event;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use sled::Db;
-
 use crate::{Identifier, api::ServerAPI};
 
 pub fn ID(namespace: &str, id: &str) -> Identifier {
@@ -32,7 +30,12 @@ pub struct Events;
 impl Events {
     pub fn init_auth(_api: &mut ServerAPI) {}
 
-    pub fn CheckAuth(api: &ServerAPI, uid: String, challenge: String, db: Db) -> bool {
+    pub fn CheckAuth(
+        api: &ServerAPI,
+        uid: String,
+        challenge: String,
+        db: rust_rocksdb::DB,
+    ) -> bool {
         auth_event::AuthEvent::check(api, uid, challenge, db)
     }
 

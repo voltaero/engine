@@ -53,7 +53,7 @@ pub trait EventCTX<C: Event>: EventHandler {
 
     fn handleCTX(&self, event: &mut C);
 }
-
+#[derive(Default, Clone)]
 pub struct EventBus {
     pub event_handler_registry: EngineEventHandlerRegistry,
 }
