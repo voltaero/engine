@@ -10,7 +10,7 @@ pub use crate::event::{
     Event, EventBus, EventCTX, EventHandler, EventRegistrar, register_inventory_handlers,
     register_inventory_handlers_for_origin,
 };
-pub use crate::events::admin_auth_event::AdminAuthEvent;
+//pub use crate::events::admin_auth_event::AdminAuthEvent;
 pub use crate::events::auth_event::AuthEvent;
 pub use crate::events::before_task_block_acquire_event::BeforeTaskBlockAcquireEvent;
 pub use crate::events::before_task_block_execute_event::BeforeTaskBlockExecuteEvent;
