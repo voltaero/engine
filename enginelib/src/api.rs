@@ -1,8 +1,3 @@
-use chrono::Utc;
-use dashmap::{DashMap, DashSet};
-use tokio::{spawn, time::interval};
-use tracing::{Level, debug, info, instrument};
-
 use crate::task::Task;
 use crate::{
     Identifier, Registry,
@@ -10,6 +5,9 @@ use crate::{
     event::{EngineEventHandlerRegistry, EventBus},
     plugin::LibraryManager,
 };
+use chrono::{DateTime, Utc};
+use serde::{Serialize,Deserialize}
+use dashmap::{DashMap, DashSet};
 pub use postcard;
 pub use postcard::from_bytes;
 pub use postcard::to_allocvec;
@@ -23,6 +21,8 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::{spawn, time::interval};
+use tracing::{Level, debug, info, instrument};
 
 pub struct ServerAPI {
     pub cfg: Config,                 // RW
@@ -96,4 +96,21 @@ impl Registry<dyn Task> for EngineTaskRegistry {
     }
 }
 #[derive(Debug, Default, Clone)]
-struct TaskQueue {}
+struct TaskQueue {
+    pub tasks: DashMap<Identifier, (async_channel::Sender<StoredTask>, async_channel::Receiver<StoredTask>)>,
+}
+#[derive(Debug, Default, Clone)]
+pub struct LeasedTaskQueue {
+    pub tasks: DashMap<Identifier, Vec<LeasedTask>>,
+}
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct StoredTask {
+    pub bytes: Vec<u8>,
+    pub id: String,
+}
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct LeasedTask {
+    pub stored_task: Arc<StoredTask>,
+    pub user_id: String,
+    pub given_at: DateTime<Utc>,
+}
