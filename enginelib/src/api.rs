@@ -3,7 +3,7 @@ use crate::error::Error;
 use crate::task::Task;
 use crate::{Identifier, Registry, config::Config, event::EventBus, plugin::LibraryManager};
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 pub use postcard;
 pub use postcard::from_bytes;
 pub use postcard::to_allocvec;
@@ -78,7 +78,10 @@ impl ServerAPI {
         api.task_registry.tasks.iter().for_each(|f| {
             let key = f.key();
             let (tx, rx) = async_channel::bounded(8096); // Add to config or make unbound ?
-            api.task_queue.tasks.entry(key.clone()).or_insert((tx, rx));
+            api.task_queue
+                .tasks
+                .entry(key.clone())
+                .or_insert((tx, rx, DashSet::default()));
             api.leased_tasks.tasks.entry(key.clone()).or_default();
             // task reg should be populated by mods
         });
@@ -124,6 +127,7 @@ pub struct TaskQueue {
         (
             async_channel::Sender<StoredTask>,
             async_channel::Receiver<StoredTask>,
+            dashmap::DashSet<String>,
         ),
     >,
 }
