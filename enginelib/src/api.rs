@@ -10,7 +10,6 @@ pub use postcard::from_bytes;
 pub use postcard::to_allocvec;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::str::pattern::Pattern;
 use std::sync::Arc;
 use tokio::{spawn, sync::RwLock, time::interval};
 use tracing::{Level, debug, instrument};
