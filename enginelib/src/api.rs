@@ -67,7 +67,7 @@ impl Default for ServerAPI {
     }
 }
 impl ServerAPI {
-    pub fn load(api: &Arc<Self>, task_type: Identifier) -> Result<(), Error> {
+    pub async fn load(api: &Arc<Self>, task_type: Identifier) -> Result<(), Error> {
         let k = api
             .task_queue
             .tasks
@@ -75,11 +75,13 @@ impl ServerAPI {
             .ok_or(Error::new("TaskTypeNotFound".into()))?;
         // t:namespace:task_name:<id> -> Serialized Task Record
         let prefix = format!("t:{}:{}:", task_type.0, task_type.1);
-        api.db
+
+        let tasks = api
+            .db
             .prefix_iterator(prefix.as_bytes())
             .map_while(|result| match result {
                 Ok((key, value)) if key.starts_with(prefix.as_bytes()) => Some(Some((key, value))),
-                Ok(_) => None, // We passed the prefix range: stop iteration.
+                Ok(_) => None,
                 Err(err) => {
                     eprintln!("RocksDB read error: {err}");
                     Some(None)
@@ -87,17 +89,21 @@ impl ServerAPI {
             })
             .flatten()
             .filter_map(|(key, value)| String::from_utf8(key.to_vec()).ok().map(|key| (key, value)))
-            .take(4096)
-            .for_each(|f| {
-                let id: String = f.0.split(":").skip(3).collect();
-                if k.2.insert(id) {
-                    k.0.send(StoredTask {
-                        bytes: f.1.into(),
-                        task_id: f.0.split(":").skip(3).collect(),
-                        task_type: task_type.clone(),
-                    });
-                };
-            });
+            .take(4096);
+
+        for (key, value) in tasks {
+            let task_id = key.split(':').skip(3).collect::<Vec<_>>().join(":");
+
+            if k.2.insert(task_id.clone()) {
+                k.0.send(StoredTask {
+                    bytes: value.into(),
+                    task_id,
+                    task_type: task_type.clone(),
+                })
+                .await
+                .map_err(|err| Error::new(format!("Failed to send stored task: {err}")))?;
+            }
+        }
 
         Ok(())
     }

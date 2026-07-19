@@ -1,6 +1,16 @@
 use std::sync::Arc;
 
-use crate::api::ServerAPI;
+use crate::{Identifier, api::ServerAPI, error::Error};
 
 #[allow(dead_code)]
-fn lease(_api: Arc<ServerAPI>) {}
+async fn lease(api: Arc<ServerAPI>, task_type: Identifier) -> Result<(), Error> {
+    let task = api
+        .task_queue
+        .tasks
+        .get(&task_type)
+        .ok_or(Error::new("TaskTypeNotFound".into()))?
+        .1
+        .recv()
+        .await;
+    Ok(())
+}
