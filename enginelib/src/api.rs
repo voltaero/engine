@@ -71,7 +71,7 @@ impl ServerAPI {
             .task_queue
             .tasks
             .get(&task_type)
-            .ok_or(Error::new("TaskTypeNotFound".into()));
+            .ok_or(Error::new("TaskTypeNotFound".into()))?;
         Ok(())
     }
     pub fn populate(api: &Arc<Self>) {
