@@ -86,6 +86,14 @@ impl ServerAPI {
     pub fn init() -> Arc<Self> {
         let api = Arc::new(Self::default());
         Self::populate(&api);
+        let dapi = api.clone();
+        std::thread::spawn(async move || {
+            let mut interval = interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                LeasedTaskQueue::reap_expired(&dapi);
+            }
+        });
         api
     }
 }
@@ -104,7 +112,7 @@ impl Registry<dyn Task> for EngineTaskRegistry {
         );
         self.tasks.insert(identifier, task);
     }
-
+    #[instrument]
     fn get(&self, identifier: &Identifier) -> Option<Box<dyn Task>> {
         self.tasks.get(identifier).map(|obj| obj.clone_box())
     }
@@ -137,6 +145,7 @@ pub struct LeasedTask {
 }
 
 impl LeasedTask {
+    #[instrument]
     fn expired(&self) -> bool {
         if self.given_at.timestamp() + 36000 >= Utc::now().timestamp() {
             return false;
