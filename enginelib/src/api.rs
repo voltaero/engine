@@ -1,4 +1,5 @@
 use crate::api;
+use crate::error::Error;
 use crate::task::Task;
 use crate::{Identifier, Registry, config::Config, event::EventBus, plugin::LibraryManager};
 use chrono::{DateTime, Utc};
@@ -62,6 +63,29 @@ impl Default for ServerAPI {
         LibraryManager::load_modules(&mut k);
         crate::event::register_inventory_handlers(&mut k);
         return k;
+    }
+}
+impl ServerAPI {
+    pub fn load(api: &Arc<Self>, task_type: Identifier) -> Result<(), Error> {
+        let k = api
+            .task_queue
+            .tasks
+            .get(&task_type)
+            .ok_or(Error::new("TaskTypeNotFound".into()));
+        Ok(())
+    }
+    pub fn populate(api: &Arc<Self>) {
+        api.task_registry.tasks.iter().for_each(|f| {
+            let key = f.key();
+            let (tx, rx) = async_channel::bounded(8096); // Add to config or make unbound ?
+            api.task_queue.tasks.entry(key.clone()).or_insert((tx, rx));
+            api.leased_tasks.tasks.entry(key.clone()).or_default();
+        });
+    }
+    pub fn init() -> Arc<Self> {
+        let api = Arc::new(Self::default());
+        Self::populate(&api);
+        api
     }
 }
 
