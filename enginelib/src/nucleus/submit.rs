@@ -5,8 +5,6 @@ use crate::{Identifier, Registry, api::ServerAPI, error::Error};
 // f:namespace:task_name:<id> -> Finished Task Record
 #[allow(dead_code)]
 pub fn submit(api: Arc<ServerAPI>, task_bytes: &[u8], task_type: Identifier) -> Result<(), Error> {
-    // deserialize
-
     let task = api
         .task_registry
         .get(&task_type)
@@ -25,6 +23,5 @@ pub fn submit(api: Arc<ServerAPI>, task_bytes: &[u8], task_type: Identifier) -> 
             return Err(Error::new(res.err().unwrap().to_string()));
         }
     }
-
     Ok(())
 }

@@ -80,6 +80,7 @@ impl ServerAPI {
             let (tx, rx) = async_channel::bounded(8096); // Add to config or make unbound ?
             api.task_queue.tasks.entry(key.clone()).or_insert((tx, rx));
             api.leased_tasks.tasks.entry(key.clone()).or_default();
+            // task reg should be populated by mods
         });
     }
     pub fn init() -> Arc<Self> {
