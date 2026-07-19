@@ -1,3 +1,4 @@
+use crate::api;
 use crate::task::Task;
 use crate::{Identifier, Registry, config::Config, event::EventBus, plugin::LibraryManager};
 use chrono::{DateTime, Utc};
@@ -5,9 +6,10 @@ use dashmap::DashMap;
 pub use postcard;
 pub use postcard::from_bytes;
 pub use postcard::to_allocvec;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-
+use tokio::{spawn, sync::RwLock, time::interval};
 use tracing::{Level, debug, instrument};
 
 pub struct ServerAPI {
@@ -59,7 +61,7 @@ impl Default for ServerAPI {
         };
         LibraryManager::load_modules(&mut k);
         crate::event::register_inventory_handlers(&mut k);
-        k
+        return k;
     }
 }
 
@@ -106,4 +108,22 @@ pub struct LeasedTask {
     pub stored_task: Arc<StoredTask>,
     pub user_id: String,
     pub given_at: DateTime<Utc>,
+}
+
+impl LeasedTask {
+    fn expired(&self) -> bool {
+        if self.given_at.timestamp() + 36000 >= Utc::now().timestamp() {
+            return false;
+        }
+        return true;
+    }
+}
+
+impl LeasedTaskQueue {
+    fn reap_expired(api: &Arc<ServerAPI>) {
+        api.leased_tasks.tasks.retain(|_, tasks| {
+            tasks.retain(|task| !task.expired());
+            !tasks.is_empty()
+        });
+    }
 }
