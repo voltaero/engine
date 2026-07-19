@@ -72,12 +72,24 @@ impl ServerAPI {
             .tasks
             .get(&task_type)
             .ok_or(Error::new("TaskTypeNotFound".into()))?;
+        // t:namespace:task_name:<id> -> Serialized Task Record
+        let data = api
+            .db
+            .prefix_iterator(format!("t:{}:{}:", task_type.0, task_type.1))
+            .take(4096)
+            .filter_map(|f| match f {
+                Ok((key, value)) => Some((key, value)),
+                Err(error) => {
+                    eprintln!("RocksDB read error: {error}");
+                    None
+                }
+            });
         Ok(())
     }
     pub fn populate(api: &Arc<Self>) {
         api.task_registry.tasks.iter().for_each(|f| {
             let key = f.key();
-            let (tx, rx) = async_channel::bounded(8096); // Add to config or make unbound ?
+            let (tx, rx) = async_channel::bounded(8192); // Add to config or make unbound ?
             api.task_queue
                 .tasks
                 .entry(key.clone())
