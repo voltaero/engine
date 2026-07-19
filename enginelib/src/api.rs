@@ -101,7 +101,8 @@ pub struct LeasedTaskQueue {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct StoredTask {
     pub bytes: Vec<u8>,
-    pub id: String,
+    pub task_id: String,
+    pub task_type: Identifier,
 }
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct LeasedTask {
