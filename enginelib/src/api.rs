@@ -90,11 +90,14 @@ impl ServerAPI {
             .filter_map(|(key, value)| String::from_utf8(key.to_vec()).ok().map(|key| (key, value)))
             .take(4096)
             .for_each(|f| {
-                k.0.send(StoredTask {
-                    bytes: f.1.into(),
-                    task_id: f.0.split(":").skip(3).collect(),
-                    task_type: ID_from_string(&prefix),
-                });
+                let id: String = f.0.split(":").skip(3).collect();
+                if k.2.insert(id) {
+                    k.0.send(StoredTask {
+                        bytes: f.1.into(),
+                        task_id: f.0.split(":").skip(3).collect(),
+                        task_type: task_type.clone(),
+                    });
+                };
             });
 
         Ok(())
