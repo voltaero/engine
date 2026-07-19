@@ -1,5 +1,6 @@
 use crate::api;
 use crate::error::Error;
+use crate::events::{ID, ID_from_string};
 use crate::task::Task;
 use crate::{Identifier, Registry, config::Config, event::EventBus, plugin::LibraryManager};
 use chrono::{DateTime, Utc};
@@ -9,6 +10,7 @@ pub use postcard::from_bytes;
 pub use postcard::to_allocvec;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::str::pattern::Pattern;
 use std::sync::Arc;
 use tokio::{spawn, sync::RwLock, time::interval};
 use tracing::{Level, debug, instrument};
@@ -73,17 +75,28 @@ impl ServerAPI {
             .get(&task_type)
             .ok_or(Error::new("TaskTypeNotFound".into()))?;
         // t:namespace:task_name:<id> -> Serialized Task Record
-        let data = api
-            .db
-            .prefix_iterator(format!("t:{}:{}:", task_type.0, task_type.1))
-            .take(4096)
-            .filter_map(|f| match f {
-                Ok((key, value)) => Some((key, value)),
-                Err(error) => {
-                    eprintln!("RocksDB read error: {error}");
-                    None
+        let prefix = format!("t:{}:{}:", task_type.0, task_type.1);
+        api.db
+            .prefix_iterator(prefix.as_bytes())
+            .map_while(|result| match result {
+                Ok((key, value)) if key.starts_with(prefix.as_bytes()) => Some(Some((key, value))),
+                Ok(_) => None, // We passed the prefix range: stop iteration.
+                Err(err) => {
+                    eprintln!("RocksDB read error: {err}");
+                    Some(None)
                 }
+            })
+            .flatten()
+            .filter_map(|(key, value)| String::from_utf8(key.to_vec()).ok().map(|key| (key, value)))
+            .take(4096)
+            .for_each(|f| {
+                k.0.send(StoredTask {
+                    bytes: f.1.into(),
+                    task_id: f.0.split(":").skip(3).collect(),
+                    task_type: ID_from_string(&prefix),
+                });
             });
+
         Ok(())
     }
     pub fn populate(api: &Arc<Self>) {

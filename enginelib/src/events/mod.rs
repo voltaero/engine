@@ -26,7 +26,13 @@ use crate::{Identifier, api::ServerAPI};
 pub fn ID(namespace: &str, id: &str) -> Identifier {
     (namespace.to_string(), id.to_string())
 }
-
+#[allow(non_snake_case)]
+pub fn ID_from_string(id: &String) -> Identifier {
+    (
+        id.split(":").take(1).collect(),
+        id.split(":").skip(1).collect(),
+    )
+}
 pub struct Events;
 
 #[allow(non_snake_case)]
