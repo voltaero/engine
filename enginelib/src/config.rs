@@ -12,6 +12,8 @@ pub struct ConfigTomlServer {
     #[serde(default = "default_host")]
     pub host: String,
 
+    // Renamed from cgrpc_token; keep the alias so existing configs still authenticate.
+    #[serde(alias = "cgrpc_token")]
     pub auth_token: Option<String>,
 }
 impl Default for ConfigTomlServer {

@@ -18,7 +18,7 @@ impl AuthEvent {
         api: &ServerAPI,
         uid: String,
         challenge: String,
-        db: rust_rocksdb::DB,
+        db: Arc<rust_rocksdb::DB>,
         output: Arc<RwLock<bool>>,
     ) {
         api.event_bus.fire(&mut AuthEvent {
@@ -26,12 +26,12 @@ impl AuthEvent {
             id: ("core".to_string(), "auth_event".to_string()),
             uid,
             challenge,
-            db: Arc::new(db),
+            db,
             output,
         });
     }
 
-    pub fn check(api: &ServerAPI, uid: String, challenge: String, db: rust_rocksdb::DB) -> bool {
+    pub fn check(api: &ServerAPI, uid: String, challenge: String, db: Arc<rust_rocksdb::DB>) -> bool {
         let output = Arc::new(RwLock::new(false));
         Self::fire(api, uid, challenge, db, output.clone());
         *output.read().unwrap()

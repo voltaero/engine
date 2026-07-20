@@ -26,30 +26,23 @@ use crate::{Identifier, api::ServerAPI};
 pub fn ID(namespace: &str, id: &str) -> Identifier {
     (namespace.to_string(), id.to_string())
 }
-#[allow(non_snake_case)]
-pub fn ID_from_string(id: &String) -> Identifier {
-    (
-        id.split(":").take(1).collect(),
-        id.split(":").skip(1).collect(),
-    )
-}
 pub struct Events;
 
 #[allow(non_snake_case)]
 impl Events {
     pub fn init_auth(_api: &mut ServerAPI) {}
 
-    pub fn CheckAuth(
-        api: &ServerAPI,
-        uid: String,
-        challenge: String,
-        db: rust_rocksdb::DB,
-    ) -> bool {
+    pub fn CheckAuth(api: &ServerAPI, uid: String, challenge: String, db: Arc<DB>) -> bool {
         auth_event::AuthEvent::check(api, uid, challenge, db)
     }
 
-    pub fn CheckAdminAuth(api: &ServerAPI, payload: String, target: Identifier, db: DB) -> bool {
-        admin_auth_event::AdminAuthEvent::check(api, payload, target, Arc::new(db))
+    pub fn CheckAdminAuth(
+        api: &ServerAPI,
+        payload: String,
+        target: Identifier,
+        db: Arc<DB>,
+    ) -> bool {
+        admin_auth_event::AdminAuthEvent::check(api, payload, target, db)
     }
 
     pub fn CgrpcEvent(
