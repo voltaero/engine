@@ -19,6 +19,15 @@ pub fn task_key(task_type: &Identifier, task_id: &str) -> String {
     format!("t:{}:{}:{}", task_type.0, task_type.1, task_id)
 }
 
+// f:namespace:task_name:<id> -> Finished Task Record
+pub fn finished_task_key(task_type: &Identifier, task_id: &str) -> String {
+    format!("f:{}:{}:{}", task_type.0, task_type.1, task_id)
+}
+
+pub fn finished_task_key_prefix(task_type: &Identifier) -> String {
+    format!("f:{}:{}:", task_type.0, task_type.1)
+}
+
 pub fn task_id_from_key(key: &str) -> Option<&str> {
     key.splitn(4, ':').nth(3)
 }

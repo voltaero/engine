@@ -31,7 +31,12 @@ impl AuthEvent {
         });
     }
 
-    pub fn check(api: &ServerAPI, uid: String, challenge: String, db: Arc<rust_rocksdb::DB>) -> bool {
+    pub fn check(
+        api: &ServerAPI,
+        uid: String,
+        challenge: String,
+        db: Arc<rust_rocksdb::DB>,
+    ) -> bool {
         let output = Arc::new(RwLock::new(false));
         Self::fire(api, uid, challenge, db, output.clone());
         *output.read().unwrap()
