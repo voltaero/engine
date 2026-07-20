@@ -48,7 +48,10 @@ impl Default for ServerAPI {
         let mut opts = rust_rocksdb::Options::default();
         opts.create_if_missing(true);
 
-        let db = Arc::new(rust_rocksdb::DB::open(&opts, path).unwrap());
+        let db = Arc::new(
+            rust_rocksdb::DB::open(&opts, path)
+                .expect("Failed to open RocksDB — check that the path is writable and no other process holds the lock"),
+        );
 
         use std::sync::OnceLock;
 
