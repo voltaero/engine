@@ -1,15 +1,18 @@
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorKind {
     NotFound,
     NotSupported,
     InvalidArgument,
     IOError,
+    Overloaded,
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Error {
     kind: ErrorKind,
     message: String,
@@ -40,6 +43,10 @@ impl Error {
 
     pub fn io_error(message: impl Into<String>) -> Error {
         Self::with_kind(ErrorKind::IOError, message)
+    }
+
+    pub fn overloaded(message: impl Into<String>) -> Error {
+        Self::with_kind(ErrorKind::Overloaded, message)
     }
 
     pub fn kind(&self) -> ErrorKind {

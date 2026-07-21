@@ -8,6 +8,34 @@ description = "A Blazingly fast distributed task system"
 [features]
 default = []
 dev = []
+
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+[[bin]]
+name = "bench_server"
+path = "src/bin/bench_server.rs"
+
 [dependencies]
 
 enginelib = { path = "../enginelib" }
+tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
+tmq = "0.5.0"
+futures = "0.3"
+serde = { workspace = true }
+toml = { workspace = true }
+tracing = "0.1"
+
+[dev-dependencies]
+chrono = { version = "0.4.44", features = ["serde"] }
+dashmap = "6.2.1"
+async-channel = "2.5.0"
