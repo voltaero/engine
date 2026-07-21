@@ -1,6 +1,8 @@
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorKind {
     NotFound,
     NotSupported,
@@ -9,7 +11,7 @@ pub enum ErrorKind {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Error {
     kind: ErrorKind,
     message: String,

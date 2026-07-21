@@ -29,6 +29,7 @@ pub use crate::events::start_event::StartEvent;
 pub use crate::events::task_block_acquired_event::TaskBlockAcquiredEvent;
 pub use crate::events::{Events, ID};
 pub use crate::plugin::{LibraryDependency, LibraryMetadata};
+pub use crate::protocol::{Envelope, Request, Response};
 pub use crate::task::{Runner, Task, Verifiable};
 pub use crate::{Identifier, RawIdentifier, Registry};
 pub use tracing;

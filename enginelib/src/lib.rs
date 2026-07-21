@@ -4,6 +4,7 @@ pub mod config;
 pub mod event;
 pub mod events;
 pub mod nucleus;
+pub mod protocol;
 extern crate self as enginelib;
 pub use inventory;
 pub mod plugin;

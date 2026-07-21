@@ -64,8 +64,8 @@ pub fn derive_verifiable(input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         impl ::enginelib::task::Verifiable for #name {
-            fn verify(&self, b: Vec<u8>) -> bool {
-                let k: Result<#name, _> = enginelib::api::postcard::from_bytes(b.as_slice());
+            fn verify(&self, b: &[u8]) -> bool {
+                let k: Result<#name, _> = enginelib::api::postcard::from_bytes(b);
                 k.is_ok()
             }
         }

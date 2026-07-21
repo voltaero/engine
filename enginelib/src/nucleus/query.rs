@@ -16,7 +16,7 @@ use crate::{api::ServerAPI, error::Error};
 /// [`crate::api`] (`task_key_prefix`, `finished_task_key_prefix`, `task_key`,
 /// `finished_task_key`) to scope to a task type, its pending records, its
 /// finished records, or a single record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Query {
     /// Fetch a single record by its exact key. O(1) point read (`db.get`, not a
     /// scan) — the primitive for addressing one known task, e.g. the id returned
@@ -73,7 +73,7 @@ pub struct Page {
 }
 
 /// The outcome of a [`Query`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum QueryResult {
     /// A single record, or `None` when the key is absent.
     Record(Option<Record>),
