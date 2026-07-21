@@ -8,6 +8,7 @@ pub enum ErrorKind {
     NotSupported,
     InvalidArgument,
     IOError,
+    Overloaded,
     Unknown,
 }
 
@@ -42,6 +43,10 @@ impl Error {
 
     pub fn io_error(message: impl Into<String>) -> Error {
         Self::with_kind(ErrorKind::IOError, message)
+    }
+
+    pub fn overloaded(message: impl Into<String>) -> Error {
+        Self::with_kind(ErrorKind::Overloaded, message)
     }
 
     pub fn kind(&self) -> ErrorKind {

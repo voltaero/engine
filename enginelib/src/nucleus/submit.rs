@@ -54,8 +54,8 @@ pub fn submit_batch(
         batch.put(task_key(&task_type, id), bytes);
     }
     let mut wopts = WriteOptions::default();
-    // Durability is the WAL; skip fsync-per-write to sustain the write rate.
-    wopts.set_sync(false);
+    // Do not acknowledge submissions until the WAL is durable on stable storage.
+    wopts.set_sync(true);
     api.db
         .write_opt(&batch, &wopts)
         .map_err(|err| Error::io_error(format!("Failed to persist task batch: {err}")))?;

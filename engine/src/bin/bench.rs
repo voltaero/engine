@@ -3,8 +3,8 @@
 //! Spawns the `bench_server` binary as a **separate OS process** and drives it
 //! over real tcp: one submitter connection plus N worker connections, each a real
 //! libzmq DEALER. No in-process server, no unbounded channel — the server runs the
-//! real `bounded(8192)` pipeline, fed by the persistent per-task-type loaders that
-//! `serve()` spawns (submit writes to the DB; the loaders stream records into the
+//! real bounded pipeline, fed by persistent per-task-type loaders started by the
+//! benchmark server (submit writes to the DB; loaders stream records into the
 //! lease channel). Stall detection is a safety net: if progress stops for
 //! `BENCH_STALL_SECS`, the run reports `stalled` rather than hanging or lying.
 //!
@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use engine::bench_task::FibTask;
 use engine::client::Client;
-use engine_core::FibTask;
 use enginelib::Identifier;
 use enginelib::task::Task;
 
@@ -62,7 +62,10 @@ async fn main() {
                 Err(_) => return,
             };
             loop {
-                let leased = match client.lease(task_type.clone(), "w".into(), lease_batch).await {
+                let leased = match client
+                    .lease(task_type.clone(), "w".into(), lease_batch)
+                    .await
+                {
                     Ok(v) => v,
                     Err(_) => break,
                 };

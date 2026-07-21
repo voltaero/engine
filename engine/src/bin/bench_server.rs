@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use engine_core::FibTask;
+use engine::bench_task::FibTask;
 use enginelib::api::ServerAPI;
 use enginelib::task::Task;
 
@@ -26,14 +26,19 @@ async fn main() {
     let fib: Arc<dyn Task> = Arc::new(FibTask::default());
     api.task_registry.tasks.insert(task_type.clone(), fib);
     let api = Arc::new(api);
-    // Real bounded(8192) queue + dedup set, exactly as the deployed server builds.
-    ServerAPI::populate(&api);
+    // Real bounded queue + dedup set, as the deployed server builds. Depth is
+    // configurable (ENGINE_QUEUE_SIZE, default 8192) for the sweep.
+    let queue_size: usize = std::env::var("ENGINE_QUEUE_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8192);
+    ServerAPI::populate_with(&api, queue_size);
     // Match init()'s deployment behavior: run the lease reaper. (At the 3600s TTL
     // it never fires within a bench, but it's free and keeps this faithful.)
     ServerAPI::spawn_reaper(&api);
-    // Loading (DB → channel) is done by the loader tasks that serve() spawns —
-    // submit only writes to the DB. No separate startup drain needed.
-    let _ = &task_type;
+    // Submit only writes to the DB; one loader per task type feeds the bounded
+    // lease queue. Transport shards must not create duplicate loaders.
+    ServerAPI::spawn_loaders(&api);
 
     let endpoint = format!("tcp://127.0.0.1:{port}");
     eprintln!("bench_server listening on {endpoint} (db={db_path})");

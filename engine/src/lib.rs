@@ -4,5 +4,7 @@
 //! (which link `enginelib`) don't inherit a libzmq build dependency. The wire
 //! types are shared via [`enginelib::protocol`].
 
+pub mod bench_task;
 pub mod client;
 pub mod server;
+pub mod transport;

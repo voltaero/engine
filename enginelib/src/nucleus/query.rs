@@ -96,7 +96,9 @@ pub fn query(api: Arc<ServerAPI>, query: Query) -> Result<QueryResult, Error> {
                 .db
                 .get(key.as_bytes())
                 .map_err(|err| Error::io_error(format!("Failed to read record: {err}")))?;
-            Ok(QueryResult::Record(value.map(|value| Record { key, value })))
+            Ok(QueryResult::Record(
+                value.map(|value| Record { key, value }),
+            ))
         }
         Query::EstimateKeys => {
             let keys = api

@@ -4,7 +4,7 @@
 //! registry refuses identifiers that would collide key prefixes.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
@@ -83,7 +83,9 @@ async fn reaped_lease_is_requeued() {
     let api = test_api("reap", &task_type);
 
     submit::submit(api.clone(), b"payload", task_type.clone()).expect("submit");
-    ServerAPI::load_all(&api, task_type.clone()).await.expect("load");
+    ServerAPI::load_all(&api, task_type.clone())
+        .await
+        .expect("load");
 
     let leased = lease::lease_batch(api.clone(), task_type.clone(), "w1".into(), 1)
         .await
@@ -95,7 +97,12 @@ async fn reaped_lease_is_requeued() {
     LeasedTaskQueue::reap_expired(&api);
 
     // The lease is gone and the task is back in the channel for the next worker.
-    assert!(api.leased_tasks.tasks.get(&task_type).is_none_or(|l| l.is_empty()));
+    assert!(
+        api.leased_tasks
+            .tasks
+            .get(&task_type)
+            .is_none_or(|l| l.is_empty())
+    );
     let released = lease::lease_batch(api.clone(), task_type.clone(), "w2".into(), 1)
         .await
         .expect("re-lease");
@@ -143,8 +150,18 @@ async fn full_channel_reap_recovers_via_loader_rescan() {
 
     // Wait until the channel is full so the reaper's try_send must fail.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while api.task_queue.tasks.get(&task_type).expect("queue").0.len() < 1 {
-        assert!(tokio::time::Instant::now() < deadline, "loader never enqueued");
+    while api
+        .task_queue
+        .tasks
+        .get(&task_type)
+        .expect("queue")
+        .0
+        .is_empty()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "loader never enqueued"
+        );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
@@ -170,6 +187,35 @@ async fn full_channel_reap_recovers_via_loader_rescan() {
     assert_eq!(seen, expected);
 }
 
+/// A closed loader channel must not leave records marked in-flight when none
+/// were enqueued. The rescan flag allows recovery after the queue is recreated.
+#[tokio::test]
+async fn load_after_closed_channel_clears_dedup_and_requests_rescan() {
+    let task_type: Identifier = ("test".to_string(), "echo".to_string());
+    let api = test_api("closed_loader", &task_type);
+    let ids = submit::submit_batch(
+        api.clone(),
+        task_type.clone(),
+        vec![b"a".to_vec(), b"b".to_vec()],
+    )
+    .expect("submit");
+
+    let queue = api.task_queue.tasks.get(&task_type).expect("queue");
+    queue.1.close();
+    drop(queue);
+
+    let err = ServerAPI::load_after(&api, &task_type, None)
+        .await
+        .expect_err("closed queue must reject loader sends");
+    assert!(err.as_ref().contains("Failed to send stored task"));
+
+    let queue = api.task_queue.tasks.get(&task_type).expect("queue");
+    for id in ids {
+        assert!(!queue.2.contains(&id), "task remained in dedup set");
+    }
+    assert!(queue.3.load(Ordering::Acquire), "rescan was not requested");
+}
+
 /// A duplicate task id inside one complete_batch request is completed and
 /// counted once, not twice.
 #[tokio::test]
@@ -178,7 +224,9 @@ async fn complete_batch_counts_duplicate_ids_once() {
     let api = test_api("dup", &task_type);
 
     submit::submit(api.clone(), b"payload", task_type.clone()).expect("submit");
-    ServerAPI::load_all(&api, task_type.clone()).await.expect("load");
+    ServerAPI::load_all(&api, task_type.clone())
+        .await
+        .expect("load");
     let leased = lease::lease_batch(api.clone(), task_type.clone(), "w".into(), 1)
         .await
         .expect("lease");

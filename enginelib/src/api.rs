@@ -3,10 +3,10 @@ use crate::task::Task;
 use crate::{Identifier, Registry, config::Config, event::EventBus, plugin::LibraryManager};
 use chrono::{DateTime, Utc};
 use dashmap::{DashMap, DashSet};
-use rust_rocksdb::{Direction, IteratorMode};
 pub use postcard;
 pub use postcard::from_bytes;
 pub use postcard::to_allocvec;
+use rust_rocksdb::{Direction, IteratorMode};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,6 +66,12 @@ impl ServerAPI {
     /// [`Default`] uses the standard `./engine_db`; tests pass a temp path so
     /// they don't collide on the shared store.
     pub fn with_path(path: &str) -> Self {
+        Self::with_path_and_config(path, Config::default())
+    }
+
+    /// Open a database with an explicitly loaded configuration. Production
+    /// startup uses this path so transport and auth settings are not discarded.
+    pub fn with_path_and_config(path: &str, config: Config) -> Self {
         let mut opts = rust_rocksdb::Options::default();
         opts.create_if_missing(true);
 
@@ -77,7 +83,7 @@ impl ServerAPI {
         Self::setup_logger();
 
         let mut k = Self {
-            cfg: Config::default(),
+            cfg: config,
             event_bus: EventBus::default(),
             lib_manager: LibraryManager::default(),
             db,
@@ -234,14 +240,14 @@ impl ServerAPI {
                 if cursor.as_deref() == Some(key.as_str()) {
                     continue;
                 }
-                if let Some(task_id) = task_id_from_key(&key) {
-                    if k.2.insert(task_id.to_string()) {
-                        batch.push(StoredTask {
-                            bytes: value.into(),
-                            task_id: task_id.to_string(),
-                            task_type: task_type.clone(),
-                        });
-                    }
+                if let Some(task_id) = task_id_from_key(&key)
+                    && k.2.insert(task_id.to_string())
+                {
+                    batch.push(StoredTask {
+                        bytes: value.into(),
+                        task_id: task_id.to_string(),
+                        task_type: task_type.clone(),
+                    });
                 }
                 // Advance the cursor past every key seen, so skipped keys aren't
                 // revisited next call.
@@ -251,9 +257,20 @@ impl ServerAPI {
         };
 
         let count = batch.len();
-        for task in batch {
-            if sender.send(task).await.is_err() {
-                return Err(Error::new("Task queue closed".to_string()));
+        let mut batch = batch.into_iter();
+        while let Some(task) = batch.next() {
+            if let Err(err) = sender.send(task).await {
+                // None of these tasks reached the channel. Clear their in-flight
+                // markers and rewind the loader so the persisted records can be
+                // recovered if the queue is recreated.
+                if let Some(k) = api.task_queue.tasks.get(task_type) {
+                    k.2.remove(&err.0.task_id);
+                    for task in batch {
+                        k.2.remove(&task.task_id);
+                    }
+                    k.3.store(true, Ordering::Release);
+                }
+                return Err(Error::new(format!("Failed to send stored task: {err}")));
             }
         }
         Ok((count, last))
@@ -311,19 +328,31 @@ impl ServerAPI {
         }
     }
     pub fn populate(api: &Arc<Self>) {
+        Self::populate_with(api, 8192);
+    }
+
+    /// Like [`populate`] but with a configurable per-type lease-channel capacity.
+    /// Used to sweep queue depth in benchmarks.
+    pub fn populate_with(api: &Arc<Self>, queue_size: usize) {
         api.task_registry.tasks.iter().for_each(|f| {
             let key = f.key();
-            let (tx, rx) = async_channel::bounded(8192); // Add to config or make unbound ?
-            api.task_queue
-                .tasks
-                .entry(key.clone())
-                .or_insert((tx, rx, DashSet::default(), Arc::new(AtomicBool::new(false))));
+            let (tx, rx) = async_channel::bounded(queue_size.max(1));
+            api.task_queue.tasks.entry(key.clone()).or_insert((
+                tx,
+                rx,
+                DashSet::default(),
+                Arc::new(AtomicBool::new(false)),
+            ));
             api.leased_tasks.tasks.entry(key.clone()).or_default();
             // task reg should be populated by mods
         });
     }
     pub fn init() -> Arc<Self> {
-        let api = Arc::new(Self::default());
+        Self::init_with_config(Config::default())
+    }
+
+    pub fn init_with_config(config: Config) -> Arc<Self> {
+        let api = Arc::new(Self::with_path_and_config("./engine_db", config));
         Self::populate(&api);
         Self::spawn_reaper(&api);
         api
@@ -377,17 +406,16 @@ impl Registry<dyn Task> for EngineTaskRegistry {
 /// rescan flag. Recovery paths set the flag *after* removing an id from the
 /// dedup set to tell [`ServerAPI::run_loader`] its cursor has passed a record
 /// that must be re-enqueued, so it rewinds and re-walks the prefix.
+pub type TaskQueueEntry = (
+    async_channel::Sender<StoredTask>,
+    async_channel::Receiver<StoredTask>,
+    dashmap::DashSet<String>,
+    Arc<AtomicBool>,
+);
+
 #[derive(Debug, Default, Clone)]
 pub struct TaskQueue {
-    pub tasks: DashMap<
-        Identifier,
-        (
-            async_channel::Sender<StoredTask>,
-            async_channel::Receiver<StoredTask>,
-            dashmap::DashSet<String>,
-            Arc<AtomicBool>,
-        ),
-    >,
+    pub tasks: DashMap<Identifier, TaskQueueEntry>,
 }
 #[derive(Debug, Default, Clone)]
 pub struct LeasedTaskQueue {

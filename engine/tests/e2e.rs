@@ -64,6 +64,7 @@ async fn submit_lease_complete_over_tcp() {
         .insert(task_type.clone(), Arc::new(EchoTask));
     let api = Arc::new(api);
     ServerAPI::populate(&api);
+    ServerAPI::spawn_loaders(&api);
 
     // Serve in the background.
     let serve_api = api.clone();

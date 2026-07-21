@@ -564,22 +564,13 @@ dependencies = [
  "async-channel",
  "chrono",
  "dashmap",
- "engine_core",
  "enginelib",
  "futures",
  "serde",
  "tmq",
  "tokio",
- "tracing",
-]
-
-[[package]]
-name = "engine_core"
-version = "0.1.0"
-dependencies = [
- "enginelib",
- "serde",
  "toml 1.1.2+spec-1.1.0",
+ "tracing",
 ]
 
 [[package]]

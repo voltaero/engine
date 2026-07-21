@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use chrono::Utc;
 
@@ -60,33 +62,67 @@ pub async fn lease_batch(
     user_id: String,
     max: u32,
 ) -> Result<Vec<Arc<StoredTask>>, Error> {
+    lease_batch_limited(
+        api,
+        task_type,
+        user_id,
+        max,
+        usize::MAX,
+        Duration::from_secs(LEASE_LONG_POLL_SECS),
+    )
+    .await
+}
+
+/// Transport-facing lease with explicit response-byte and long-poll bounds.
+/// Tasks that would exceed the byte budget are put back without changing their
+/// dedup state, so the caller never receives an undeliverable lease.
+pub async fn lease_batch_limited(
+    api: Arc<ServerAPI>,
+    task_type: Identifier,
+    user_id: String,
+    max: u32,
+    max_bytes: usize,
+    poll_timeout: Duration,
+) -> Result<Vec<Arc<StoredTask>>, Error> {
     if max == 0 {
         return Ok(Vec::new());
     }
 
-    // Clone the receiver out of the map guard before awaiting (see `lease`).
-    let receiver = api
-        .task_queue
-        .tasks
-        .get(&task_type)
-        .ok_or(Error::not_found("TaskTypeNotFound"))?
-        .1
-        .clone();
+    // Clone both channel halves out of the map guard before awaiting.
+    let (sender, receiver) = {
+        let queue = api
+            .task_queue
+            .tasks
+            .get(&task_type)
+            .ok_or(Error::not_found("TaskTypeNotFound"))?;
+        (queue.0.clone(), queue.1.clone())
+    };
 
-    let mut out: Vec<Arc<StoredTask>> = Vec::new();
-    let first = match tokio::time::timeout(
-        std::time::Duration::from_secs(LEASE_LONG_POLL_SECS),
-        receiver.recv(),
-    )
-    .await
-    {
+    let first = match tokio::time::timeout(poll_timeout, receiver.recv()).await {
         Err(_elapsed) => return Ok(Vec::new()),
         Ok(recv) => recv.map_err(|err| Error::new(format!("Task queue closed: {err}")))?,
     };
-    out.push(Arc::new(first));
+
+    let mut used_bytes = estimated_wire_bytes(&first);
+    if used_bytes > max_bytes {
+        requeue_unleased(&api, &task_type, &sender, first);
+        return Err(Error::invalid_argument(
+            "Stored task exceeds the configured lease response limit",
+        ));
+    }
+
+    let mut out: Vec<Arc<StoredTask>> = vec![Arc::new(first)];
     while (out.len() as u32) < max {
         match receiver.try_recv() {
-            Ok(task) => out.push(Arc::new(task)),
+            Ok(task) => {
+                let task_bytes = estimated_wire_bytes(&task);
+                if used_bytes.saturating_add(task_bytes) > max_bytes {
+                    requeue_unleased(&api, &task_type, &sender, task);
+                    break;
+                }
+                used_bytes = used_bytes.saturating_add(task_bytes);
+                out.push(Arc::new(task));
+            }
             Err(_) => break,
         }
     }
@@ -104,4 +140,27 @@ pub async fn lease_batch(
     }
 
     Ok(out)
+}
+
+fn estimated_wire_bytes(task: &StoredTask) -> usize {
+    task.bytes
+        .len()
+        .saturating_add(task.task_id.len())
+        .saturating_add(task.task_type.0.len())
+        .saturating_add(task.task_type.1.len())
+        .saturating_add(64)
+}
+
+fn requeue_unleased(
+    api: &Arc<ServerAPI>,
+    task_type: &Identifier,
+    sender: &async_channel::Sender<StoredTask>,
+    task: StoredTask,
+) {
+    if let Err(err) = sender.try_send(task)
+        && let Some(queue) = api.task_queue.tasks.get(task_type)
+    {
+        queue.2.remove(&err.into_inner().task_id);
+        queue.3.store(true, Ordering::Release);
+    }
 }

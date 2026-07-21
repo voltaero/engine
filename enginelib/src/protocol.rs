@@ -12,10 +12,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::Identifier;
 use crate::api::StoredTask;
 use crate::error::Error;
 use crate::nucleus::query::{Query, QueryResult};
-use crate::Identifier;
 
 /// A request plus the caller's auth token, as sent on the wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +75,9 @@ pub enum Response {
     Cancelled,
     /// A `Query` result.
     Query(QueryResult),
+    /// The transport is at capacity. Mutations were not executed and may be
+    /// retried after the suggested delay.
+    Overloaded { retry_after_ms: u64 },
     /// The operation failed.
     Err(Error),
 }

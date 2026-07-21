@@ -59,6 +59,7 @@ impl Client {
     ) -> Result<Vec<String>, Error> {
         match self.call(Request::SubmitBatch { task_type, tasks }).await? {
             Response::Submitted { task_ids } => Ok(task_ids),
+            Response::Overloaded { retry_after_ms } => Err(overloaded(retry_after_ms)),
             Response::Err(e) => Err(e),
             other => Err(unexpected(other)),
         }
@@ -82,6 +83,7 @@ impl Client {
             .await?
         {
             Response::Leased(tasks) => Ok(tasks),
+            Response::Overloaded { retry_after_ms } => Err(overloaded(retry_after_ms)),
             Response::Err(e) => Err(e),
             other => Err(unexpected(other)),
         }
@@ -98,6 +100,7 @@ impl Client {
             .await?
         {
             Response::Completed { ok } => Ok(ok),
+            Response::Overloaded { retry_after_ms } => Err(overloaded(retry_after_ms)),
             Response::Err(e) => Err(e),
             other => Err(unexpected(other)),
         }
@@ -107,6 +110,7 @@ impl Client {
     pub async fn renew(&mut self, task_type: Identifier, task_id: String) -> Result<(), Error> {
         match self.call(Request::Renew { task_type, task_id }).await? {
             Response::Renewed => Ok(()),
+            Response::Overloaded { retry_after_ms } => Err(overloaded(retry_after_ms)),
             Response::Err(e) => Err(e),
             other => Err(unexpected(other)),
         }
@@ -116,6 +120,7 @@ impl Client {
     pub async fn cancel(&mut self, task_type: Identifier, task_id: String) -> Result<(), Error> {
         match self.call(Request::Cancel { task_type, task_id }).await? {
             Response::Cancelled => Ok(()),
+            Response::Overloaded { retry_after_ms } => Err(overloaded(retry_after_ms)),
             Response::Err(e) => Err(e),
             other => Err(unexpected(other)),
         }
@@ -125,10 +130,15 @@ impl Client {
     pub async fn query(&mut self, q: Query) -> Result<QueryResult, Error> {
         match self.call(Request::Query(q)).await? {
             Response::Query(r) => Ok(r),
+            Response::Overloaded { retry_after_ms } => Err(overloaded(retry_after_ms)),
             Response::Err(e) => Err(e),
             other => Err(unexpected(other)),
         }
     }
+}
+
+fn overloaded(retry_after_ms: u64) -> Error {
+    Error::overloaded(format!("server overloaded; retry after {retry_after_ms}ms"))
 }
 
 fn unexpected(resp: Response) -> Error {

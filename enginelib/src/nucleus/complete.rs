@@ -61,7 +61,9 @@ pub fn complete(
     }
     if let Err(err) = api.db.delete(task_key(&task_type, &task_id)) {
         clear_dedup(true);
-        return Err(Error::io_error(format!("Failed to delete task record: {err}")));
+        return Err(Error::io_error(format!(
+            "Failed to delete task record: {err}"
+        )));
     }
 
     clear_dedup(false);
