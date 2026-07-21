@@ -1,4 +1,4 @@
-use std::{fs, io::Error, u32};
+use std::{fs, io::Error};
 
 use serde::{Deserialize, Serialize};
 use tracing::{error, instrument};
@@ -7,37 +7,20 @@ fn default_host() -> String {
     "[::1]:50051".into()
 }
 
-fn default_clean_tasks() -> u64 {
-    60
-}
-fn default_task_block_size() -> u32 {
-    256
-}
-fn default_pagination_limit() -> u32 {
-    u32::MAX
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ConfigTomlServer {
-    #[serde(default)]
-    pub cgrpc_token: Option<String>, // Administrator Token, used to invoke cgrpc reqs. If not preset will default to no protection.
     #[serde(default = "default_host")]
     pub host: String,
-    #[serde(default = "default_clean_tasks")]
-    pub clean_tasks: u64,
-    #[serde(default = "default_pagination_limit")]
-    pub pagination_limit: u32,
-    #[serde(default = "default_task_block_size")]
-    pub task_block_size: u32,
+
+    // Renamed from cgrpc_token; keep the alias so existing configs still authenticate.
+    #[serde(alias = "cgrpc_token")]
+    pub auth_token: Option<String>,
 }
 impl Default for ConfigTomlServer {
     fn default() -> Self {
         Self {
-            cgrpc_token: None,
             host: default_host(),
-            clean_tasks: default_clean_tasks(),
-            pagination_limit: default_pagination_limit(),
-            task_block_size: default_task_block_size(),
+            auth_token: Option::None,
         }
     }
 }
@@ -52,9 +35,9 @@ impl Config {
     pub fn new() -> Self {
         let mut content: String = "".to_owned();
         let result: Result<String, Error> = fs::read_to_string("config.toml");
-        if result.is_ok() {
-            content = result.unwrap();
-        };
+        if let Ok(file_content) = result {
+            content = file_content;
+        }
         let config_toml: ConfigTomlServer = toml::from_str(&content).unwrap_or_else(|err| {
             error!("Failed to parse config file.");
             error!("{:#?}", err);

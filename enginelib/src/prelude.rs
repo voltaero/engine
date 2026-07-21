@@ -10,11 +10,11 @@ pub use crate::event::{
     Event, EventBus, EventCTX, EventHandler, EventRegistrar, register_inventory_handlers,
     register_inventory_handlers_for_origin,
 };
-pub use crate::events::admin_auth_event::AdminAuthEvent;
+//pub use crate::events::admin_auth_event::AdminAuthEvent;
 pub use crate::events::auth_event::AuthEvent;
-pub use crate::events::before_task_acquire_event::BeforeTaskAcquireEvent;
-pub use crate::events::before_task_execute_event::BeforeTaskExecuteEvent;
-pub use crate::events::before_task_publish_event::BeforeTaskPublishEvent;
+pub use crate::events::before_task_block_acquire_event::BeforeTaskBlockAcquireEvent;
+pub use crate::events::before_task_block_execute_event::BeforeTaskBlockExecuteEvent;
+pub use crate::events::before_task_block_publish_event::BeforeTaskBlockPublishEvent;
 pub use crate::events::cgrpc_event::CgrpcEvent;
 pub use crate::events::client_auth_prepare_event::ClientAuthPrepareEvent;
 pub use crate::events::client_start_event::ClientStartEvent;
@@ -22,11 +22,11 @@ pub use crate::events::server_before_task_acquire_event::ServerBeforeTaskAcquire
 pub use crate::events::server_before_task_create_event::ServerBeforeTaskCreateEvent;
 pub use crate::events::server_before_task_publish_event::ServerBeforeTaskPublishEvent;
 pub use crate::events::server_start_event::ServerStartEvent;
-pub use crate::events::server_task_acquired_event::ServerTaskAcquiredEvent;
-pub use crate::events::server_task_created_event::ServerTaskCreatedEvent;
-pub use crate::events::server_task_published_event::ServerTaskPublishedEvent;
+pub use crate::events::server_task_block_acquired_event::ServerTaskBlockAcquiredEvent;
+pub use crate::events::server_task_block_created_event::ServerTaskBlockCreatedEvent;
+pub use crate::events::server_task_block_published_event::ServerTaskBlockPublishedEvent;
 pub use crate::events::start_event::StartEvent;
-pub use crate::events::task_acquired_event::TaskAcquiredEvent;
+pub use crate::events::task_block_acquired_event::TaskBlockAcquiredEvent;
 pub use crate::events::{Events, ID};
 pub use crate::plugin::{LibraryDependency, LibraryMetadata};
 pub use crate::task::{Runner, Task, Verifiable};

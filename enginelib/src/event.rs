@@ -1,6 +1,6 @@
 use crate::{Identifier, api::ServerAPI};
+use dashmap::DashMap;
 use std::any::Any;
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use tracing::instrument;
@@ -22,10 +22,10 @@ pub fn register_inventory_handlers_for_origin(api: &mut ServerAPI, origin: &'sta
 
 fn register_inventory_handlers_inner(api: &mut ServerAPI, origin: Option<&'static str>) {
     for item in inventory::iter::<EventRegistrar> {
-        if let Some(origin) = origin {
-            if item.origin != origin {
-                continue;
-            }
+        if let Some(origin) = origin
+            && item.origin != origin
+        {
+            continue;
         }
         (item.func)(api);
     }
@@ -51,9 +51,10 @@ pub trait EventCTX<C: Event>: EventHandler {
         self.handleCTX(event);
     }
 
+    #[allow(non_snake_case)]
     fn handleCTX(&self, event: &mut C);
 }
-
+#[derive(Default, Clone)]
 pub struct EventBus {
     pub event_handler_registry: EngineEventHandlerRegistry,
 }
@@ -80,7 +81,7 @@ pub trait EventHandler: Any + Send + Sync {
 
 #[derive(Clone, Default)]
 pub struct EngineEventHandlerRegistry {
-    pub event_handlers: HashMap<Identifier, Vec<Arc<dyn EventHandler>>>,
+    pub event_handlers: DashMap<Identifier, Vec<Arc<dyn EventHandler>>>,
 }
 
 impl EngineEventHandlerRegistry {
@@ -90,7 +91,7 @@ impl EngineEventHandlerRegistry {
         identifier: Identifier,
     ) {
         let handler = Arc::new(handler);
-        let handlers = self.event_handlers.entry(identifier.clone()).or_default();
+        let mut handlers = self.event_handlers.entry(identifier.clone()).or_default();
         handlers.push(handler);
         debug!(
             "EventBus: Registered handler for event {}.{}",
@@ -100,6 +101,14 @@ impl EngineEventHandlerRegistry {
 }
 
 impl EventBus {
+    pub fn has_handlers(&self, identifier: &Identifier) -> bool {
+        self.event_handler_registry
+            .event_handlers
+            .get(identifier)
+            .map(|handlers| !handlers.is_empty())
+            .unwrap_or(false)
+    }
+
     pub fn register_handler<H: EventHandler + Send + Sync + 'static>(
         &mut self,
         handler: H,
@@ -115,7 +124,7 @@ impl EventBus {
         debug!("EventBus: Firing event {}.{}", id.0, id.1);
 
         if let Some(handlers) = self.event_handler_registry.event_handlers.get(&id) {
-            for handler in handlers {
+            for handler in handlers.iter() {
                 if event.is_cancelled() && !handler.receive_cancelled() {
                     continue;
                 }

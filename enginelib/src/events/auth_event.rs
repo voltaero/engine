@@ -2,7 +2,6 @@ use std::sync::{Arc, RwLock};
 
 use crate::{Identifier, api::ServerAPI};
 use macros::{Event, event_handler};
-use sled::Db;
 
 #[derive(Clone, Debug, Event)]
 #[event(namespace = "core", name = "auth_event", cancellable)]
@@ -11,15 +10,15 @@ pub struct AuthEvent {
     pub id: Identifier,
     pub uid: String,
     pub challenge: String,
-    pub db: Db,
+    pub db: Arc<rust_rocksdb::DB>,
     pub output: Arc<RwLock<bool>>,
 }
 impl AuthEvent {
     pub fn fire(
-        api: &mut ServerAPI,
+        api: &ServerAPI,
         uid: String,
         challenge: String,
-        db: Db,
+        db: Arc<rust_rocksdb::DB>,
         output: Arc<RwLock<bool>>,
     ) {
         api.event_bus.fire(&mut AuthEvent {
@@ -32,7 +31,12 @@ impl AuthEvent {
         });
     }
 
-    pub fn check(api: &mut ServerAPI, uid: String, challenge: String, db: Db) -> bool {
+    pub fn check(
+        api: &ServerAPI,
+        uid: String,
+        challenge: String,
+        db: Arc<rust_rocksdb::DB>,
+    ) -> bool {
         let output = Arc::new(RwLock::new(false));
         Self::fire(api, uid, challenge, db, output.clone());
         *output.read().unwrap()

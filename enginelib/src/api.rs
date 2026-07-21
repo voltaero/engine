@@ -1,280 +1,58 @@
-use chrono::Utc;
-use crossbeam::queue::ArrayQueue;
-use tokio::{spawn, sync::RwLock, time::interval};
-use tracing::{Level, debug, error, info, instrument};
-
-use crate::{
-    Identifier, Registry,
-    config::Config,
-    event::{EngineEventHandlerRegistry, EventBus},
-    plugin::LibraryManager,
-    task::{LeasedTaskQueue, StoredTask, Task, TaskQueue},
-};
+use crate::error::Error;
+use crate::task::Task;
+use crate::{Identifier, Registry, config::Config, event::EventBus, plugin::LibraryManager};
+use chrono::{DateTime, Utc};
+use dashmap::{DashMap, DashSet};
 pub use postcard;
 pub use postcard::from_bytes;
 pub use postcard::to_allocvec;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
-};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tracing::{Level, debug, instrument};
+
+// t:namespace:task_name:<id> -> Serialized Task Record
+pub fn task_key_prefix(task_type: &Identifier) -> String {
+    format!("t:{}:{}:", task_type.0, task_type.1)
+}
+
+pub fn task_key(task_type: &Identifier, task_id: &str) -> String {
+    format!("t:{}:{}:{}", task_type.0, task_type.1, task_id)
+}
+
+// f:namespace:task_name:<id> -> Finished Task Record
+pub fn finished_task_key(task_type: &Identifier, task_id: &str) -> String {
+    format!("f:{}:{}:{}", task_type.0, task_type.1, task_id)
+}
+
+pub fn finished_task_key_prefix(task_type: &Identifier) -> String {
+    format!("f:{}:{}:", task_type.0, task_type.1)
+}
+
+pub fn task_id_from_key(key: &str) -> Option<&str> {
+    key.splitn(4, ':').nth(3)
+}
 
 pub struct ServerAPI {
-    pub cfg: Config,                       // RW
+    pub cfg: Config,                 // RW
+    pub event_bus: EventBus,         // RW
+    pub lib_manager: LibraryManager, // RW
+    pub db: Arc<rust_rocksdb::DB>,
     pub task_queue: TaskQueue,             // RW
     pub leased_tasks: LeasedTaskQueue,     // RW
     pub task_registry: EngineTaskRegistry, // RW
-    pub event_bus: EventBus,               // RW
-    pub db: sled::Db,                      // R
-    pub lib_manager: LibraryManager,       // RW
-    pub client: bool,                      // RW
 }
 
 impl Default for ServerAPI {
     fn default() -> Self {
-        Self {
-            cfg: Config::default(),
-            task_queue: TaskQueue::default(),
-            db: sled::open("engine_db").unwrap(),
-            lib_manager: LibraryManager::default(),
-            task_registry: EngineTaskRegistry::default(),
-            event_bus: EventBus {
-                event_handler_registry: EngineEventHandlerRegistry {
-                    event_handlers: HashMap::new(),
-                },
-            },
-            leased_tasks: LeasedTaskQueue::default(),
-            client: false,
-        }
-    }
-}
-impl ServerAPI {
-    // pub fn default_client() -> Self {
-    //     Self {
-    //         cfg: Config::default(),
-    //         task_queue: TaskQueue::default(),
-    //         db: sled::open("engine_client_db").unwrap(),
-    //         lib_manager: LibraryManager::default(),
-    //         task_registry: EngineTaskRegistry::default(),
-    //         event_bus: EventBus {
-    //             event_handler_registry: EngineEventHandlerRegistry {
-    //                 event_handlers: HashMap::new(),
-    //             },
-    //         },
-    //         solved_tasks: SolvedTasks::default(),
-    //         executing_tasks: ExecutingTaskQueue::default(),
-    //         client: true,
-    //     }
-    //}
-    pub fn test_default() -> Self {
-        // `sled::Config::temporary(true)` defaults to `/dev/shm` on Linux when no path is set.
-        // Some environments deny writes there, so force a unique temp path.
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        let path = "./engine_db";
+        let mut opts = rust_rocksdb::Options::default();
+        opts.create_if_missing(true);
 
-        static DB_COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let db_id = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let db_path = std::env::temp_dir().join(format!(
-            "enginelib-test-db-{}-{}",
-            std::process::id(),
-            db_id
-        ));
+        let db = Arc::new(
+            rust_rocksdb::DB::open(&opts, path)
+                .expect("Failed to open RocksDB — check that the path is writable and no other process holds the lock"),
+        );
 
-        Self {
-            client: false,
-            cfg: Config::new(),
-            leased_tasks: LeasedTaskQueue::default(),
-            task_queue: TaskQueue::default(),
-            db: sled::Config::new()
-                .path(db_path)
-                .temporary(true)
-                .flush_every_ms(None)
-                .open()
-                .unwrap(),
-            lib_manager: LibraryManager::default(),
-            task_registry: EngineTaskRegistry::default(),
-            event_bus: EventBus {
-                event_handler_registry: EngineEventHandlerRegistry {
-                    event_handlers: HashMap::new(),
-                },
-            },
-        }
-    }
-    pub fn init(api: &mut Self) {
-        Self::setup_logger();
-        api.cfg = Config::new();
-        Self::init_db(api);
-        let mut new_lib_manager = LibraryManager::default();
-        new_lib_manager.load_modules(api);
-        api.lib_manager = new_lib_manager;
-        for (id, _tsk) in api.task_registry.tasks.iter() {
-            api.task_queue
-                .tasks
-                .entry(id.clone())
-                .insert_entry(ArrayQueue::new(
-                    api.cfg.config_toml.task_block_size as usize,
-                ));
-            api.leased_tasks.tasks.entry(id.clone()).or_default();
-        }
-
-        Self::init_events(api);
-    }
-
-    fn init_events(api: &mut Self) {
-        crate::event::register_inventory_handlers(api);
-    }
-    pub fn init_chron(api: Arc<RwLock<Self>>) {
-        let t = api.try_read().unwrap().cfg.config_toml.clean_tasks;
-        spawn(clear_sled_periodically(api, t));
-    }
-    const TASKS_PREFIX: &'static str = "tasks:";
-    const LEASING_PREFIX: &'static str = "leasing:";
-    const SOLVED_PREFIX: &'static str = "solved:";
-
-    fn state_key(prefix: &str, task_id: &Identifier, id: String) -> Vec<u8> {
-        format!("{}{}\u{1f}{}:{}", prefix, task_id.0, task_id.1, id).into_bytes()
-    }
-
-    fn parse_state_key(prefix: &str, key: &[u8]) -> Option<Identifier> {
-        let key = std::str::from_utf8(key).ok()?;
-        let rest = key.strip_prefix(prefix)?;
-        let (task_id, id) = rest.split_once(":")?;
-        let (namespace, task) = task_id.split_once('\u{1f}')?;
-        Some((namespace.to_string(), task.to_string()))
-    }
-
-    // pub fn apply_batch_entries(
-    //     db: &sled::Db,
-    //     entries: Vec<(&'static str, Vec<u8>)>,
-    // ) -> sled::Result<()> {
-    //     let mut batch = sled::Batch::default();
-    //     for (key, value) in entries {
-    //         batch.insert(key, value);
-    //     }
-    //     db.apply_batch(batch)
-    // }
-
-    // pub fn apply_batch_ops(
-    //     db: &sled::Db,
-    //     ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
-    // ) -> sled::Result<()> {
-    //     let mut batch = sled::Batch::default();
-    //     for (key, value) in ops {
-    //         match value {
-    //             Some(v) => batch.insert(key, v),
-    //             None => batch.remove(key),
-    //         }
-    //     }
-    //     db.apply_batch(batch)
-    // }
-
-    // pub fn state_op_tasks(
-    //     id: &Identifier,
-    //     value: &Vec<StoredTask>,
-    // ) -> Result<(Vec<u8>, Option<Vec<u8>>), postcard::Error> {
-    //     if value.is_empty() {
-    //         Ok((Self::state_key(Self::TASKS_PREFIX, id), None))
-    //     } else {
-    //         Ok((
-    //             Self::state_key(Self::TASKS_PREFIX, id),
-    //             Some(postcard::to_allocvec(value)?),
-    //         ))
-    //     }
-    // }
-
-    // pub fn state_op_executing(
-    //     id: &Identifier,
-    //     value: &Vec<StoredExecutingTask>,
-    // ) -> Result<(Vec<u8>, Option<Vec<u8>>), postcard::Error> {
-    //     if value.is_empty() {
-    //         Ok((Self::state_key(Self::LEASING_PREFIX, id), None))
-    //     } else {
-    //         Ok((
-    //             Self::state_key(Self::LEASING_PREFIX, id),
-    //             Some(postcard::to_allocvec(value)?),
-    //         ))
-    //     }
-    // }
-
-    // pub fn state_op_solved(
-    //     id: &Identifier,
-    //     value: &Vec<StoredTask>,
-    // ) -> Result<(Vec<u8>, Option<Vec<u8>>), postcard::Error> {
-    //     if value.is_empty() {
-    //         Ok((Self::state_key(Self::SOLVED_PREFIX, id), None))
-    //     } else {
-    //         Ok((
-    //             Self::state_key(Self::SOLVED_PREFIX, id),
-    //             Some(postcard::to_allocvec(value)?),
-    //         ))
-    //     }
-    // }
-
-    // pub fn sync_db(api: &mut ServerAPI) {
-    //     // IF THIS FN CAUSES PANIC SOMETHING IS VERY BROKEN
-    //     let mut ops: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
-
-    //     for prefix in [
-    //         Self::TASKS_PREFIX,
-    //         Self::LEASING_PREFIX,
-    //         Self::SOLVED_PREFIX,
-    //     ] {
-    //         for item in api.db.scan_prefix(prefix.as_bytes()) {
-    //             if let Ok((key, _)) = item {
-    //                 ops.push((key.to_vec(), None));
-    //             }
-    //         }
-    //     }
-
-    //     for (id, tasks) in &api.task_queue.tasks {
-    //         ops.push(Self::state_op_tasks(id, tasks).unwrap());
-    //     }
-    //     for (id, tasks) in &api.executing_tasks.tasks {
-    //         ops.push(Self::state_op_executing(id, tasks).unwrap());
-    //     }
-    //     for (id, tasks) in &api.solved_tasks.tasks {
-    //         ops.push(Self::state_op_solved(id, tasks).unwrap());
-    //     }
-
-    //     Self::apply_batch_ops(&api.db, ops).unwrap();
-    //     debug!("Synced in-memory state to keyed sled storage");
-    // }
-
-    fn init_db(api: &mut ServerAPI) {
-        api.task_queue = TaskQueue::default();
-        api.leased_tasks = LeasedTaskQueue::default();
-
-        for item in api.db.scan_prefix(Self::TASKS_PREFIX.as_bytes()) {
-            if let Ok((key, value)) = item {
-                if let Some(id) = Self::parse_state_key(Self::TASKS_PREFIX, &key) {
-                    if let Ok(tasks) = postcard::from_bytes::<StoredTask>(&value) {
-                        api.task_queue.tasks.get(&id).unwrap().push(Arc::new(tasks));
-                    }
-                }
-            }
-        }
-
-        for item in api.db.scan_prefix(Self::LEASING_PREFIX.as_bytes()) {
-            if let Ok((key, value)) = item {
-                if let Some(id) = Self::parse_state_key(Self::LEASING_PREFIX, &key) {
-                    if let Ok(tasks) = postcard::from_bytes::<Vec<StoredExecutingTask>>(&value) {
-                        api.executing_tasks.tasks.insert(id, tasks);
-                    }
-                }
-            }
-        }
-
-        for item in api.db.scan_prefix(Self::SOLVED_PREFIX.as_bytes()) {
-            if let Ok((key, value)) = item {
-                if let Some(id) = Self::parse_state_key(Self::SOLVED_PREFIX, &key) {
-                    if let Ok(tasks) = postcard::from_bytes::<Vec<StoredTask>>(&value) {
-                        api.solved_tasks.tasks.insert(id, tasks);
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn setup_logger() {
         use std::sync::OnceLock;
 
         static INIT: OnceLock<()> = OnceLock::new();
@@ -294,14 +72,116 @@ impl ServerAPI {
                 // builds the subscriber.
                 .try_init();
         });
+
+        let mut k = Self {
+            cfg: Config::default(),
+            event_bus: EventBus::default(),
+            lib_manager: LibraryManager::default(),
+            db,
+            task_registry: EngineTaskRegistry::default(),
+            task_queue: TaskQueue::default(),
+            leased_tasks: LeasedTaskQueue::default(),
+        };
+        LibraryManager::load_modules(&mut k);
+        crate::event::register_inventory_handlers(&mut k);
+        return k;
     }
 }
+impl ServerAPI {
+    pub async fn load(api: &Arc<Self>, task_type: Identifier) -> Result<(), Error> {
+        const LOAD_BATCH_SIZE: usize = 4096;
+        let prefix = task_key_prefix(&task_type);
+
+        // Collect the batch while holding the map guard, but never await under it:
+        // send() on a full channel would otherwise block all writers to this shard.
+        let (sender, batch) = {
+            let k = api
+                .task_queue
+                .tasks
+                .get(&task_type)
+                .ok_or(Error::not_found("TaskTypeNotFound"))?;
+
+            let mut batch = Vec::new();
+            for result in api.db.prefix_iterator(prefix.as_bytes()) {
+                if batch.len() >= LOAD_BATCH_SIZE {
+                    break;
+                }
+                let (key, value) = match result {
+                    Ok(kv) => kv,
+                    Err(err) => {
+                        eprintln!("RocksDB read error: {err}");
+                        continue;
+                    }
+                };
+                if !key.starts_with(prefix.as_bytes()) {
+                    break;
+                }
+                let Ok(key) = String::from_utf8(key.to_vec()) else {
+                    continue;
+                };
+                let Some(task_id) = task_id_from_key(&key) else {
+                    continue;
+                };
+                if k.2.insert(task_id.to_string()) {
+                    batch.push(StoredTask {
+                        bytes: value.into(),
+                        task_id: task_id.to_string(),
+                        task_type: task_type.clone(),
+                    });
+                }
+            }
+            (k.0.clone(), batch)
+        };
+
+        let mut batch = batch.into_iter();
+        while let Some(task) = batch.next() {
+            if let Err(err) = sender.send(task).await {
+                // Un-mark everything that never made it into the queue so a
+                // later load() can retry those tasks.
+                if let Some(k) = api.task_queue.tasks.get(&task_type) {
+                    k.2.remove(&err.0.task_id);
+                    for task in batch {
+                        k.2.remove(&task.task_id);
+                    }
+                }
+                return Err(Error::new(format!("Failed to send stored task: {err}")));
+            }
+        }
+
+        Ok(())
+    }
+    pub fn populate(api: &Arc<Self>) {
+        api.task_registry.tasks.iter().for_each(|f| {
+            let key = f.key();
+            let (tx, rx) = async_channel::bounded(8192); // Add to config or make unbound ?
+            api.task_queue
+                .tasks
+                .entry(key.clone())
+                .or_insert((tx, rx, DashSet::default()));
+            api.leased_tasks.tasks.entry(key.clone()).or_default();
+            // task reg should be populated by mods
+        });
+    }
+    pub fn init() -> Arc<Self> {
+        let api = Arc::new(Self::default());
+        Self::populate(&api);
+        let dapi = api.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+                LeasedTaskQueue::reap_expired(&dapi);
+            }
+        });
+        api
+    }
+}
+
 #[derive(Default, Clone, Debug)]
 pub struct EngineTaskRegistry {
-    pub tasks: HashMap<Identifier, Arc<dyn Task>>,
+    pub tasks: DashMap<Identifier, Arc<dyn Task>>,
 }
 impl Registry<dyn Task> for EngineTaskRegistry {
-    #[instrument]
+    #[instrument(skip_all, fields(namespace = %identifier.0, name = %identifier.1))]
     fn register(&mut self, task: Arc<dyn Task>, identifier: Identifier) {
         // Insert the task into the hashmap with (mod_id, identifier) as the key
         debug!(
@@ -310,94 +190,67 @@ impl Registry<dyn Task> for EngineTaskRegistry {
         );
         self.tasks.insert(identifier, task);
     }
-
+    #[instrument(skip_all, fields(namespace = %identifier.0, name = %identifier.1))]
     fn get(&self, identifier: &Identifier) -> Option<Box<dyn Task>> {
         self.tasks.get(identifier).map(|obj| obj.clone_box())
     }
 }
+#[derive(Debug, Default, Clone)]
+pub struct TaskQueue {
+    pub tasks: DashMap<
+        Identifier,
+        (
+            async_channel::Sender<StoredTask>,
+            async_channel::Receiver<StoredTask>,
+            dashmap::DashSet<String>,
+        ),
+    >,
+}
+#[derive(Debug, Default, Clone)]
+pub struct LeasedTaskQueue {
+    pub tasks: DashMap<Identifier, Vec<LeasedTask>>,
+}
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct StoredTask {
+    pub bytes: Vec<u8>,
+    pub task_id: String,
+    pub task_type: Identifier,
+}
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct LeasedTask {
+    pub stored_task: Arc<StoredTask>,
+    pub user_id: String,
+    pub given_at: DateTime<Utc>,
+}
 
-pub async fn clear_sled_periodically(api: Arc<RwLock<ServerAPI>>, n_minutes: u64) {
-    info!("Sled Cron Job Started");
-    let mut interval = interval(Duration::from_secs(n_minutes * 60));
-    loop {
-        interval.tick().await;
-        info!("Purging Unsolved Tasks");
+const LEASE_TTL_SECS: i64 = 3600;
 
-        let now = Utc::now().timestamp();
-        let mut rw_api = api.write().await;
+impl LeasedTask {
+    fn expired(&self) -> bool {
+        self.given_at.timestamp() + LEASE_TTL_SECS < Utc::now().timestamp()
+    }
+}
 
-        let mut moved_tasks: Vec<(Identifier, StoredTask)> = Vec::new();
-        let mut touched_exec: HashSet<Identifier> = HashSet::new();
-
-        for (id, task_list) in rw_api.executing_tasks.tasks.iter_mut() {
-            let before_len = task_list.len();
-            task_list.retain(|info| {
-                let age = now - info.given_at.timestamp();
-                if age > 3600 {
-                    info!("Task {:?} is older than an hour! Moving...", info);
-                    moved_tasks.push((
-                        id.clone(),
-                        StoredTask {
-                            id: info.id.clone(),
-                            bytes: info.bytes.clone(),
-                        },
-                    ));
+impl LeasedTaskQueue {
+    fn reap_expired(api: &Arc<ServerAPI>) {
+        let mut reaped: Vec<(Identifier, String)> = Vec::new();
+        api.leased_tasks.tasks.retain(|task_type, tasks| {
+            tasks.retain(|task| {
+                if task.expired() {
+                    reaped.push((task_type.clone(), task.stored_task.task_id.clone()));
                     false
                 } else {
                     true
                 }
             });
-
-            if task_list.len() != before_len {
-                touched_exec.insert(id.clone());
+            !tasks.is_empty()
+        });
+        // Clear reaped ids from the dedup set outside the leased_tasks locks so
+        // load() can re-enqueue the tasks from their still-persisted records.
+        for (task_type, task_id) in reaped {
+            if let Some(queue) = api.task_queue.tasks.get(&task_type) {
+                queue.2.remove(&task_id);
             }
-        }
-
-        let mut touched_tasks: HashSet<Identifier> = HashSet::new();
-        for (id, task) in moved_tasks {
-            rw_api
-                .task_queue
-                .tasks
-                .entry(id.clone())
-                .or_default()
-                .push(task);
-            touched_tasks.insert(id);
-        }
-
-        if touched_exec.is_empty() && touched_tasks.is_empty() {
-            continue;
-        }
-
-        let mut ops: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
-
-        for id in touched_exec {
-            let value = rw_api
-                .executing_tasks
-                .tasks
-                .get(&id)
-                .cloned()
-                .unwrap_or_default();
-            match ServerAPI::state_op_executing(&id, &value) {
-                Ok(op) => ops.push(op),
-                Err(e) => error!("Failed to serialize executing_tasks entry: {:?}", e),
-            }
-        }
-
-        for id in touched_tasks {
-            let value = rw_api
-                .task_queue
-                .tasks
-                .get(&id)
-                .cloned()
-                .unwrap_or_default();
-            match ServerAPI::state_op_tasks(&id, &value) {
-                Ok(op) => ops.push(op),
-                Err(e) => error!("Failed to serialize tasks entry: {:?}", e),
-            }
-        }
-
-        if let Err(e) = ServerAPI::apply_batch_ops(&rw_api.db, ops) {
-            error!("Failed to update task state in Sled batch: {:?}", e);
         }
     }
 }

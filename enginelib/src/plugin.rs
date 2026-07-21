@@ -8,7 +8,8 @@ use std::{collections::HashMap, fs};
 use tracing::{debug, error, info};
 #[derive(Clone, Debug)]
 pub struct LibraryInstance {
-    dynamic_library: Arc<ManuallyDrop<Library>>,
+    // Kept alive for as long as any metadata or registered mod code may be used.
+    _dynamic_library: Arc<ManuallyDrop<Library>>,
     pub metadata: Arc<LibraryMetadata>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,7 +65,8 @@ impl LibraryManager {
         drop(self);
     }
 
-    pub fn load_modules(&mut self, api: &mut ServerAPI) {
+    pub fn load_modules(api: &mut ServerAPI) {
+        let mut library_manager = LibraryManager::default();
         let dir_path = "./mods";
         let mut files: Vec<String> = Vec::new();
 
@@ -74,13 +76,10 @@ impl LibraryManager {
             Ok(entries) => {
                 for entry in entries.filter_map(Result::ok) {
                     let path = entry.path();
-                    if path.is_file() {
-                        if let Some(extension) = path.extension() {
-                            if extension == "rf" {
-                                debug!("Found valid module file: {}", path.display());
-                                files.push(path.display().to_string());
-                            }
-                        }
+                    if path.is_file() && path.extension().is_some_and(|extension| extension == "rf")
+                    {
+                        debug!("Found valid module file: {}", path.display());
+                        files.push(path.display().to_string());
                     }
                 }
             }
@@ -92,8 +91,9 @@ impl LibraryManager {
 
         info!("Found {} module(s) to load", files.len());
         for file in files {
-            self.load_module(&file, api);
+            library_manager.load_module(&file, api);
         }
+        api.lib_manager = library_manager;
     }
 
     pub fn load_module(&mut self, path: &str, api: &mut ServerAPI) {
@@ -170,7 +170,7 @@ impl LibraryManager {
         self.libraries.insert(
             metadata.mod_id.clone(),
             LibraryInstance {
-                dynamic_library: Arc::new(ManuallyDrop::new(lib)),
+                _dynamic_library: Arc::new(ManuallyDrop::new(lib)),
                 metadata: Arc::new(metadata.clone()),
             },
         );

@@ -3,6 +3,7 @@ pub mod api;
 pub mod config;
 pub mod event;
 pub mod events;
+pub mod nucleus;
 extern crate self as enginelib;
 pub use inventory;
 pub mod plugin;
@@ -17,3 +18,4 @@ pub trait Registry<T: ?Sized>: Default + Clone {
     fn get(&self, identifier: &Identifier) -> Option<Box<T>>;
 }
 pub use chrono;
+pub mod error;

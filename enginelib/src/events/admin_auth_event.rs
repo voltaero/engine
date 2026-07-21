@@ -1,7 +1,7 @@
 use std::sync::{Arc, RwLock};
 
 use macros::{Event, event_handler};
-use sled::Db;
+use rust_rocksdb::DB;
 
 use crate::{Identifier, api::ServerAPI};
 
@@ -12,17 +12,17 @@ pub struct AdminAuthEvent {
     pub id: Identifier,
     pub payload: String,
     pub target: Identifier,
-    pub db: Db,
+    pub db: Arc<DB>,
     pub output: Arc<RwLock<bool>>,
 }
 // Event trait auto-implemented by derive macro
 
 impl AdminAuthEvent {
     pub fn fire(
-        api: &mut ServerAPI,
+        api: &ServerAPI,
         payload: String,
         target: Identifier,
-        db: Db,
+        db: Arc<DB>,
         output: Arc<RwLock<bool>>,
     ) {
         api.event_bus.fire(&mut AdminAuthEvent {
@@ -35,7 +35,7 @@ impl AdminAuthEvent {
         });
     }
 
-    pub fn check(api: &mut ServerAPI, payload: String, target: Identifier, db: Db) -> bool {
+    pub fn check(api: &ServerAPI, payload: String, target: Identifier, db: Arc<DB>) -> bool {
         let output = Arc::new(RwLock::new(false));
         Self::fire(api, payload, target, db, output.clone());
         *output.read().unwrap()
@@ -45,7 +45,7 @@ impl AdminAuthEvent {
 #[event_handler(
     namespace = "core",
     name = "admin_auth_event",
-    ctx = api.cfg.config_toml.cgrpc_token.clone()
+    ctx = api.cfg.config_toml.auth_token.clone()
 )]
 fn admin_auth_handler(event: &mut AdminAuthEvent, token: &Option<String>) {
     match token.as_deref() {

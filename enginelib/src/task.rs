@@ -1,35 +1,10 @@
 use std::fmt::Debug;
-use std::{collections::HashMap, sync::Arc};
 
 use crate::Identifier;
-use chrono::{DateTime, Utc};
-use crossbeam::queue::ArrayQueue;
-use serde::{Deserialize, Serialize};
 use tracing::{error, instrument, warn};
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct StoredTask {
-    pub bytes: Vec<u8>,
-    pub id: String,
-}
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct LeasedTask {
-    pub stored_task: Arc<StoredTask>,
-    pub user_id: String,
-    pub given_at: DateTime<Utc>,
-}
-#[derive(Debug, Default)]
-pub struct TaskQueue {
-    pub tasks: HashMap<Identifier, ArrayQueue<Arc<StoredTask>>>,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct LeasedTaskQueue {
-    pub tasks: HashMap<Identifier, Vec<LeasedTask>>,
-}
-
 pub trait Verifiable {
-    fn verify(&self, b: Vec<u8>) -> bool;
+    fn verify(&self, b: &[u8]) -> bool;
 }
 pub trait Task: Debug + Sync + Send + Verifiable {
     fn get_id(&self) -> Identifier;
@@ -61,6 +36,7 @@ pub trait Task: Debug + Sync + Send + Verifiable {
     fn to_bytes(&self) -> Vec<u8>;
     #[allow(clippy::wrong_self_convention)]
     fn from_bytes(&self, bytes: &[u8]) -> Box<dyn Task>;
+    #[allow(clippy::wrong_self_convention)]
     fn from_toml(&self, d: String) -> Box<dyn Task>;
     fn to_toml(&self) -> String;
 }
