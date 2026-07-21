@@ -18,6 +18,12 @@ use crate::{api::ServerAPI, error::Error};
 /// finished records, or a single record.
 #[derive(Debug, Clone)]
 pub enum Query {
+    /// Fetch a single record by its exact key. O(1) point read (`db.get`, not a
+    /// scan) — the primitive for addressing one known task, e.g. the id returned
+    /// by `submit`. `key` must be the full key, built with
+    /// [`crate::api::task_key`] / [`crate::api::finished_task_key`]. Unlike
+    /// [`Query::Scan`] this matches the key exactly, never by prefix.
+    Get { key: String },
     /// Store-wide approximate key count, read from RocksDB SST metadata.
     /// O(1) — never scans. Exact counts over a trillion keys are deliberately
     /// not offered because they cost a full scan.
@@ -35,6 +41,14 @@ pub enum Query {
         after: Option<String>,
         limit: usize,
     },
+    /// Delete a single record by its exact key. O(1) point delete — the
+    /// counterpart to [`Query::Get`] and the single-record analogue of
+    /// [`Query::PurgePrefix`]. Idempotent: absent keys are a no-op.
+    ///
+    /// Operates on the raw store only. To remove a *pending* task that may be
+    /// queued or leased, use `cancel`/`complete` instead, so the in-memory dedup
+    /// set and lease state stay consistent — this bypasses both.
+    Delete { key: String },
     /// Drop every record under `prefix` with a single range tombstone. The
     /// write cost is independent of how many keys match — the alternative,
     /// deleting a billion keys one at a time, is what this exists to avoid.
@@ -61,18 +75,29 @@ pub struct Page {
 /// The outcome of a [`Query`].
 #[derive(Debug, Clone)]
 pub enum QueryResult {
+    /// A single record, or `None` when the key is absent.
+    Record(Option<Record>),
     /// Approximate total key count.
     EstimateKeys(u64),
     /// Approximate on-disk size, in bytes.
     EstimateSize(u64),
     /// A page of records.
     Page(Page),
+    /// A single-record delete completed.
+    Deleted,
     /// A purge completed.
     Purged,
 }
 
 pub fn query(api: Arc<ServerAPI>, query: Query) -> Result<QueryResult, Error> {
     match query {
+        Query::Get { key } => {
+            let value = api
+                .db
+                .get(key.as_bytes())
+                .map_err(|err| Error::io_error(format!("Failed to read record: {err}")))?;
+            Ok(QueryResult::Record(value.map(|value| Record { key, value })))
+        }
         Query::EstimateKeys => {
             let keys = api
                 .db
@@ -125,6 +150,12 @@ pub fn query(api: Arc<ServerAPI>, query: Query) -> Result<QueryResult, Error> {
                 records.push(record);
             }
             Ok(QueryResult::Page(Page { records, next }))
+        }
+        Query::Delete { key } => {
+            api.db
+                .delete(key.as_bytes())
+                .map_err(|err| Error::io_error(format!("Failed to delete record: {err}")))?;
+            Ok(QueryResult::Deleted)
         }
         Query::PurgePrefix { prefix } => {
             let end = prefix_successor(prefix.as_bytes())
