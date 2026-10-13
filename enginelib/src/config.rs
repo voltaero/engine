@@ -19,6 +19,22 @@ fn default_queue_capacity() -> usize {
     8192
 }
 
+fn default_proxy_host() -> String {
+    "[::1]:50050".into()
+}
+
+fn default_max_message_bytes() -> i64 {
+    64 * 1024 * 1024
+}
+
+fn default_session_idle_secs() -> u64 {
+    900
+}
+
+fn default_heartbeat_secs() -> u64 {
+    5
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ConfigTomlServer {
     #[serde(default = "default_host")]
@@ -42,6 +58,35 @@ pub struct ConfigTomlServer {
     /// tops a queue up from RocksDB once it drains below a quarter of this.
     #[serde(default = "default_queue_capacity")]
     pub queue_capacity: usize,
+
+    /// Identifies this server to clients and the proxy.
+    #[serde(default)]
+    pub server_id: u16,
+
+    /// Endpoint clients should use to reach this server, as announced to the
+    /// proxy. Defaults to `host`; set it when binding a wildcard address.
+    #[serde(default)]
+    pub advertise: Option<String>,
+
+    /// Proxy to register with (heartbeat every `heartbeat_secs`). Unset = none.
+    #[serde(default)]
+    pub proxy: Option<String>,
+
+    /// Address the `proxy` binary listens on.
+    #[serde(default = "default_proxy_host")]
+    pub proxy_host: String,
+
+    /// Largest accepted inbound message; bigger ones drop the connection.
+    #[serde(default = "default_max_message_bytes")]
+    pub max_message_bytes: i64,
+
+    /// Sessions idle this long are forgotten; the client must `Hello` again.
+    #[serde(default = "default_session_idle_secs")]
+    pub session_idle_secs: u64,
+
+    /// Interval of server -> proxy registration heartbeats.
+    #[serde(default = "default_heartbeat_secs")]
+    pub heartbeat_secs: u64,
 }
 impl Default for ConfigTomlServer {
     fn default() -> Self {
@@ -51,6 +96,13 @@ impl Default for ConfigTomlServer {
             lease_ttl_secs: default_lease_ttl_secs(),
             reap_interval_secs: default_reap_interval_secs(),
             queue_capacity: default_queue_capacity(),
+            server_id: 0,
+            advertise: None,
+            proxy: None,
+            proxy_host: default_proxy_host(),
+            max_message_bytes: default_max_message_bytes(),
+            session_idle_secs: default_session_idle_secs(),
+            heartbeat_secs: default_heartbeat_secs(),
         }
     }
 }

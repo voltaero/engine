@@ -7,15 +7,15 @@ Operational guide for coding agents in this repository.
 Rust workspace for a distributed task engine with dynamic mods.
 
 Workspace members:
-- `engine` (binary: `server`)
+- `engine` (binaries: `server`, `proxy`)
 - `enginelib` (shared runtime API, events, tasks, plugin loader, task nucleus)
 - `enginelib/macros` (proc macros used by mods and core)
 
 > **Repo is mid-rewrite.** The earlier design (gRPC/proto, `client`/`packer`
 > binaries, and the RFC1002/1003/1004 design docs) was removed in the "rewrite:
 > clean" pass and no longer exists in the tree. Do not cite those RFCs or the
-> proto layer — they are gone. `engine/src/bin/server.rs` is currently a stub
-> (`ServerAPI::init()`, RPC commented out); the transport layer is not yet wired.
+> proto layer — they are gone. The transport is now ZeroMQ; the wire protocol
+> is specified in `docs/protocol.md`.
 
 ## Start here (fast orientation)
 
@@ -25,13 +25,17 @@ Workspace members:
 4. `enginelib/src/event.rs` (event dispatch)
 5. `enginelib/src/plugin.rs` (mod loader)
 6. `enginelib/src/config.rs` (config/token)
-7. `engine/src/bin/server.rs` (entrypoint stub)
+7. `enginelib/src/wire.rs` (wire messages) and `enginelib/src/transport/*`
+   (ZeroMQ server, client, proxy); spec in `docs/protocol.md`
+8. `engine/src/bin/server.rs`, `engine/src/bin/proxy.rs` (entrypoints)
 
 ## Build/test commands
 
 - Build all: `cargo build --workspace`
 - Test all: `cargo test --workspace`
 - Run server: `cargo run -p engine --bin server`
+- Run proxy: `cargo run -p engine --bin proxy`
+- Needs the system `libzmq` (the `zmq` crate links it via pkg-config).
 
 ## Key architecture facts
 
@@ -40,8 +44,14 @@ Workspace members:
 - Task lifecycle operations live in `enginelib/src/nucleus/*` (`submit`, `lease`, `renew`, `complete`, `cancel`, `query`).
 - Core event system is in `enginelib/src/event.rs`; core events in `enginelib/src/events/*`.
 - Mods are loaded from `./mods/*.rf` by `enginelib/src/plugin.rs`.
-- No network transport is wired yet — `server.rs` only builds `ServerAPI`. There is
-  no proto/gRPC layer and no `client`/`packer` binary in the current tree.
+- Transport is ZeroMQ (`enginelib/src/transport/*`): server ROUTER on `host`,
+  `transport::client::Client` (DEALER), and a discovery-only proxy (ROUTER on
+  `proxy_host`) that servers heartbeat to. Messages are postcard `Envelope`s
+  from `enginelib/src/wire.rs`; the request set mirrors `nucleus/*` one-to-one.
+- Server I/O: one thread owns the ROUTER socket and only moves bytes; handlers
+  run on tokio (DB work on the blocking pool) and send replies back over an
+  inproc PUSH/PULL pair. Never touch the ROUTER from a handler (zmq sockets are
+  not thread-safe).
 
 ## Data/persistence model (important)
 
@@ -166,6 +176,15 @@ Do not assume secure defaults without verifying handlers/mods.
 - Lifecycle tests live in `enginelib/tests/nucleus.rs`; build the API with
   `ServerAPI::open(<temp dir>, cfg)` so tests don't share `./engine_db`.
 
+### Wire/transport change
+- Messages: `enginelib/src/wire.rs` (bump `PROTO_VERSION` on incompatible
+  changes); server/client/proxy: `enginelib/src/transport/*`; keep
+  `docs/protocol.md` in sync.
+- Each wire request must map onto a nucleus op so the dedup/lease/RocksDB
+  invariants stay enforced in one place. No raw `Put` over the wire.
+- End-to-end tests: `enginelib/tests/transport.rs` (real loopback TCP server
+  on `tcp://127.0.0.1:*`).
+
 ### Event/macro change
 - Runtime dispatch: `enginelib/src/event.rs`
 - Macro generation: `enginelib/macros/src/lib.rs`
@@ -195,5 +214,6 @@ Report any warnings/errors that indicate risk (panic paths, serialization, auth 
 - Preserve current external behavior unless task explicitly requests behavior change.
 - Event cancellation is in-process, not transport: `#[event(..., cancellable)]` gives
   an event `cancel()`/`is_cancelled()`, and callers branch on the returned `.cancelled`
-  flag (see `events/*`). The old gRPC `Status::aborted` mapping no longer applies —
-  transport isn't wired yet.
+  flag (see `events/*`). The old gRPC `Status::aborted` mapping no longer applies.
+  Auth events are fired by the transport on `Hello` (`core:auth_event`, and
+  `core:admin_auth_event` when the client presents an `admin_token`).

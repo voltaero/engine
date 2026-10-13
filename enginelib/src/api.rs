@@ -37,6 +37,30 @@ pub fn task_id_from_key(key: &str) -> Option<&str> {
     key.splitn(4, ':').nth(3)
 }
 
+/// Installs the global tracing subscriber (DEBUG in debug builds, INFO in
+/// release). Idempotent; `ServerAPI::open` calls it.
+pub fn init_tracing() {
+    use std::sync::OnceLock;
+
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        #[cfg(debug_assertions)]
+        let _ = tracing_subscriber::FmtSubscriber::builder()
+            // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
+            // will be written to stdout.
+            .with_max_level(Level::DEBUG)
+            // builds the subscriber.
+            .try_init();
+        #[cfg(not(debug_assertions))]
+        let _ = tracing_subscriber::FmtSubscriber::builder()
+            // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
+            // will be written to stdout.
+            .with_max_level(Level::INFO)
+            // builds the subscriber.
+            .try_init();
+    });
+}
+
 pub struct ServerAPI {
     pub cfg: Config,                 // RW
     pub event_bus: EventBus,         // RW
@@ -70,25 +94,7 @@ impl ServerAPI {
                 .expect("Failed to open RocksDB — check that the path is writable and no other process holds the lock"),
         );
 
-        use std::sync::OnceLock;
-
-        static INIT: OnceLock<()> = OnceLock::new();
-        INIT.get_or_init(|| {
-            #[cfg(debug_assertions)]
-            let _ = tracing_subscriber::FmtSubscriber::builder()
-                // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
-                // will be written to stdout.
-                .with_max_level(Level::DEBUG)
-                // builds the subscriber.
-                .try_init();
-            #[cfg(not(debug_assertions))]
-            let _ = tracing_subscriber::FmtSubscriber::builder()
-                // all spans/events with a level higher than TRACE (e.g, debug, info, warn, etc.)
-                // will be written to stdout.
-                .with_max_level(Level::INFO)
-                // builds the subscriber.
-                .try_init();
-        });
+        init_tracing();
 
         let mut k = Self {
             cfg,
