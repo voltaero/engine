@@ -50,7 +50,34 @@ impl AdminAuthEvent {
 fn admin_auth_handler(event: &mut AdminAuthEvent, token: &Option<String>) {
     match token.as_deref() {
         None => *event.output.write().unwrap() = true,
-        Some(token) if token == event.payload.as_str() => *event.output.write().unwrap() = true,
+        Some(token) if constant_time_eq(token.as_bytes(), event.payload.as_bytes()) => {
+            *event.output.write().unwrap() = true
+        }
         Some(_) => {}
+    }
+}
+
+/// Compares two byte strings in time independent of where they first differ, so
+/// the admin token can't be recovered byte-by-byte from response timing. Only the
+/// length is allowed to leak.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let diff = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    std::hint::black_box(diff) == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_bytes() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        assert!(!constant_time_eq(b"secret", b"secret!"));
+        assert!(!constant_time_eq(b"", b"x"));
     }
 }

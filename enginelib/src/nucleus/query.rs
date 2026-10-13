@@ -173,7 +173,7 @@ pub fn query(api: Arc<ServerAPI>, query: Query) -> Result<QueryResult, Error> {
 /// Smallest key strictly greater than every key with `prefix`, i.e. the
 /// exclusive upper bound of the prefix range. `None` when `prefix` is empty or
 /// all `0xff` (an unbounded range with no finite successor).
-fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut end = prefix.to_vec();
     while let Some(last) = end.last_mut() {
         if *last < 0xff {

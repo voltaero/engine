@@ -1,10 +1,22 @@
-use std::{fs, io::Error};
+use std::{fs, io::Error, path::Path};
 
 use serde::{Deserialize, Serialize};
 use tracing::{error, instrument};
 
 fn default_host() -> String {
     "[::1]:50051".into()
+}
+
+fn default_lease_ttl_secs() -> u64 {
+    300
+}
+
+fn default_reap_interval_secs() -> u64 {
+    15
+}
+
+fn default_queue_capacity() -> usize {
+    8192
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -15,12 +27,30 @@ pub struct ConfigTomlServer {
     // Renamed from cgrpc_token; keep the alias so existing configs still authenticate.
     #[serde(alias = "cgrpc_token")]
     pub auth_token: Option<String>,
+
+    /// How long a lease stays valid without a `renew`, in seconds. Once it lapses
+    /// the reaper drops the lease and the task becomes leasable again.
+    #[serde(default = "default_lease_ttl_secs")]
+    pub lease_ttl_secs: u64,
+
+    /// How often the reaper sweeps for expired leases, in seconds. A lease can
+    /// outlive its TTL by up to this long.
+    #[serde(default = "default_reap_interval_secs")]
+    pub reap_interval_secs: u64,
+
+    /// Bounded capacity of each per-type in-memory task queue. The refill path
+    /// tops a queue up from RocksDB once it drains below a quarter of this.
+    #[serde(default = "default_queue_capacity")]
+    pub queue_capacity: usize,
 }
 impl Default for ConfigTomlServer {
     fn default() -> Self {
         Self {
             host: default_host(),
             auth_token: Option::None,
+            lease_ttl_secs: default_lease_ttl_secs(),
+            reap_interval_secs: default_reap_interval_secs(),
+            queue_capacity: default_queue_capacity(),
         }
     }
 }
@@ -33,8 +63,15 @@ impl Config {
     #[allow(clippy::new_without_default)]
     #[instrument]
     pub fn new() -> Self {
+        Self::from_file("config.toml")
+    }
+
+    /// Loads the config from `path`; a missing file or parse error falls back to
+    /// defaults (parse errors are logged).
+    #[instrument(skip_all)]
+    pub fn from_file(path: impl AsRef<Path>) -> Self {
         let mut content: String = "".to_owned();
-        let result: Result<String, Error> = fs::read_to_string("config.toml");
+        let result: Result<String, Error> = fs::read_to_string(path);
         if let Ok(file_content) = result {
             content = file_content;
         }
@@ -44,5 +81,33 @@ impl Config {
             ConfigTomlServer::default()
         });
         Self { config_toml }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_file_reads_keys_and_defaults_the_rest() {
+        let path =
+            std::env::temp_dir().join(format!("enginelib-config-test-{}.toml", std::process::id()));
+        fs::write(&path, "cgrpc_token = \"secret\"\nlease_ttl_secs = 42\n").unwrap();
+        let cfg = Config::from_file(&path).config_toml;
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(cfg.auth_token.as_deref(), Some("secret"));
+        assert_eq!(cfg.lease_ttl_secs, 42);
+        assert_eq!(cfg.reap_interval_secs, default_reap_interval_secs());
+        assert_eq!(cfg.queue_capacity, default_queue_capacity());
+        assert_eq!(cfg.host, default_host());
+    }
+
+    #[test]
+    fn from_file_missing_falls_back_to_defaults() {
+        let cfg = Config::from_file("/nonexistent/enginelib/config.toml").config_toml;
+        assert_eq!(cfg.auth_token, None);
+        assert_eq!(cfg.lease_ttl_secs, 300);
+        assert_eq!(cfg.reap_interval_secs, 15);
     }
 }
