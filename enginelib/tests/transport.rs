@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use enginelib::api::ServerAPI;
-use enginelib::config::Config;
+use enginelib::config::{Config, TaskTypeConfig};
 use enginelib::error::ErrorKind;
 use enginelib::task::{Task, Verifiable};
 use enginelib::transport::Background;
@@ -84,6 +84,16 @@ fn start(name: &str, auth_token: Option<&str>, proxy: Option<(&str, u16)>) -> Ha
     let dir = TempDir::new(name);
     let mut cfg = Config::default();
     cfg.config_toml.auth_token = auth_token.map(str::to_string);
+    let server_id = proxy.map_or(0, |(_, id)| id);
+    cfg.config_toml.server_id = server_id;
+    // Small chunks so batches span several chunk leases.
+    cfg.config_toml.tasks.insert(
+        "test:task".into(),
+        TaskTypeConfig {
+            chunk_size: Some(10),
+            ..Default::default()
+        },
+    );
     let mut api = ServerAPI::open(&dir.0, cfg);
     api.task_registry.register(Arc::new(TestTask), task_type());
     let api = Arc::new(api);
@@ -96,7 +106,7 @@ fn start(name: &str, auth_token: Option<&str>, proxy: Option<(&str, u16)>) -> Ha
             api,
             ServerOptions {
                 endpoint: "tcp://127.0.0.1:*".into(),
-                server_id: proxy.map_or(0, |(_, id)| id),
+                server_id,
                 advertise: None,
                 proxy: proxy.map(|(endpoint, _)| endpoint.to_string()),
                 heartbeat: Duration::from_millis(100),
@@ -157,6 +167,7 @@ fn full_lifecycle_over_tcp() {
     let harness = start("lifecycle", None, None);
     let mut client = connect(&harness);
     assert_eq!(client.server.task_types.len(), 1);
+    assert_eq!(client.server.task_types[0].chunk_size, 10);
 
     // Insert 100 valid payloads plus one that fails verification.
     let mut payloads: Vec<Vec<u8>> = (0..100u32).map(|i| i.to_be_bytes().to_vec()).collect();
@@ -169,10 +180,27 @@ fn full_lifecycle_over_tcp() {
         ErrorKind::InvalidArgument
     );
     let ids: Vec<String> = ids.into_iter().take(100).map(Result::unwrap).collect();
+    assert!(ids.iter().all(|id| id.len() == 24));
 
-    // Lease a batch of 60, renew it, then complete it while asking for the rest.
+    // A pending task is visible by id; a malformed id is Unknown.
+    let QueryResponse::Records(records) = client
+        .query(Query::Get {
+            task_type: task_type(),
+            ids: vec![ids[0].clone(), "bogus".into()],
+        })
+        .unwrap()
+    else {
+        panic!("expected records");
+    };
+    assert_eq!(records[0].status, TaskStatus::Pending);
+    assert_eq!(records[1].status, TaskStatus::Unknown);
+
+    // Lease a batch of 60 (six whole chunks), renew it, then complete it while
+    // asking for the rest.
     let first = client.lease(task_type(), 60, WAIT).unwrap();
     assert_eq!(first.tasks.len(), 60);
+    let tokens: std::collections::BTreeSet<u64> = first.tasks.iter().map(|t| t.token).collect();
+    assert_eq!(tokens.len(), 6, "one token per chunk lease");
     let renewed = client.renew(lease_refs(&first)).unwrap();
     assert!(renewed.iter().all(Result::is_ok));
 

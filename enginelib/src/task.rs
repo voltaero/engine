@@ -3,6 +3,19 @@ use std::fmt::Debug;
 use crate::Identifier;
 use tracing::{error, instrument, warn};
 
+/// Per-type storage/lease limits a mod may suggest via [`Task::limits`]. `None`
+/// fields fall back to the engine default; `config.toml` `[tasks."ns:name"]`
+/// entries override both. See [`crate::api::TaskSettings`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TaskLimits {
+    /// Tasks per storage/lease chunk (1..=65536).
+    pub chunk_size: Option<u32>,
+    /// Largest accepted payload, in bytes.
+    pub max_payload: Option<u32>,
+    /// Largest accepted result, in bytes.
+    pub max_result: Option<u32>,
+}
+
 pub trait Verifiable {
     fn verify(&self, b: &[u8]) -> bool;
 }
@@ -32,6 +45,11 @@ pub trait Task: Debug + Sync + Send + Verifiable {
             Some(Runner::HIP) => self.run_hip(),
             Some(Runner::CPU) | None => self.run_cpu(),
         }
+    }
+    /// Storage/lease limits for this task type. The default defers everything
+    /// to config and engine defaults, so existing mods need no change.
+    fn limits(&self) -> TaskLimits {
+        TaskLimits::default()
     }
     fn to_bytes(&self) -> Vec<u8>;
     #[allow(clippy::wrong_self_convention)]

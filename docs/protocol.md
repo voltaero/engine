@@ -1,7 +1,8 @@
 # Engine wire protocol
 
-Status: v1 implemented over ZeroMQ (`enginelib/src/wire.rs`,
-`enginelib/src/transport/*`). The message set mirrors
+Status: v2 implemented over ZeroMQ (`enginelib/src/wire.rs`,
+`enginelib/src/transport/*`), with chunked task storage (see
+[Chunked storage](#chunked-storage)). The message set mirrors
 `enginelib/src/nucleus/*` one-to-one. Items under **Planned** are not built yet.
 
 ## Roles
@@ -42,9 +43,12 @@ C → S  Hello   { proto_ver, auth: Auth, caps: Caps }
 S → C  Welcome { proto_ver, server_id, lease_ttl_secs, task_types: [TaskTypeInfo] }
      | Error   { kind, message }
 
-Auth = { uid, challenge, admin_token: Option<String> }
-Caps = { runners: [Cpu | Hip], max_inflight }
+Auth         = { uid, challenge, admin_token: Option<String> }
+Caps         = { runners: [Cpu | Hip], max_inflight }
+TaskTypeInfo = { task_type, chunk_size, max_payload: Option<u32>, max_result: Option<u32> }
 ```
+
+`TaskTypeInfo` carries the effective [per-type settings](#per-type-settings).
 
 - `uid` + `challenge` go through `core:auth_event` (default handler: allow; a
   mod can verify `challenge` as a proxy-issued ticket).
@@ -75,19 +79,32 @@ Leased     { task_type, expires_at_ms, tasks: [LeasedItem { task_id, token, byte
 
 Semantics:
 
-- **Lease** waits up to `wait_ms` for the first task, then takes whatever else
-  is already queued, up to `max_tasks` (capped at 65 536). Every task gets its
-  own fencing token. Nothing queued in time → `Error{NotFound, "QueueEmpty"}`.
+- **The lease unit is a chunk.** **Lease** waits up to `wait_ms` for the first
+  chunk, then takes whatever else is already queued, whole chunks at a time,
+  until it holds at least `max_tasks` tasks (capped at 65 536). Chunks are
+  never split, so it may return up to `chunk_size - 1` tasks more than
+  `max_tasks`; size requests in multiples of `TaskTypeInfo.chunk_size`. All
+  tasks of one chunk share one fencing token. A chunk that was partially
+  completed before (cancel, reap, restart) is leased with only its open tasks.
+  Nothing queued in time → `Error{NotFound, "QueueEmpty"}`.
 - **Renew**, **Complete**, **CancelLease** are batched with one result per
   entry, in order, so one stale lease doesn't fail the batch.
-- **Complete** verifies each result with the task type's `verify`. Retrying a
-  completion whose identical result is already stored succeeds (safe after a
-  lost reply).
+- **Renew** and **CancelLease** act on the whole chunk lease named by an
+  entry's `(task_id, token)`; entries of the same chunk lease share one
+  outcome. Cancelling gives every still-open task of the chunk back.
+- **Complete** verifies each result with the task type's `verify` (and
+  `max_result`). It may cover any subset of a chunk lease (partial complete);
+  the chunk stays leased until its last open task is done. Retrying a
+  completion whose identical result is already stored succeeds, with or
+  without a live lease (safe after a lost reply); a different result for a
+  done task → `NotFound "TaskNotLeased"`.
 - **Lease piggyback**: set `then_lease` and the server returns the next batch
   in `Completed.next` (never waits; `None` if the queue is empty). Or omit it
   and send a separate `Lease`.
 - **CancelLease** cancels the lease, never the task: it goes back to the queue.
-- Wrong token → `InvalidArgument "LeaseTokenMismatch"`; no lease → `NotFound`.
+- Wrong token → `InvalidArgument "LeaseTokenMismatch"`; no lease → `NotFound`;
+  malformed task id → `InvalidArgument "InvalidTaskId"`; another server's id →
+  `NotFound "WrongServer"`.
 
 ## Query
 
@@ -111,9 +128,23 @@ Stats  = { server_id, uptime_ms, inserted, leased, completed, cancelled,
 ```
 
 - Everything is O(seek): no unbounded scans; `Scan` pages are capped at 10 000.
+- `Insert` packs the verified payloads of one call into fresh chunks of
+  `chunk_size` (a partial last chunk is fine) and writes them in one
+  `WriteBatch`; ids are returned only once that write is durable. Chunks are
+  never shared across calls, so batch your inserts (a single-payload insert
+  costs a whole chunk record). Payloads over `max_payload` →
+  `InvalidArgument "PayloadTooLarge"`.
+- `Get` answers per task: `Finished` (result), `Leased` / `Pending` (payload),
+  `Unknown` (no such task, malformed id, or another server's id).
+- `Scan` pages over **tasks**, in task id order: `Pending` lists tasks without
+  a result, `Finished` tasks with one. `after` / `next` are task ids.
+- `Delete` works at **chunk granularity**: each id deletes its whole chunk
+  record in that scope. Refused (`InvalidArgument "TaskInFlight"`) if a named
+  chunk is queued or leased.
 - `Purge` of `Pending` does not touch tasks already queued or leased.
-- `Stats.completed` counts successful `Complete` results, including idempotent
-  retries. Poll it for a live throughput counter.
+- `Stats` counters are per task (`queued` / `active_leases` count open tasks,
+  not chunks). `Stats.completed` counts successful `Complete` results,
+  including idempotent retries. Poll it for a live throughput counter.
 
 ## Errors
 
@@ -155,18 +186,94 @@ session_idle_secs = 900
 auth_token = "..."             # admin token
 lease_ttl_secs = 300
 reap_interval_secs = 15
-queue_capacity = 8192
+queue_capacity = 65536         # approx. tasks per in-memory queue (held as chunks)
+
+[tasks."ns:name"]              # per-type overrides (optional)
+chunk_size = 1024
+max_payload = 65536
+max_result = 65536
 ```
+
+## Chunked storage
+
+Every task is still an individual payload with its own verified, stored
+result; only the **storage and lease unit** is a chunk of up to `chunk_size`
+tasks. That replaces ~3 RocksDB ops, an 80-char id and a lease entry per task
+with a few ops and one lease per chunk.
+
+### Task ids
+
+12 bytes, hex encoded as the wire `task_id` (24 lowercase hex chars):
+
+```
+[server_id u16][chunk_seq u64][idx u16]      e.g. 0003 000000000000002a 0007
+```
+
+- `server_id` — config `server_id`. A server only accepts its own ids.
+- `chunk_seq` — strictly increasing, **server-wide** (shared by all task types:
+  one allocator and meta key, ids unique across types, and one `safe_upto`
+  watermark for every refill cursor). Persisted in the default column family
+  as `m:chunk_seq` (big-endian u64 high-water mark), reserved in blocks of
+  65 536 *before* use, so a restart resumes above every seq ever handed out
+  and never reuses an id.
+- `idx` — the task's index inside its chunk.
+
+### Records
+
+| Key | Column family | Value |
+|---|---|---|
+| `t:<ns>:<name>:<chunk_seq 16 hex>` | `pending` | payloads |
+| `f:<ns>:<name>:<chunk_seq 16 hex>` | `finished` | results + done bitmap |
+| `m:chunk_seq` | default | seq high-water mark |
+
+`chunk_seq` is zero-padded hex, so key order is numeric order. Encodings
+(`enginelib/src/chunk.rs`, little-endian `u32` lengths):
+
+```
+pending   [0x01][n u32]([len u32][payload])*n
+finished  [0x01][n u32][done bitmap ceil(n/8) bytes]([len u32][result])*popcount(done)
+```
+
+- The pending record is immutable. A chunk's open tasks are the indexes not
+  set in the finished record's done bitmap (no separate open bitmap to
+  rewrite on every partial complete).
+- A `Complete` merges its results into the finished record (read-modify-write
+  only if the chunk already had results) in one `WriteBatch`; when the last
+  open task is done, the same batch deletes the pending record.
+- `pending` is delete-heavy and compacts on deletion; `finished` is
+  append-mostly and stores values in blob files (`min_blob_size` 4 KiB). Both
+  use bloom filters (refill probes `finished` for every chunk it loads).
+
+### In-memory state (per task type)
+
+- Queue of chunks (`TypeQueue`), capacity `queue_capacity / chunk_size`
+  chunks; each entry carries the chunk's payloads and open-index bitmap.
+- Dedup set of `chunk_seq`: a chunk is in it **iff** it is queued or leased.
+- Leases keyed by `chunk_seq`, one fencing token each.
+- Refill: first drains a *recovery set* (chunks whose dedup entry was cleared
+  while their record stayed persisted — a cancel/reap requeue that found the
+  queue full, a failed refill send), then advances a forward-only cursor over
+  `t:` keys bounded by the allocator's `safe_upto` (the oldest chunk whose
+  insert is still being written). Since keys only grow and nothing lands
+  below `safe_upto` later, the cursor never rescans from the start.
+- Cancel and reaping requeue the still-open indexes of the chunk directly.
+
+## Per-type settings
+
+| Setting | Meaning | Engine default |
+|---|---|---|
+| `chunk_size` | tasks per chunk, 1..=65 536 | 1024 |
+| `max_payload` | largest accepted payload (bytes) | unlimited |
+| `max_result` | largest accepted result (bytes) | unlimited |
+
+Precedence: `config.toml` `[tasks."ns:name"]` > mod (`Task::limits() ->
+TaskLimits`, a defaulted trait method) > engine default. Resolved once per
+type in `ServerAPI::populate`, surfaced in `Welcome.task_types`.
 
 ## Planned
 
-- **Chunked storage**: tasks stored and leased in chunks with 12-byte ids
-  `[server_id u16][chunk_seq u64][idx u16]`. That cuts DB operations and
-  lease bookkeeping per task, and lets `Get`/`Complete` be routed to the
-  owning server (`Error{Moved}`). The wire shapes above stay valid: tasks in a
-  chunk would share a token.
-- **Per-type settings** (`chunk_size`, `max_payload`, `max_result`,
-  `lease_ttl_secs`), with precedence `config.toml` > mod (`TaskLimits` on
-  `Task`) > engine default, surfaced in `TaskTypeInfo`.
+- **Routing by id**: ids carry `server_id`, so `Get`/`Complete` for another
+  server could answer `Error{Moved}` with its endpoint (today: `WrongServer`).
+- **Per-type `lease_ttl_secs`** alongside the other per-type settings.
 - **Stats push** over a ZeroMQ PUB socket instead of polling.
 - **Ticket scheme** for forwarded auth (HMAC vs. ed25519).

@@ -1,13 +1,14 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
 
-use crate::api::{Lease, LeasedTask, next_lease_token};
+use crate::api::{ChunkLease, Lease, QueuedChunk, TypeQueue, next_lease_token};
 use crate::{Identifier, api::ServerAPI, error::Error};
 
-/// Leases the next queued task of `task_type`, waiting as long as it takes for
-/// one to arrive. Prefer [`lease_timeout`] for anything driven by a client.
+/// Leases the next queued chunk of `task_type` (all of its open tasks, under
+/// one token), waiting as long as it takes for one to arrive. Prefer
+/// [`lease_timeout`] for anything driven by a client.
 pub async fn lease(
     api: Arc<ServerAPI>,
     task_type: Identifier,
@@ -26,56 +27,116 @@ pub async fn lease_timeout(
     lease_inner(api, task_type, user_id, Some(timeout)).await
 }
 
+/// Leases the next queued chunk if one is ready right now; never waits.
+pub fn try_lease(
+    api: &Arc<ServerAPI>,
+    task_type: &Identifier,
+    user_id: &str,
+) -> Result<Option<Lease>, Error> {
+    let queue = queue_of(api, task_type)?;
+    refill_if_low(api, task_type, &queue);
+    match queue.rx.try_recv() {
+        Ok(chunk) => Ok(Some(grant(
+            api,
+            task_type,
+            &queue,
+            user_id.to_string(),
+            chunk,
+        ))),
+        Err(async_channel::TryRecvError::Empty) => Ok(None),
+        Err(err) => Err(Error::new(format!("Task queue closed: {err}"))),
+    }
+}
+
+/// Leases whole chunks until at least `max_tasks` tasks are leased or the
+/// queue is empty. Waits up to `wait` for the first chunk only. Chunks are
+/// never split, so the total may exceed `max_tasks` by up to one chunk.
+pub async fn lease_many(
+    api: Arc<ServerAPI>,
+    task_type: Identifier,
+    user_id: String,
+    max_tasks: usize,
+    wait: Duration,
+) -> Result<Vec<Lease>, Error> {
+    let first = lease_timeout(api.clone(), task_type.clone(), user_id.clone(), wait).await?;
+    let mut total = first.len();
+    let mut leases = vec![first];
+    while total < max_tasks {
+        match try_lease(&api, &task_type, &user_id)? {
+            Some(lease) => {
+                total += lease.len();
+                leases.push(lease);
+            }
+            None => break,
+        }
+    }
+    Ok(leases)
+}
+
+fn queue_of(api: &ServerAPI, task_type: &Identifier) -> Result<Arc<TypeQueue>, Error> {
+    api.task_queue
+        .get(task_type)
+        .ok_or(Error::not_found("TaskTypeNotFound"))
+}
+
+/// Tops the queue up from RocksDB once it runs low.
+fn refill_if_low(api: &Arc<ServerAPI>, task_type: &Identifier, queue: &TypeQueue) {
+    if ServerAPI::below_watermark(queue.rx.len(), queue.tx.capacity()) {
+        ServerAPI::request_refill(api, task_type);
+    }
+}
+
 async fn lease_inner(
     api: Arc<ServerAPI>,
     task_type: Identifier,
     user_id: String,
     timeout: Option<Duration>,
 ) -> Result<Lease, Error> {
-    // Clone the receiver out of the map guard before awaiting; recv() on an
-    // empty queue would otherwise hold the shard lock indefinitely.
-    let (receiver, capacity) = {
-        let queue = api
-            .task_queue
-            .tasks
-            .get(&task_type)
-            .ok_or(Error::not_found("TaskTypeNotFound"))?;
-        (queue.1.clone(), queue.0.capacity())
-    };
-
-    // Top the queue up from RocksDB once it runs low. Requested before awaiting
-    // so a worker parked on an empty queue is woken by the refill it triggered.
-    if ServerAPI::below_watermark(receiver.len(), capacity) {
-        ServerAPI::request_refill(&api, &task_type);
-    }
+    let queue = queue_of(&api, &task_type)?;
+    // Requested before awaiting so a worker parked on an empty queue is woken
+    // by the refill it triggered.
+    refill_if_low(&api, &task_type, &queue);
 
     let received = match timeout {
-        Some(timeout) => tokio::time::timeout(timeout, receiver.recv())
+        Some(timeout) => tokio::time::timeout(timeout, queue.rx.recv())
             .await
             .map_err(|_| Error::not_found("QueueEmpty"))?,
-        None => receiver.recv().await,
+        None => queue.rx.recv().await,
     };
-    let task = received.map_err(|err| Error::new(format!("Task queue closed: {err}")))?;
+    let chunk = received.map_err(|err| Error::new(format!("Task queue closed: {err}")))?;
+    Ok(grant(&api, &task_type, &queue, user_id, chunk))
+}
 
-    // No await from here on: the task goes from "queued" straight to "leased"
-    // (its task_id stays in the dedup set throughout).
-    let stored_task = Arc::new(task);
+/// Records the lease of a just-received chunk. No await: the chunk goes from
+/// "queued" straight to "leased" (it stays in the dedup set throughout).
+fn grant(
+    api: &ServerAPI,
+    task_type: &Identifier,
+    queue: &TypeQueue,
+    user_id: String,
+    chunk: QueuedChunk,
+) -> Lease {
+    queue.note_received(&chunk);
     let given_at = Utc::now();
     let lease = Lease {
-        task: stored_task.clone(),
+        task_type: task_type.clone(),
+        server_id: api.server_id(),
+        chunk_seq: chunk.chunk_seq,
+        payloads: chunk.payloads.clone(),
+        open: chunk.open.clone(),
         token: next_lease_token(),
         expires_at: api.lease_expiry(given_at),
     };
-    api.leased_tasks.leases_or_default(&task_type).insert(
-        stored_task.task_id.clone(),
-        LeasedTask {
-            stored_task,
+    api.leased_tasks.leases_or_default(task_type).insert(
+        chunk.chunk_seq,
+        Arc::new(Mutex::new(ChunkLease {
+            chunk,
             user_id,
             token: lease.token,
             given_at,
             expires_at: lease.expires_at,
-        },
+            gone: false,
+        })),
     );
-
-    Ok(lease)
+    lease
 }

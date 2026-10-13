@@ -1,4 +1,4 @@
-use std::{fs, io::Error, path::Path};
+use std::{collections::HashMap, fs, io::Error, path::Path};
 
 use serde::{Deserialize, Serialize};
 use tracing::{error, instrument};
@@ -16,7 +16,7 @@ fn default_reap_interval_secs() -> u64 {
 }
 
 fn default_queue_capacity() -> usize {
-    8192
+    65_536
 }
 
 fn default_proxy_host() -> String {
@@ -54,10 +54,17 @@ pub struct ConfigTomlServer {
     #[serde(default = "default_reap_interval_secs")]
     pub reap_interval_secs: u64,
 
-    /// Bounded capacity of each per-type in-memory task queue. The refill path
-    /// tops a queue up from RocksDB once it drains below a quarter of this.
+    /// Approximate number of *tasks* each per-type in-memory queue holds. The
+    /// queue holds chunks, so its capacity is `queue_capacity / chunk_size`
+    /// chunks (at least one). The refill path tops a queue up from RocksDB once
+    /// it drains below a quarter of that.
     #[serde(default = "default_queue_capacity")]
     pub queue_capacity: usize,
+
+    /// Per-type overrides, keyed `"namespace:name"`. They take precedence over
+    /// a mod's `Task::limits()` and the engine defaults.
+    #[serde(default)]
+    pub tasks: HashMap<String, TaskTypeConfig>,
 
     /// Identifies this server to clients and the proxy.
     #[serde(default)]
@@ -103,8 +110,17 @@ impl Default for ConfigTomlServer {
             max_message_bytes: default_max_message_bytes(),
             session_idle_secs: default_session_idle_secs(),
             heartbeat_secs: default_heartbeat_secs(),
+            tasks: HashMap::new(),
         }
     }
+}
+
+/// `[tasks."namespace:name"]` table in `config.toml`.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TaskTypeConfig {
+    pub chunk_size: Option<u32>,
+    pub max_payload: Option<u32>,
+    pub max_result: Option<u32>,
 }
 #[derive(Debug, Clone, Default)]
 pub struct Config {
@@ -144,7 +160,11 @@ mod tests {
     fn from_file_reads_keys_and_defaults_the_rest() {
         let path =
             std::env::temp_dir().join(format!("enginelib-config-test-{}.toml", std::process::id()));
-        fs::write(&path, "cgrpc_token = \"secret\"\nlease_ttl_secs = 42\n").unwrap();
+        fs::write(
+            &path,
+            "cgrpc_token = \"secret\"\nlease_ttl_secs = 42\n[tasks.\"ns:t\"]\nchunk_size = 7\n",
+        )
+        .unwrap();
         let cfg = Config::from_file(&path).config_toml;
         let _ = fs::remove_file(&path);
 
@@ -153,6 +173,8 @@ mod tests {
         assert_eq!(cfg.reap_interval_secs, default_reap_interval_secs());
         assert_eq!(cfg.queue_capacity, default_queue_capacity());
         assert_eq!(cfg.host, default_host());
+        assert_eq!(cfg.tasks["ns:t"].chunk_size, Some(7));
+        assert_eq!(cfg.tasks["ns:t"].max_payload, None);
     }
 
     #[test]

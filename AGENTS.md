@@ -7,7 +7,7 @@ Operational guide for coding agents in this repository.
 Rust workspace for a distributed task engine with dynamic mods.
 
 Workspace members:
-- `engine` (binaries: `server`, `proxy`)
+- `engine` (binaries: `server`, `proxy`, `bench`)
 - `enginelib` (shared runtime API, events, tasks, plugin loader, task nucleus)
 - `enginelib/macros` (proc macros used by mods and core)
 
@@ -22,6 +22,7 @@ Workspace members:
 1. `Cargo.toml` (workspace)
 2. `enginelib/src/api.rs` (`ServerAPI`, task queues, RocksDB, key helpers)
 3. `enginelib/src/nucleus/*` (task lifecycle: submit/lease/renew/complete/cancel/query)
+   and `enginelib/src/chunk.rs` (task ids, chunk encodings, seq allocator)
 4. `enginelib/src/event.rs` (event dispatch)
 5. `enginelib/src/plugin.rs` (mod loader)
 6. `enginelib/src/config.rs` (config/token)
@@ -55,89 +56,113 @@ Workspace members:
 
 ## Data/persistence model (important)
 
-RocksDB is the source of truth. Key layout (see helpers in `enginelib/src/api.rs`:
-`task_key`, `task_key_prefix`, `finished_task_key`, `finished_task_key_prefix`):
-- `t:<namespace>:<task_name>:<id>` -> serialized pending task record
-- `f:<namespace>:<task_name>:<id>` -> serialized finished task record
+RocksDB is the source of truth. Tasks are stored and leased in **chunks**
+(`enginelib/src/chunk.rs`); every task is still an individual payload with its
+own verified result. Key layout (helpers in `enginelib/src/api.rs`: `task_key`,
+`task_key_prefix`, `finished_task_key`, `finished_task_key_prefix`,
+`chunk_seq_from_key`; spec in `docs/protocol.md` "Chunked storage"):
+- `t:<namespace>:<task_name>:<chunk_seq 16 hex>` -> pending chunk record (payloads),
+  column family `pending` (`api.cf_pending()`)
+- `f:<namespace>:<task_name>:<chunk_seq 16 hex>` -> finished chunk record (results +
+  done bitmap), column family `finished` (`api.cf_finished()`)
+- `m:chunk_seq` (default CF) -> persisted `chunk_seq` high-water mark (`SeqAllocator`)
+
+The pending record is immutable; a chunk's open tasks are the indexes *not* set
+in the finished record's done bitmap. Use `api.read_pending` / `api.read_finished`
+rather than raw `db.get` (raw keys live in non-default column families).
+
+Task ids (wire `task_id`): 12 bytes `[server_id u16][chunk_seq u64][idx u16]`,
+24 hex chars (`chunk::TaskId`, `api.task_id()`, `api.parse_task_id()` — the latter
+rejects other servers' ids with NotFound `"WrongServer"`). `chunk_seq` is
+server-wide (all task types), strictly increasing, reserved in persisted blocks so
+ids are never reused across restarts.
 
 In-memory state on `ServerAPI` (rebuilt from the DB by the refill path), keyed by
 `Identifier`:
-- `task_queue: TaskQueue` — per-type `(async_channel Sender, Receiver, dedup DashSet<id>)`.
-  A task_id is in the dedup set iff it is in-flight (queued in the channel **or** leased).
-  Channel capacity is `queue_capacity` (config).
-- `leased_tasks: LeasedTaskQueue` — per-type `Arc<DashMap<task_id, LeasedTask>>`
-  (O(1) renew/complete/cancel). Each lease carries a fencing `token` and
-  `expires_at`; the reaper drops expired leases every `reap_interval_secs`.
-- `load_state: LoadStates` — per-type `LoadState`: refill cursor, rescan flag,
-  generation/idle tracking, and the single-refill guard (see "Refill" below).
+- `task_queue: TaskQueue` — per-type `Arc<TypeQueue>` { `tx`/`rx` channel of
+  `QueuedChunk` (payloads + open bitmap), `dedup: DashSet<chunk_seq>`, queued-task
+  counter }. A chunk is in the dedup set **iff** it is in flight (queued **or**
+  leased). Channel capacity = `queue_capacity / chunk_size` chunks (min 1).
+- `leased_tasks: LeasedTaskQueue` — per-type `Arc<DashMap<chunk_seq, LeaseCell>>`,
+  `LeaseCell = Arc<Mutex<ChunkLease>>`. One lease (and one fencing `token`) per
+  chunk; `ChunkLease.chunk.open` is the indexes this lease hasn't completed.
+  **Lock order:** never lock a `ChunkLease` while holding a DashMap guard (clone
+  the `Arc` out first); removing from the map while holding the mutex is fine.
+  A lease that ends is marked `gone` under its mutex (`LeasedTaskQueue::end`).
+- `load_state: LoadStates` — per-type `LoadState`: forward cursor, recovery set,
+  generation/idle tracking, single-refill guard (see "Refill" below).
+- `chunk_seq: SeqAllocator`, `settings: DashMap<Identifier, TaskSettings>`.
 
 Config (`config.toml`, loaded by `ServerAPI::default()` via `Config::new()`;
 `ServerAPI::open(path, cfg)` takes an explicit store path + config, e.g. for tests):
-`host`, `auth_token` (alias `cgrpc_token`), `lease_ttl_secs` (default 300),
-`reap_interval_secs` (default 15), `queue_capacity` (default 8192).
+`host`, `server_id`, `auth_token` (alias `cgrpc_token`), `lease_ttl_secs` (default
+300), `reap_interval_secs` (default 15), `queue_capacity` (tasks, default 65536),
+and per-type `[tasks."ns:name"]` { `chunk_size`, `max_payload`, `max_result` }.
 
-`Identifier` = `(namespace, task)`. Task instance IDs are separate string IDs
-(`druid` hex), generated by `submit` and **returned to the caller** so the task
-can later be addressed by `cancel`/`renew`/`complete`/`query`.
+Per-type settings (`api.settings(&type) -> TaskSettings`): precedence
+`config.toml` `[tasks."ns:name"]` > mod `Task::limits() -> TaskLimits` (defaulted
+trait method) > engine default (`chunk_size` 1024, no size limits). Resolved in
+`populate()` and sent in `Welcome.task_types`.
 
 ### Task lifecycle (`enginelib/src/nucleus/*`)
 
-- `submit(bytes, task_type) -> String` — verifies bytes, persists the pending
-  record, returns the generated task_id. Does not enqueue it itself; it bumps the
-  type's load generation and requests a refill if the queue is below the watermark.
-- `ServerAPI::load(task_type)` / `api.refill(&task_type)` — one cursor pass: reads
-  pending records from the DB and `try_send`s any not already in the dedup set, up
-  to the channel's free capacity. Never awaits.
-- `lease(task_type, user_id) -> Lease` / `lease_timeout(.., timeout) -> Lease` —
-  `recv`s from the channel and records a lease (task stays in the dedup set).
-  `Lease { task: Arc<StoredTask>, token: u64, expires_at }`. `lease_timeout` fails
-  with NotFound `"QueueEmpty"` on timeout. Requests a refill when the queue is
-  below the low watermark (25% of capacity).
-- `renew(task_type, task_id, token) -> expires_at` — extends the lease by a full TTL
-  from now. Touches nothing else.
-- `complete(task_type, task_id, token, bytes)` — finalize a leased task: verifies
-  bytes, atomically writes the `f:` record + deletes the `t:` record (one
-  `WriteBatch`), then clears the lease + dedup entry. Idempotent: with no matching
-  lease, returns Ok if the `f:` record already holds identical bytes (a retry
-  after a lost response); otherwise NotFound `"TaskNotLeased"`.
-- `cancel(task_type, task_id, token)` — cancels the **lease, not the task**: drops the
-  lease and `try_send`s the record back into the queue (dedup entry and persisted
-  record untouched). If the channel is full/closed it clears the dedup entry and
-  marks a rescan so a later refill recovers the still-persisted record. Synchronous —
-  no await window in which the task is neither leased nor queued.
-- Lease fencing: `renew`/`complete`/`cancel` must present the token returned by
-  `lease`. Unknown lease -> NotFound; lease held under a different token (e.g. the
-  caller's lease was reaped and the task re-leased) -> InvalidArgument
+- `submit(bytes, type) -> task_id` / `submit_batch(payloads, type) -> [Result<task_id>]`
+  — verifies each payload (+ `max_payload`), packs the valid ones of *this call*
+  into fresh chunks of `chunk_size`, reserves seqs, writes all chunks in one
+  `WriteBatch`, and only then returns ids. Never merges across calls. Bumps the
+  load generation and requests a refill if the queue is below the watermark.
+- `ServerAPI::load(type)` / `api.refill(&type)` — one refill pass (see below);
+  `try_send`s loadable chunks up to the channel's free capacity. Never awaits.
+- `lease` / `lease_timeout` -> `Lease` (one chunk: `chunk_seq`, `payloads`, `open`,
+  `token`, `expires_at`; `lease.tasks()` yields `(task_id, payload)`), `try_lease`
+  (non-blocking), `lease_many(max_tasks, wait)` (whole chunks until >= max_tasks;
+  never splits a chunk). `lease_timeout` fails with NotFound `"QueueEmpty"`.
+  Requests a refill below the 25% watermark.
+- `renew` / `renew_batch` — extends the chunk lease named by `(task_id, token)`.
+- `complete` / `complete_batch(items)` — verifies each result (+ `max_result`),
+  groups items per (type, chunk, token) and merges each group into the `f:`
+  record in one `WriteBatch` (partial completes allowed). When the chunk's last
+  open task is done the same batch deletes the `t:` record and the lease + dedup
+  entry are dropped. On write failure nothing changes (lease intact, retryable).
+  Idempotent: a done task whose stored result is identical succeeds (with or
+  without a live lease); otherwise NotFound `"TaskNotLeased"`, or
+  `"LeaseTokenMismatch"` if another lease holds the chunk.
+- `cancel` / `cancel_batch` — cancels the **chunk lease, not the tasks**: ends the
+  lease and requeues its still-open indexes (`ServerAPI::requeue`). The chunk
+  stays in the dedup set; if the channel is full/closed it is un-marked and put in
+  the recovery set. Synchronous — no await window.
+- Lease fencing: `renew`/`complete`/`cancel` must present the lease token.
+  Unknown lease -> NotFound; held under another token -> InvalidArgument
   `"LeaseTokenMismatch"`. Tokens come from a process-global counter: they fence,
   they are not secrets.
-- `query(Query) -> QueryResult` — operator/CRUD surface, all O(seek) (never a
-  full keyspace scan): point `Get { key }` / `Delete { key }`, range
-  `Scan { prefix, after, limit }` / `PurgePrefix { prefix }`, and
-  `EstimateKeys` / `EstimateSize`. Build keys with the `*_key` helpers. Raw
-  `Delete`/`PurgePrefix` bypass dedup/lease state — use `cancel`/`complete` for
-  in-flight tasks. There is intentionally no raw `Put`: create/update go through
-  `submit`/`complete` so verification and in-memory invariants hold.
+- Reaper (`LeasedTaskQueue::reap_expired`): ends expired leases and requeues their
+  open indexes like `cancel`.
+- `query(Query) -> QueryResult` — raw operator surface over *chunk records*, all
+  O(seek): `Get`/`Delete { key }`, `Scan { prefix, after, limit }`,
+  `PurgePrefix`, `EstimateKeys`, `EstimateSize`. Routed to the CF by key prefix
+  (`t:` pending, `f:` finished, else default). Raw `Delete`/`PurgePrefix` bypass
+  dedup/lease state. There is intentionally no raw `Put`.
+- Task-level views used by the wire `Query`: `get_tasks` (Finished / Leased /
+  Pending / Unknown per task id), `scan_tasks` (pages over tasks, `after`/`next`
+  are task ids), `delete_tasks` (chunk granularity; refuses in-flight chunks).
 
 ### Refill (`ServerAPI::refill`, `request_refill`, `LoadState` in `api.rs`)
 
-- Each type keeps a cursor (last `t:` key examined). A pass seeks straight to it
-  with `ReadOptions` lower/upper bounds instead of rescanning from the prefix start,
-  so in-flight records and `complete()` tombstones behind it aren't re-walked.
-- druid keys are only *roughly* time-ordered, so the cursor must not skip keys for
-  good. The type falls back to a **full rescan from the prefix start** on the next
-  pass when: a cursor pass reaches the end of the prefix; or a dedup entry is
-  cleared while the record stays persisted (lease reaping, `cancel` overflow, a
-  failed `complete` write, a failed refill `try_send`). Call
-  `LoadState::mark_rescan()` *after* clearing dedup entries.
-- `generation` is bumped by `submit` and every rescan trigger; after a full pass
-  that reached the end, refills no-op until the generation changes. So `t:` records
-  must be written via `submit` — anything else must call `mark_rescan()`.
-- Triggers: `lease()` below the 25% watermark, `submit()` below the watermark, and
-  the reaper after reaping. `request_refill` runs at most one refill per type
-  (`AtomicBool` slot; requests that arrive mid-run cause one more pass), on tokio's
-  blocking pool when inside a runtime, else inline.
-- The DB is opened with `add_compact_on_deletion_collector_factory` so
-  tombstone-heavy SSTs get compacted early.
+- A pass first drains the **recovery set** (point reads; chunks whose dedup entry
+  was cleared while the record stayed persisted), then advances a **forward-only
+  cursor** over `t:` keys, bounded above by `SeqAllocator::safe_upto()` (the oldest
+  seq whose insert is still being written). Keys only grow and nothing can land
+  below `safe_upto` later, so the cursor never rescans from the start.
+- Anything that clears a dedup entry of a still-pending chunk must call
+  `LoadState::recover(chunk_seq)` *after* clearing it. `mark_rescan()` (reset the
+  cursor) is only for out-of-band `t:` writes.
+- Loading a chunk reads its `f:` record to compute the open indexes (bloom filter
+  keeps the "no results yet" probe cheap).
+- `generation` is bumped by `submit` and `recover`; after a pass that reached the
+  end with an empty recovery set, refills no-op until it changes.
+- Triggers: `lease()` below the 25% watermark, `submit()` below the watermark, a
+  requeue overflow. `request_refill` runs at most one refill per type (on tokio's
+  blocking pool inside a runtime, else inline).
 
 ## Mod ABI contract (must keep)
 
@@ -165,20 +190,28 @@ Do not assume secure defaults without verifying handlers/mods.
 ## Change playbooks
 
 ### Task lifecycle/queue change
-- Touch: `enginelib/src/nucleus/*`, `enginelib/src/api.rs`, `enginelib/src/task.rs`,
-  `engine/src/bin/server.rs`
-- Keep the three representations in sync: RocksDB record, dedup `DashSet`, and
-  `leased_tasks`. A task_id must be in the dedup set for exactly as long as it is
-  queued or leased — never leave it set with the record neither queued nor leased.
-- Validate transitions: submitted -> queued (refill) -> leased -> completed, plus
-  lease cancel (requeue) and lease reaping (dedup cleared, rescan marked, DB kept
-  for the next refill).
+- Touch: `enginelib/src/nucleus/*`, `enginelib/src/api.rs`, `enginelib/src/chunk.rs`,
+  `enginelib/src/task.rs`, `engine/src/bin/server.rs`
+- Keep the three representations in sync **at chunk granularity**: RocksDB
+  records (`t:` + `f:`), the dedup `DashSet<chunk_seq>`, and `leased_tasks`. A
+  chunk must be in the dedup set for exactly as long as it is queued or leased —
+  never leave it set with the chunk neither queued nor leased, and when clearing
+  it while the `t:` record stays, call `LoadState::recover`.
+- A chunk's open indexes = not done in its `f:` record. Queue entries and leases
+  carry that bitmap; never requeue indexes that already have results.
+- Validate transitions: submitted (chunked) -> queued (refill) -> leased ->
+  completed (partial or full; full deletes `t:`), plus lease cancel / reaping
+  (requeue only open indexes; overflow -> recovery set) and restart (leases lost,
+  `t:` chunks reload with their open indexes, `chunk_seq` resumes above the
+  persisted high-water mark).
 - Lifecycle tests live in `enginelib/tests/nucleus.rs`; build the API with
   `ServerAPI::open(<temp dir>, cfg)` so tests don't share `./engine_db`.
+- Throughput: `cargo run --release -p engine --bin bench -- --tasks N --db <disk dir>`
+  (in-process server + inserter/worker threads; `/tmp` may be tmpfs).
 
 ### Wire/transport change
 - Messages: `enginelib/src/wire.rs` (bump `PROTO_VERSION` on incompatible
-  changes); server/client/proxy: `enginelib/src/transport/*`; keep
+  changes; currently 2); server/client/proxy: `enginelib/src/transport/*`; keep
   `docs/protocol.md` in sync.
 - Each wire request must map onto a nucleus op so the dedup/lease/RocksDB
   invariants stay enforced in one place. No raw `Put` over the wire.

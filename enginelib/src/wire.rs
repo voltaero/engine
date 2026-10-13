@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::Identifier;
 use crate::error::{Error, ErrorKind};
 
-pub const PROTO_VERSION: u16 = 1;
+/// v2: chunked storage (12-byte task ids, per-type settings in `TaskTypeInfo`).
+pub const PROTO_VERSION: u16 = 2;
 
 /// Upper bound on tasks handed out by one `Lease` (or `then_lease`).
 pub const MAX_LEASE_BATCH: u32 = 65_536;
@@ -46,7 +47,8 @@ pub enum Request {
         auth: Auth,
         caps: Caps,
     },
-    /// Lease up to `max_tasks` tasks, waiting at most `wait_ms` for the first.
+    /// Lease whole chunks until at least `max_tasks` tasks (or the queue is
+    /// empty), waiting at most `wait_ms` for the first chunk.
     Lease {
         task_type: Identifier,
         max_tasks: u32,
@@ -91,7 +93,8 @@ pub struct Caps {
     pub max_inflight: u32,
 }
 
-/// Addresses one lease: the task and the token `lease` handed out for it.
+/// Addresses one leased task and the token `lease` handed out for it. Every
+/// task of a chunk lease shares the token; renew/cancel act on the whole chunk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseRef {
     pub task_type: Identifier,
@@ -126,9 +129,16 @@ pub struct Leased {
     pub tasks: Vec<LeasedItem>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskTypeInfo {
     pub task_type: Identifier,
+    /// Tasks per chunk. A `Lease` hands out whole chunks, so it may return up
+    /// to `chunk_size - 1` tasks more than `max_tasks`.
+    pub chunk_size: u32,
+    /// Largest accepted payload in bytes (`None` = unlimited).
+    pub max_payload: Option<u32>,
+    /// Largest accepted result in bytes (`None` = unlimited).
+    pub max_result: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,7 +189,8 @@ pub enum Query {
         task_type: Identifier,
         ids: Vec<String>,
     },
-    /// One page of records, resuming strictly after `after`.
+    /// One page of tasks (not chunks), resuming strictly after the task id
+    /// `after`.
     Scan {
         task_type: Identifier,
         scope: Scope,
@@ -193,7 +204,8 @@ pub enum Query {
         task_type: Identifier,
         scope: Scope,
     },
-    /// Admin. Deleting a pending task that is queued or leased is refused.
+    /// Admin. Deletes the whole chunk holding each id. Refused if a named
+    /// chunk is queued or leased.
     Delete {
         task_type: Identifier,
         scope: Scope,

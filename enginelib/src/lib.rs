@@ -1,5 +1,6 @@
 use std::sync::Arc;
 pub mod api;
+pub mod chunk;
 pub mod config;
 pub mod event;
 pub mod events;

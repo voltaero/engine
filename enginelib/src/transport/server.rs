@@ -16,21 +16,25 @@ use tokio::runtime::Handle;
 use tracing::{debug, error, info, warn};
 
 use super::{Background, POLL_MS, context, sleep_unless_stopped, zmq_err};
-use crate::api::{
-    ServerAPI, finished_task_key, finished_task_key_prefix, task_id_from_key, task_key,
-    task_key_prefix,
-};
+use crate::api::ServerAPI;
 use crate::config::ConfigTomlServer;
 use crate::error::{Error, ErrorKind};
 use crate::events::Events;
-use crate::nucleus::query::{self as db_query, Query as DbQuery, QueryResult};
+use crate::nucleus::query::{
+    self as db_query, Query as DbQuery, QueryResult, delete_tasks, get_tasks, scan_tasks,
+    scope_prefix,
+};
 use crate::nucleus::{
-    cancel::cancel, complete::complete, lease::lease_timeout, renew::renew, submit::submit_batch,
+    cancel::cancel_batch,
+    complete::{CompleteItem, complete_batch},
+    lease::lease_many,
+    renew::renew_batch,
+    submit::submit_batch,
 };
 use crate::wire::{
     self, Auth, LeaseRef, Leased, LeasedItem, MAX_LEASE_BATCH, MAX_SCAN_LIMIT, PROTO_VERSION,
-    PageRecord, ProxyRequest, Query, QueryResponse, Request, Response, Scope, ServerInfo, Stats,
-    TaskRecord, TaskResult, TaskStatus, TaskTypeInfo, WireError,
+    ProxyRequest, Query, QueryResponse, Request, Response, ServerInfo, Stats, TaskResult,
+    TaskTypeInfo, WireError,
 };
 use crate::{Identifier, Registry};
 
@@ -44,6 +48,8 @@ const RECV_BURST: usize = 1024;
 pub struct ServerOptions {
     /// ZeroMQ endpoint to bind, e.g. `tcp://[::1]:50051` or `tcp://127.0.0.1:*`.
     pub endpoint: String,
+    /// Announced in `Welcome`/to the proxy. Keep it equal to the API config's
+    /// `server_id`, which task ids embed (`from_config` does).
     pub server_id: u16,
     /// Endpoint announced to the proxy; defaults to the bound endpoint.
     pub advertise: Option<String>,
@@ -414,18 +420,9 @@ impl Shared {
                 Err(err) => Response::Error(err.into()),
             },
             Request::Renew { leases } => Response::Renewed {
-                results: leases
+                results: renew_batch(&self.api, leases.into_iter().map(lease_ref_parts))
                     .into_iter()
-                    .map(|lease| {
-                        renew(
-                            self.api.clone(),
-                            lease.task_type,
-                            &lease.task_id,
-                            lease.token,
-                        )
-                        .map(wire::unix_ms)
-                        .map_err(Into::into)
-                    })
+                    .map(|result| result.map(wire::unix_ms).map_err(Into::into))
                     .collect(),
             },
             Request::Complete {
@@ -449,18 +446,11 @@ impl Shared {
                 Response::Completed { results, next }
             }
             Request::CancelLease { leases } => {
-                let results: Vec<Result<(), WireError>> = leases
-                    .into_iter()
-                    .map(
-                        |LeaseRef {
-                             task_type,
-                             task_id,
-                             token,
-                         }| {
-                            cancel(self.api.clone(), task_type, task_id, token).map_err(Into::into)
-                        },
-                    )
-                    .collect();
+                let results: Vec<Result<(), WireError>> =
+                    cancel_batch(&self.api, leases.into_iter().map(lease_ref_parts))
+                        .into_iter()
+                        .map(|result| result.map_err(Into::into))
+                        .collect();
                 add(
                     &self.counters.cancelled,
                     results.iter().filter(|result| result.is_ok()).count(),
@@ -517,12 +507,21 @@ impl Shared {
             task_types: self
                 .task_types()
                 .into_iter()
-                .map(|task_type| TaskTypeInfo { task_type })
+                .map(|task_type| {
+                    let settings = api.settings(&task_type);
+                    TaskTypeInfo {
+                        task_type,
+                        chunk_size: settings.chunk_size,
+                        max_payload: settings.max_payload,
+                        max_result: settings.max_result,
+                    }
+                })
                 .collect(),
         }
     }
 
-    /// Leases up to `max_tasks`, waiting at most `wait` for the first one only.
+    /// Leases whole chunks until at least `max_tasks` tasks, waiting at most
+    /// `wait` for the first chunk only.
     async fn lease(
         &self,
         task_type: Identifier,
@@ -531,32 +530,16 @@ impl Shared {
         wait: Duration,
     ) -> Result<Leased, Error> {
         let max_tasks = max_tasks.clamp(1, MAX_LEASE_BATCH) as usize;
-        let first = lease_timeout(self.api.clone(), task_type.clone(), uid.clone(), wait).await?;
-        let mut expires_at = first.expires_at;
-        let mut tasks = Vec::with_capacity(max_tasks.min(1024));
-        let mut push = |lease: crate::api::Lease| {
+        let leases = lease_many(self.api.clone(), task_type.clone(), uid, max_tasks, wait).await?;
+        let mut expires_at = chrono::DateTime::<chrono::Utc>::MAX_UTC;
+        let mut tasks = Vec::with_capacity(leases.iter().map(|lease| lease.len()).sum());
+        for lease in &leases {
             expires_at = expires_at.min(lease.expires_at);
-            tasks.push(LeasedItem {
-                task_id: lease.task.task_id.clone(),
+            tasks.extend(lease.tasks().map(|(task_id, bytes)| LeasedItem {
+                task_id,
                 token: lease.token,
-                bytes: lease.task.bytes.clone(),
-            });
-        };
-        push(first);
-        // The rest only take what is already queued. A zero timeout still polls
-        // the queue once before giving up.
-        for _ in 1..max_tasks {
-            match lease_timeout(
-                self.api.clone(),
-                task_type.clone(),
-                uid.clone(),
-                Duration::ZERO,
-            )
-            .await
-            {
-                Ok(lease) => push(lease),
-                Err(_) => break,
-            }
+                bytes: bytes.to_vec(),
+            }));
         }
         add(&self.counters.leased, tasks.len());
         Ok(Leased {
@@ -567,18 +550,18 @@ impl Shared {
     }
 
     fn complete(&self, results: Vec<TaskResult>) -> Vec<Result<(), WireError>> {
-        let results: Vec<Result<(), WireError>> = results
+        let items = results
             .into_iter()
-            .map(|TaskResult { lease, bytes }| {
-                complete(
-                    self.api.clone(),
-                    lease.task_type,
-                    lease.task_id,
-                    lease.token,
-                    &bytes,
-                )
-                .map_err(Into::into)
+            .map(|TaskResult { lease, bytes }| CompleteItem {
+                task_type: lease.task_type,
+                task_id: lease.task_id,
+                lease_token: lease.token,
+                bytes,
             })
+            .collect();
+        let results: Vec<Result<(), WireError>> = complete_batch(&self.api, items)
+            .into_iter()
+            .map(|result| result.map_err(Into::into))
             .collect();
         add(
             &self.counters.completed,
@@ -607,41 +590,7 @@ impl Shared {
             }
             Query::Get { task_type, ids } => {
                 self.require_type(&task_type)?;
-                let leases = api.leased_tasks.leases(&task_type);
-                let records = ids
-                    .into_iter()
-                    .map(|task_id| {
-                        if let Some(result) = self.get(finished_task_key(&task_type, &task_id))? {
-                            return Ok(TaskRecord {
-                                task_id,
-                                status: TaskStatus::Finished,
-                                bytes: Some(result),
-                            });
-                        }
-                        if let Some(lease) = leases.as_ref().and_then(|leases| {
-                            leases
-                                .get(&task_id)
-                                .map(|lease| lease.stored_task.bytes.clone())
-                        }) {
-                            return Ok(TaskRecord {
-                                task_id,
-                                status: TaskStatus::Leased,
-                                bytes: Some(lease),
-                            });
-                        }
-                        let pending = self.get(task_key(&task_type, &task_id))?;
-                        Ok(TaskRecord {
-                            task_id,
-                            status: if pending.is_some() {
-                                TaskStatus::Pending
-                            } else {
-                                TaskStatus::Unknown
-                            },
-                            bytes: pending,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, Error>>()?;
-                Ok(QueryResponse::Records(records))
+                Ok(QueryResponse::Records(get_tasks(api, &task_type, ids)?))
             }
             Query::Scan {
                 task_type,
@@ -650,32 +599,9 @@ impl Shared {
                 limit,
             } => {
                 self.require_type(&task_type)?;
-                let prefix = scope_prefix(&task_type, scope);
-                let after = after.map(|task_id| format!("{prefix}{task_id}"));
                 let limit = limit.clamp(1, MAX_SCAN_LIMIT) as usize;
-                let QueryResult::Page(page) = db_query::query(
-                    api.clone(),
-                    DbQuery::Scan {
-                        prefix,
-                        after,
-                        limit,
-                    },
-                )?
-                else {
-                    return Err(Error::new("Unexpected scan result".into()));
-                };
-                let id_of = |key: &str| task_id_from_key(key).unwrap_or_default().to_string();
-                Ok(QueryResponse::Page {
-                    records: page
-                        .records
-                        .into_iter()
-                        .map(|record| PageRecord {
-                            task_id: id_of(&record.key),
-                            bytes: record.value,
-                        })
-                        .collect(),
-                    next: page.next.as_deref().map(id_of),
-                })
+                let (records, next) = scan_tasks(api, &task_type, scope, after.as_deref(), limit)?;
+                Ok(QueryResponse::Page { records, next })
             }
             Query::EstimateKeys => match db_query::query(api.clone(), DbQuery::EstimateKeys)? {
                 QueryResult::EstimateKeys(keys) => Ok(QueryResponse::Estimate(keys)),
@@ -696,21 +622,7 @@ impl Shared {
             } => {
                 require_admin(admin)?;
                 self.require_type(&task_type)?;
-                // A queued or leased task must go through cancel/complete;
-                // deleting its record underneath would desync the dedup set.
-                if scope == Scope::Pending
-                    && let Some(queue) = api.task_queue.tasks.get(&task_type)
-                    && let Some(task_id) = ids.iter().find(|task_id| queue.2.contains(*task_id))
-                {
-                    return Err(Error::invalid_argument(format!("TaskInFlight: {task_id}")));
-                }
-                for task_id in ids {
-                    let key = match scope {
-                        Scope::Pending => task_key(&task_type, &task_id),
-                        Scope::Finished => finished_task_key(&task_type, &task_id),
-                    };
-                    db_query::query(api.clone(), DbQuery::Delete { key })?;
-                }
+                delete_tasks(api, &task_type, scope, &ids)?;
                 Ok(QueryResponse::Done)
             }
             Query::Purge { task_type, scope } => {
@@ -721,13 +633,6 @@ impl Shared {
                 Ok(QueryResponse::Done)
             }
             Query::Stats => Ok(QueryResponse::Stats(self.stats())),
-        }
-    }
-
-    fn get(&self, key: String) -> Result<Option<Vec<u8>>, Error> {
-        match db_query::query(self.api.clone(), DbQuery::Get { key })? {
-            QueryResult::Record(record) => Ok(record.map(|record| record.value)),
-            _ => Err(Error::new("Unexpected get result".into())),
         }
     }
 
@@ -758,17 +663,13 @@ impl Shared {
             .task_queue
             .tasks
             .iter()
-            .map(|queue| queue.1.len() as u64)
+            .map(|queue| queue.queued_tasks() as u64)
             .sum()
     }
 
+    /// Open tasks across live leases (leases are per chunk; this counts tasks).
     fn active_leases(&self) -> u64 {
-        self.api
-            .leased_tasks
-            .tasks
-            .iter()
-            .map(|leases| leases.len() as u64)
-            .sum()
+        self.api.leased_tasks.open_tasks() as u64
     }
 
     fn load(&self) -> u64 {
@@ -791,11 +692,8 @@ impl Shared {
     }
 }
 
-fn scope_prefix(task_type: &Identifier, scope: Scope) -> String {
-    match scope {
-        Scope::Pending => task_key_prefix(task_type),
-        Scope::Finished => finished_task_key_prefix(task_type),
-    }
+fn lease_ref_parts(lease: LeaseRef) -> (Identifier, String, u64) {
+    (lease.task_type, lease.task_id, lease.token)
 }
 
 fn require_admin(admin: bool) -> Result<(), Error> {
