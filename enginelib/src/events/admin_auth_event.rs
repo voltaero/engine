@@ -49,8 +49,10 @@ impl AdminAuthEvent {
     ctx = api.cfg.config_toml.auth_token.clone()
 )]
 fn admin_auth_handler(event: &mut AdminAuthEvent, token: &Option<String>) {
+    // No configured token grants nothing here; a mod may still grant admin by
+    // handling this event itself.
     match token.as_deref() {
-        None => *event.output.write().unwrap() = true,
+        None => {}
         Some(token) if constant_time_eq(token.as_bytes(), event.payload.as_bytes()) => {
             *event.output.write().unwrap() = true
         }

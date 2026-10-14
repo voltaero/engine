@@ -215,7 +215,8 @@ Strict compatibility check is enabled when `GE_STRICT_MODS` is set.
 - Default `AuthEvent` handler currently allows auth (`true`).
 - Admin auth checks the `config.toml` token (`auth_token`, aliased from the old
   `cgrpc_token`) in `events/admin_auth_event.rs` with a constant-time compare
-  (`subtle`); **unset token = allow** (permissive).
+  (`subtle`); **unset token = no admin** from the core handler (a mod may still
+  grant it by handling `core:admin_auth_event`).
 
 Do not assume secure defaults without verifying handlers/mods.
 

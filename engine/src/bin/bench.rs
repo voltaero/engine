@@ -20,10 +20,13 @@ use std::time::{Duration, Instant};
 
 use enginelib::api::ServerAPI;
 use enginelib::config::{Config, TaskTypeConfig};
+use enginelib::error::ErrorKind;
 use enginelib::nucleus::query::scan_tasks;
 use enginelib::task::{Task, Verifiable};
 use enginelib::transport::client::Client;
-use enginelib::transport::server::{DEFAULT_MAX_INFLIGHT, Server, ServerOptions};
+use enginelib::transport::server::{
+    DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_INFLIGHT_PER_SESSION, Server, ServerOptions,
+};
 use enginelib::wire::{Auth, Caps, LeaseRef, LeaseReq, Leased, Scope, TaskResult};
 use enginelib::{Identifier, Registry};
 
@@ -240,6 +243,7 @@ fn main() {
                 max_message_bytes: 256 * 1024 * 1024,
                 session_idle: Duration::from_secs(900),
                 max_inflight: DEFAULT_MAX_INFLIGHT,
+                max_inflight_per_session: DEFAULT_MAX_INFLIGHT_PER_SESSION,
             },
         )
         .expect("server start")
@@ -320,7 +324,16 @@ fn main() {
                     Some(leased) => leased,
                     None => match client.lease(task_type(), lease, Duration::from_millis(100)) {
                         Ok(leased) => leased,
-                        Err(_) => continue, // QueueEmpty: re-check `done`
+                        // Nothing queued yet: re-check `done` and ask again.
+                        Err(err)
+                            if err.kind() == ErrorKind::NotFound
+                                && err.as_ref() == "QueueEmpty" =>
+                        {
+                            continue;
+                        }
+                        // Anything else (server gone, protocol error) stops this
+                        // worker, which aborts the run instead of spinning.
+                        Err(err) => return Err(format!("lease: {err}")),
                     },
                 };
                 let (results, next) = client

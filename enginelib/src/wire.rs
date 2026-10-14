@@ -12,11 +12,15 @@ use crate::Identifier;
 use crate::error::{Error, ErrorKind};
 
 /// v2: authenticated proxy `Register { info, token }`.
-/// v3: chunked storage (12-byte task ids, per-type settings in `TaskTypeInfo`).
-pub const PROTO_VERSION: u16 = 3;
+/// v3: session key in `Envelope::session` / `Welcome.session`.
+/// v4: chunked storage (12-byte task ids, per-type settings in `TaskTypeInfo`).
+pub const PROTO_VERSION: u16 = 4;
 
 /// Upper bound on tasks handed out by one `Lease` (or `then_lease`).
 pub const MAX_LEASE_BATCH: u32 = 65_536;
+/// Upper bound on how long one `Lease` may wait for its first task; larger
+/// `wait_ms` values are clamped.
+pub const MAX_LEASE_WAIT_MS: u32 = 60_000;
 /// Upper bound on records returned by one `Scan` page.
 pub const MAX_SCAN_LIMIT: u32 = 10_000;
 
