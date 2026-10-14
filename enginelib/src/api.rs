@@ -188,8 +188,51 @@ impl ServerAPI {
             // record loadable has happened since: skip the scan.
             return Ok(Vec::new());
         }
-        let from_start = cursor.is_none();
+        let mut batch = Vec::new();
+        loop {
+            let from_start = cursor.is_none();
+            let reached_end =
+                self.scan_from_cursor(task_type, &prefix, dedup, &mut cursor, &mut batch, max);
 
+            if !reached_end {
+                state.idle_at.store(NOT_IDLE, Ordering::SeqCst);
+                break;
+            }
+            // Task ids are druid hex (nanosecond timestamp first), so keys are only
+            // *roughly* time-ordered: a submit can land behind the cursor. Once a
+            // pass reaches the end of the prefix, start over from the prefix start
+            // so such keys are never skipped for good.
+            *cursor = None;
+            if from_start {
+                // This pass covered the whole prefix: the store holds no loadable
+                // record as of `generation`, so refills can no-op until a submit /
+                // reap / cancel overflow bumps it.
+                state.idle_at.store(generation, Ordering::SeqCst);
+                break;
+            }
+            // A cursor pass hit the end with capacity to spare: wrap around now
+            // instead of on the next refill. Nothing may request that refill (a
+            // submit above the watermark doesn't, and waiting workers already
+            // have), so deferring it could leave workers waiting on pending work.
+            // Records this pass just took are in `dedup` and are skipped.
+            state.idle_at.store(NOT_IDLE, Ordering::SeqCst);
+        }
+        Ok(batch)
+    }
+
+    /// Walks this type's pending records strictly after `cursor` (from the prefix
+    /// start when `None`), moving untaken ones into `batch` until it holds `max`.
+    /// Leaves `cursor` at the last key examined and returns whether the walk
+    /// reached the end of the prefix.
+    fn scan_from_cursor(
+        &self,
+        task_type: &Identifier,
+        prefix: &str,
+        dedup: &DashSet<String>,
+        cursor: &mut Option<Vec<u8>>,
+        batch: &mut Vec<StoredTask>,
+        max: usize,
+    ) -> bool {
         // Bound the iterator to this type's prefix and start it strictly after
         // the last key examined (appending 0x00 yields the key's immediate
         // successor), so RocksDB seeks straight there instead of walking every
@@ -201,14 +244,13 @@ impl ServerAPI {
                 lower.push(0);
                 lower
             }
-            None => prefix.clone().into_bytes(),
+            None => prefix.as_bytes().to_vec(),
         };
         opts.set_iterate_lower_bound(lower);
         if let Some(upper) = prefix_successor(prefix.as_bytes()) {
             opts.set_iterate_upper_bound(upper);
         }
 
-        let mut batch = Vec::new();
         let mut last_key: Option<Box<[u8]>> = None;
         let mut reached_end = true;
         for result in self.db.iterator_opt(IteratorMode::Start, opts) {
@@ -241,25 +283,10 @@ impl ServerAPI {
                 }
             }
         }
-
-        if reached_end {
-            // Task ids are druid hex (nanosecond timestamp first), so keys are only
-            // *roughly* time-ordered: a submit can land behind the cursor. Once a
-            // pass reaches the end of the prefix, the next one starts over from
-            // the prefix start so such keys are never skipped for good.
-            *cursor = None;
-            // If this pass itself covered the whole prefix, the store holds no
-            // loadable record as of `generation`; refills can no-op until a
-            // submit / reap / cancel overflow bumps it.
-            let idle_at = if from_start { generation } else { NOT_IDLE };
-            state.idle_at.store(idle_at, Ordering::SeqCst);
-        } else {
-            if let Some(key) = last_key {
-                *cursor = Some(key.into_vec());
-            }
-            state.idle_at.store(NOT_IDLE, Ordering::SeqCst);
+        if !reached_end && let Some(key) = last_key {
+            *cursor = Some(key.into_vec());
         }
-        Ok(batch)
+        reached_end
     }
 
     /// Asks for an asynchronous refill of `task_type`. At most one refill runs
@@ -376,7 +403,8 @@ const NOT_IDLE: u64 = u64::MAX;
 /// type falls back to a full rescan from the prefix start whenever a record may
 /// have become loadable behind the cursor:
 /// - a cursor pass reached the end of the prefix (covers submits whose druid
-///   key sorts before the cursor);
+///   key sorts before the cursor) — with capacity to spare, the same refill
+///   wraps around at once rather than waiting for another trigger;
 /// - a task's dedup entry was cleared with its record still persisted — lease
 ///   reaping, `cancel` channel overflow, a failed `complete` write, or a refill
 ///   whose `try_send` failed.

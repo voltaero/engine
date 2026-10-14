@@ -2,6 +2,7 @@ use std::sync::{Arc, RwLock};
 
 use macros::{Event, event_handler};
 use rust_rocksdb::DB;
+use subtle::ConstantTimeEq;
 
 use crate::{Identifier, api::ServerAPI};
 
@@ -61,11 +62,7 @@ fn admin_auth_handler(event: &mut AdminAuthEvent, token: &Option<String>) {
 /// the admin token can't be recovered byte-by-byte from response timing. Only the
 /// length is allowed to leak.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let diff = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
-    std::hint::black_box(diff) == 0
+    a.ct_eq(b).into()
 }
 
 #[cfg(test)]
