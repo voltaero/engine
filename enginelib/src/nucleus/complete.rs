@@ -63,6 +63,9 @@ pub fn complete(
         clear_dedup();
         // The refill cursor may already be past this key: force a full rescan.
         api.load_state.get(&task_type).mark_rescan();
+        // Workers already parked in lease() won't ask again: re-enqueue the
+        // still-persisted record now.
+        ServerAPI::request_refill(&api, &task_type);
         return Err(Error::io_error(format!(
             "Failed to persist finished task: {err}"
         )));

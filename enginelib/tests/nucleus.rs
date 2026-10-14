@@ -294,18 +294,15 @@ async fn cursor_load_picks_up_key_before_cursor_after_full_rescan() {
     // skewed clock would). Written raw, so only the cursor logic can find it.
     api.db.put(task_key(&tt, "a0"), b"payload").unwrap();
 
-    // The cursor pass resumes after b2: it finds b3, reaches the end of the
-    // prefix, and does not see a0.
-    assert_eq!(api.refill(&tt).unwrap(), 1);
+    // The cursor pass resumes after b2: it finds b3 and reaches the end of the
+    // prefix with a slot to spare, so the same refill wraps around to a full
+    // pass from the prefix start, which picks a0 up (b1..b3 are skipped as
+    // in-flight).
+    assert_eq!(api.refill(&tt).unwrap(), 2);
     let c = lease_timeout(api.clone(), tt.clone(), "w".into(), WAIT)
         .await
         .unwrap();
     assert_eq!(c.task.task_id, "b3");
-    assert!(!in_dedup(&api, "a0"));
-
-    // Having reached the end, the next pass is a full rescan from the prefix
-    // start, which picks a0 up (b1..b3 are skipped as in-flight).
-    assert_eq!(api.refill(&tt).unwrap(), 1);
     let d = lease_timeout(api.clone(), tt.clone(), "w".into(), WAIT)
         .await
         .unwrap();
@@ -324,6 +321,72 @@ async fn cursor_load_picks_up_key_before_cursor_after_full_rescan() {
         .unwrap();
     }
     assert!(api.task_queue.tasks.get(&tt).unwrap().2.is_empty());
+}
+
+#[tokio::test]
+async fn drained_queue_finds_key_behind_cursor_at_prefix_end() {
+    // Capacity 2: the first load fills the queue exactly at the last key, so the
+    // cursor stops there without having reached the end of the prefix.
+    let (api, _dir) = setup("cursor-tail", 2, 300);
+    let tt = task_type();
+    for id in ["b1", "b2"] {
+        api.db.put(task_key(&tt, id), b"payload").unwrap();
+    }
+    ServerAPI::load(&api, tt.clone()).await.unwrap();
+
+    // A record lands behind the cursor while the queue is full (a submit above
+    // the watermark requests no refill).
+    api.db.put(task_key(&tt, "a0"), b"payload").unwrap();
+    api.load_state.get(&tt).note_submitted();
+
+    // Draining a full queue of capacity 2 never dips below the watermark.
+    let a = lease_timeout(api.clone(), tt.clone(), "w".into(), WAIT)
+        .await
+        .unwrap();
+    let b = lease_timeout(api.clone(), tt.clone(), "w".into(), WAIT)
+        .await
+        .unwrap();
+    assert_eq!(
+        (a.task.task_id.as_str(), b.task.task_id.as_str()),
+        ("b1", "b2")
+    );
+
+    // The refill on the drained queue finds nothing after the cursor; a0 must
+    // still be loaded rather than leave the worker waiting. (The one-pass wrap
+    // itself is pinned down by `cursor_load_picks_up_key_before_cursor...`.)
+    let c = lease_timeout(api.clone(), tt.clone(), "w".into(), WAIT)
+        .await
+        .unwrap();
+    assert_eq!(c.task.task_id, "a0");
+}
+
+#[tokio::test]
+async fn parked_workers_drain_backlog_through_tiny_queue() {
+    let (api, _dir) = setup("tiny", 1, 300);
+    let tt = task_type();
+
+    // Two workers park on an empty store. The first one's refill finds nothing
+    // and marks the type idle, so the second one's request is a no-op.
+    let w1 = tokio::spawn(lease_timeout(api.clone(), tt.clone(), "a".into(), WAIT));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let w2 = tokio::spawn(lease_timeout(api.clone(), tt.clone(), "b".into(), WAIT));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Two records arrive, and a single refill pass runs (as when several workers'
+    // requests fold into one); it can only queue one of them.
+    for id in ["t1", "t2"] {
+        api.db.put(task_key(&tt, id), b"payload").unwrap();
+    }
+    api.load_state.get(&tt).note_submitted();
+    assert_eq!(api.refill(&tt).unwrap(), 1);
+
+    // The worker that takes t1 must ask for another refill so the other one
+    // gets t2 instead of waiting out its timeout.
+    let first = w1.await.unwrap().unwrap();
+    let second = w2.await.unwrap().unwrap();
+    let mut ids = [first.task.task_id.clone(), second.task.task_id.clone()];
+    ids.sort();
+    assert_eq!(ids, ["t1".to_string(), "t2".to_string()]);
 }
 
 #[tokio::test]

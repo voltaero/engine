@@ -57,6 +57,13 @@ async fn lease_inner(
     };
     let task = received.map_err(|err| Error::new(format!("Task queue closed: {err}")))?;
 
+    // Ask again after taking a task: other workers may be parked on this queue
+    // with their own pre-wait requests already folded into the refill that
+    // produced this task, and a small queue can't hold enough for all of them.
+    if ServerAPI::below_watermark(receiver.len(), capacity) {
+        ServerAPI::request_refill(&api, &task_type);
+    }
+
     // No await from here on: the task goes from "queued" straight to "leased"
     // (its task_id stays in the dedup set throughout).
     let stored_task = Arc::new(task);

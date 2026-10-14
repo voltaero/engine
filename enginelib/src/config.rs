@@ -1,4 +1,4 @@
-use std::{fs, io::Error, path::Path};
+use std::{fs, io::ErrorKind, path::Path};
 
 use serde::{Deserialize, Serialize};
 use tracing::{error, instrument};
@@ -66,21 +66,36 @@ impl Config {
         Self::from_file("config.toml")
     }
 
-    /// Loads the config from `path`; a missing file or parse error falls back to
-    /// defaults (parse errors are logged).
+    /// Loads the config from `path`; a missing file falls back to defaults.
+    ///
+    /// # Panics
+    /// If the file exists but can't be read or parsed. Falling back to defaults
+    /// there would drop the configured `auth_token`, and an unset token makes
+    /// admin auth permissive. See [`Config::try_from_file`].
     #[instrument(skip_all)]
     pub fn from_file(path: impl AsRef<Path>) -> Self {
-        let mut content: String = "".to_owned();
-        let result: Result<String, Error> = fs::read_to_string(path);
-        if let Ok(file_content) = result {
-            content = file_content;
-        }
-        let config_toml: ConfigTomlServer = toml::from_str(&content).unwrap_or_else(|err| {
-            error!("Failed to parse config file.");
-            error!("{:#?}", err);
-            ConfigTomlServer::default()
-        });
-        Self { config_toml }
+        Self::try_from_file(path).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    /// Like [`Config::from_file`], but returns a descriptive error instead of
+    /// panicking when the file exists but can't be read or parsed.
+    pub fn try_from_file(path: impl AsRef<Path>) -> Result<Self, String> {
+        let path = path.as_ref();
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
+            Err(err) => {
+                return Err(format!(
+                    "Failed to read config file {}: {err}",
+                    path.display()
+                ));
+            }
+        };
+        let config_toml: ConfigTomlServer = toml::from_str(&content).map_err(|err| {
+            error!("Failed to parse config file {}: {err}", path.display());
+            format!("Invalid config file {}: {err}", path.display())
+        })?;
+        Ok(Self { config_toml })
     }
 }
 
@@ -109,5 +124,26 @@ mod tests {
         assert_eq!(cfg.auth_token, None);
         assert_eq!(cfg.lease_ttl_secs, 300);
         assert_eq!(cfg.reap_interval_secs, 15);
+    }
+
+    #[test]
+    fn invalid_file_fails_closed_instead_of_dropping_the_token() {
+        let path = std::env::temp_dir().join(format!(
+            "enginelib-config-invalid-{}.toml",
+            std::process::id()
+        ));
+        // A type error in a numeric field must not silently discard auth_token.
+        fs::write(
+            &path,
+            "auth_token = \"secret\"\nqueue_capacity = \"8192\"\n",
+        )
+        .unwrap();
+        let result = Config::try_from_file(&path);
+        let panicked = std::panic::catch_unwind(|| Config::from_file(&path)).is_err();
+        let _ = fs::remove_file(&path);
+
+        let err = result.unwrap_err();
+        assert!(err.contains("queue_capacity"), "{err}");
+        assert!(panicked);
     }
 }
