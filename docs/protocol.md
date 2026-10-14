@@ -20,7 +20,7 @@ ZeroMQ over TCP. ZeroMQ does the framing; each message is one
 postcard-encoded envelope:
 
 ```
-Envelope { req_id: u64, body: Request | Response | ProxyRequest | ProxyResponse }
+Envelope { req_id: u64, session: u128, body: Request | Response | ProxyRequest | ProxyResponse }
 ```
 
 - Server: `ROUTER` bound on `host`. Clients: `DEALER`. Proxy: `ROUTER` bound on
@@ -46,7 +46,7 @@ dropped.
 
 ```
 C → S  Hello   { proto_ver, auth: Auth, caps: Caps }
-S → C  Welcome { proto_ver, server_id, lease_ttl_secs, task_types: [TaskTypeInfo] }
+S → C  Welcome { proto_ver, server_id, session: u128, lease_ttl_secs, task_types: [TaskTypeInfo] }
      | Error   { kind, message }
 
 Auth = { uid, challenge, admin_token: Option<String> }
@@ -57,9 +57,14 @@ Caps = { runners: [Cpu | Hip], max_inflight }
   mod can verify `challenge` as a proxy-issued ticket).
 - `admin_token`, if present, goes through `core:admin_auth_event`; success
   grants `Delete`/`Purge`. No token → never admin.
-- The `uid` is bound to the connection (ROUTER identity); later messages don't
-  carry it. Any request before `Hello` → `Error{InvalidArgument,
-  "NotAuthenticated"}`. Sessions idle for `session_idle_secs` are dropped; the
+- The `uid` is bound to the session: the ROUTER identity **plus** the random
+  `session` key from `Welcome`, which the client sends in `Envelope::session`
+  on every later request (zero on the handshake, responses and proxy
+  traffic). The routing identity alone is peer-chosen, so a peer reusing a
+  disconnected client's identity without the key gets nothing; a fresh
+  `Hello` under that identity only replaces the session (the original client
+  re-handshakes). Later messages don't carry the uid. Any request before
+  `Hello`, or with a wrong key → `Error{InvalidArgument, "NotAuthenticated"}`. Sessions idle for `session_idle_secs` are dropped; the
   client re-`Hello`s automatically on `NotAuthenticated`.
 - Version mismatch → `Error{NotSupported}`.
 

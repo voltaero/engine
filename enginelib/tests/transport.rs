@@ -596,3 +596,46 @@ fn proxy_refuses_registration_without_the_token() {
     let (servers, _) = resolve(closed.endpoint(), None, &auth(None), WAIT).unwrap();
     assert!(servers.is_empty());
 }
+
+/// One raw DEALER round trip under a chosen routing identity and session key.
+fn raw_call(endpoint: &str, identity: &[u8], session: u128, request: &Request) -> Response {
+    let socket = zmq::Context::new().socket(zmq::DEALER).unwrap();
+    socket.set_linger(0).unwrap();
+    socket.set_identity(identity).unwrap();
+    socket.set_rcvtimeo(5000).unwrap();
+    socket.connect(endpoint).unwrap();
+    let bytes = enginelib::wire::encode_in_session(1, session, request).unwrap();
+    socket.send(bytes, 0).unwrap();
+    let reply = socket.recv_bytes(0).unwrap();
+    enginelib::wire::decode::<Response>(&reply).unwrap().body
+}
+
+#[test]
+fn reused_identity_does_not_inherit_session() {
+    let harness = start("session-theft", Some("secret"), None);
+    let endpoint = harness.server.endpoint();
+    let hello = Request::Hello {
+        proto_ver: enginelib::wire::PROTO_VERSION,
+        auth: auth(Some("secret")),
+        caps: Caps::default(),
+    };
+    let Response::Welcome { session, .. } = raw_call(endpoint, b"victim", 0, &hello) else {
+        panic!("expected welcome");
+    };
+    assert_ne!(session, 0);
+
+    // The victim has disconnected; a new peer claims its identity. Without the
+    // session key it gets nothing, with a wrong one neither.
+    let stats = Request::Query(Query::Stats);
+    for key in [0, session ^ 1] {
+        let Response::Error(err) = raw_call(endpoint, b"victim", key, &stats) else {
+            panic!("stolen identity was accepted");
+        };
+        assert_eq!(err.message, "NotAuthenticated");
+    }
+    // The real key still works.
+    assert!(matches!(
+        raw_call(endpoint, b"victim", session, &stats),
+        Response::Query(QueryResponse::Stats(_))
+    ));
+}

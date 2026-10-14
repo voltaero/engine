@@ -16,7 +16,7 @@ use rust_rocksdb::WriteBatch;
 use tokio::runtime::Handle;
 use tracing::{debug, error, info, warn};
 
-use super::{Background, POLL_MS, context, sleep_unless_stopped, zmq_err};
+use super::{Background, POLL_MS, constant_time_eq, context, sleep_unless_stopped, zmq_err};
 use crate::api::{
     ServerAPI, finished_task_key, finished_task_key_prefix, task_id_from_key, task_key,
     task_key_prefix,
@@ -277,7 +277,9 @@ fn dispatch(shared: &Arc<Shared>, runtime: &Handle, identity: Vec<u8>, payload: 
         let (req_id, response) = match wire::decode::<Request>(&payload) {
             Ok(envelope) => (
                 envelope.req_id,
-                shared.handle(&identity, envelope.body).await,
+                shared
+                    .handle(&identity, envelope.session, envelope.body)
+                    .await,
             ),
             Err(err) => (0, Response::Error(err.into())),
         };
@@ -416,6 +418,8 @@ impl ReplyPool {
 }
 
 struct Session {
+    /// Random key handed out in `Welcome`; every later request must carry it.
+    key: u128,
     uid: String,
     admin: bool,
     last_seen: Instant,
@@ -480,7 +484,12 @@ impl Shared {
         Ok(())
     }
 
-    async fn handle(self: &Arc<Self>, identity: &[u8], request: Request) -> Response {
+    async fn handle(
+        self: &Arc<Self>,
+        identity: &[u8],
+        session_key: u128,
+        request: Request,
+    ) -> Response {
         if let Request::Hello {
             proto_ver, auth, ..
         } = request
@@ -488,13 +497,17 @@ impl Shared {
             return self.hello(identity, proto_ver, auth);
         }
 
-        // Every other request needs a session; refresh its idle timer.
+        // Every other request needs a session; refresh its idle timer. The
+        // routing identity is peer-chosen (a peer can reuse a disconnected
+        // client's), so the session key from `Welcome` must match too.
         let (uid, admin) = match self.sessions.get_mut(identity) {
-            Some(mut session) => {
+            Some(mut session)
+                if constant_time_eq(&session.key.to_le_bytes(), &session_key.to_le_bytes()) =>
+            {
                 session.last_seen = Instant::now();
                 (session.uid.clone(), session.admin)
             }
-            None => return not_authenticated(),
+            _ => return not_authenticated(),
         };
 
         match request {
@@ -608,9 +621,14 @@ impl Shared {
                 api.db.clone(),
             )
         });
+        // Re-handshaking under an identity replaces its session, so a peer
+        // reusing someone's identity can at worst force that client to `Hello`
+        // again (it does so automatically); it never inherits the session.
+        let key: u128 = rand::random();
         self.sessions.insert(
             identity.to_vec(),
             Session {
+                key,
                 uid: auth.uid,
                 admin,
                 last_seen: Instant::now(),
@@ -619,6 +637,7 @@ impl Shared {
         Response::Welcome {
             proto_ver: PROTO_VERSION,
             server_id: self.server_id,
+            session: key,
             lease_ttl_secs: api.cfg.config_toml.lease_ttl_secs,
             task_types: self
                 .task_types()

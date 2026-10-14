@@ -580,6 +580,7 @@ dependencies = [
  "macros",
  "oxifs",
  "postcard",
+ "rand",
  "rust-rocksdb",
  "serde",
  "subtle",
