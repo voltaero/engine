@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use rust_rocksdb::WriteBatch;
 use tokio::runtime::Handle;
 use tracing::{debug, error, info, warn};
 
@@ -29,8 +30,8 @@ use crate::nucleus::{
 };
 use crate::wire::{
     self, Auth, LeaseRef, Leased, LeasedItem, MAX_LEASE_BATCH, MAX_SCAN_LIMIT, PROTO_VERSION,
-    PageRecord, ProxyRequest, Query, QueryResponse, Request, Response, Scope, ServerInfo, Stats,
-    TaskRecord, TaskResult, TaskStatus, TaskTypeInfo, WireError,
+    PageRecord, ProxyRequest, ProxyResponse, Query, QueryResponse, Request, Response, Scope,
+    ServerInfo, Stats, TaskRecord, TaskResult, TaskStatus, TaskTypeInfo, WireError,
 };
 use crate::{Identifier, Registry};
 
@@ -39,6 +40,11 @@ use crate::{Identifier, Registry};
 const HWM: i32 = 100_000;
 /// Inbound messages handled per poll wakeup before replies get a turn.
 const RECV_BURST: usize = 1024;
+/// Default cap on requests being handled at once (see
+/// [`ServerOptions::max_inflight`]).
+pub const DEFAULT_MAX_INFLIGHT: usize = 65_536;
+/// Pending records deleted per refill-excluding step of a `Purge`.
+const PURGE_PAGE: usize = 10_000;
 
 #[derive(Debug, Clone)]
 pub struct ServerOptions {
@@ -49,9 +55,15 @@ pub struct ServerOptions {
     pub advertise: Option<String>,
     /// Proxy endpoint to register with, if any.
     pub proxy: Option<String>,
+    /// Shared secret sent with every proxy registration (`proxy_token`).
+    pub proxy_token: Option<String>,
     pub heartbeat: Duration,
     pub max_message_bytes: i64,
     pub session_idle: Duration,
+    /// Most requests handled at once. When reached, the I/O thread stops reading
+    /// the ROUTER until a handler finishes, so ZeroMQ's high-water marks push
+    /// back on clients instead of memory growing. Parked `Lease` waits count.
+    pub max_inflight: usize,
 }
 
 impl ServerOptions {
@@ -61,9 +73,11 @@ impl ServerOptions {
             server_id: cfg.server_id,
             advertise: cfg.advertise.as_deref().map(wire::endpoint),
             proxy: cfg.proxy.as_deref().map(wire::endpoint),
+            proxy_token: cfg.proxy_token.clone(),
             heartbeat: Duration::from_secs(cfg.heartbeat_secs.max(1)),
             max_message_bytes: cfg.max_message_bytes,
             session_idle: Duration::from_secs(cfg.session_idle_secs.max(1)),
+            max_inflight: DEFAULT_MAX_INFLIGHT,
         }
     }
 }
@@ -130,6 +144,8 @@ impl Server {
             sessions: DashMap::new(),
             counters: Counters::default(),
             started: Instant::now(),
+            inflight: AtomicUsize::new(0),
+            max_inflight: opts.max_inflight.max(1),
             replies: ReplyPool {
                 ctx,
                 endpoint: reply_endpoint,
@@ -138,12 +154,14 @@ impl Server {
         });
 
         let stop = Arc::new(AtomicBool::new(false));
-        let mut threads = Vec::new();
+        // Owns the threads from the start: if a later step fails, dropping it
+        // stops and joins whatever already runs, releasing the bound port.
+        let mut background = Background::new(bound.clone(), stop.clone(), Vec::new());
         {
             let shared = shared.clone();
             let stop = stop.clone();
             let session_idle = opts.session_idle;
-            threads.push(
+            background.threads.push(
                 std::thread::Builder::new()
                     .name("engine-zmq-io".into())
                     .spawn(move || {
@@ -163,10 +181,16 @@ impl Server {
                 warn!("Announcing wildcard endpoint {advertise} to the proxy; set `advertise`");
             }
             let heartbeat = opts.heartbeat;
-            threads.push(
+            let token = opts.proxy_token.clone().unwrap_or_default();
+            if token.is_empty() {
+                warn!("`proxy_token` is unset; the proxy will refuse this server's registration");
+            }
+            background.threads.push(
                 std::thread::Builder::new()
                     .name("engine-zmq-heartbeat".into())
-                    .spawn(move || heartbeat_loop(&shared, &proxy, &advertise, heartbeat, &stop))
+                    .spawn(move || {
+                        heartbeat_loop(&shared, &proxy, &advertise, &token, heartbeat, &stop)
+                    })
                     .map_err(|err| {
                         Error::io_error(format!("Failed to spawn heartbeat thread: {err}"))
                     })?,
@@ -174,7 +198,7 @@ impl Server {
         }
 
         info!("Server {} listening on {bound}", opts.server_id);
-        Ok(Background::new(bound, stop, threads))
+        Ok(background)
     }
 }
 
@@ -188,15 +212,22 @@ fn io_loop(
 ) {
     let mut last_sweep = Instant::now();
     while !stop.load(Ordering::SeqCst) {
+        // At the in-flight cap, only wait for replies: inbound messages stay in
+        // ZeroMQ's queues (and, past the HWM, in TCP) until a handler finishes.
+        let saturated = shared.saturated();
         let mut items = [
-            router.as_poll_item(zmq::POLLIN),
             replies_in.as_poll_item(zmq::POLLIN),
+            router.as_poll_item(if saturated {
+                zmq::PollEvents::empty()
+            } else {
+                zmq::POLLIN
+            }),
         ];
         if let Err(err) = zmq::poll(&mut items, POLL_MS) {
             error!("zmq poll failed: {err}");
             return;
         }
-        let (inbound, outbound) = (items[0].is_readable(), items[1].is_readable());
+        let (outbound, inbound) = (items[0].is_readable(), items[1].is_readable());
 
         if outbound {
             // Forward every pending reply. A peer that has gone away (or whose
@@ -210,6 +241,9 @@ fn io_loop(
 
         if inbound {
             for _ in 0..RECV_BURST {
+                if shared.saturated() {
+                    break;
+                }
                 let frames = match router.recv_multipart(zmq::DONTWAIT) {
                     Ok(frames) => frames,
                     Err(zmq::Error::EAGAIN) => break,
@@ -237,6 +271,7 @@ fn io_loop(
 }
 
 fn dispatch(shared: &Arc<Shared>, runtime: &Handle, identity: Vec<u8>, payload: Vec<u8>) {
+    let slot = InflightSlot::acquire(shared);
     let shared = shared.clone();
     runtime.spawn(async move {
         let (req_id, response) = match wire::decode::<Request>(&payload) {
@@ -246,6 +281,9 @@ fn dispatch(shared: &Arc<Shared>, runtime: &Handle, identity: Vec<u8>, payload: 
             ),
             Err(err) => (0, Response::Error(err.into())),
         };
+        // Free the slot before handing over the reply, so the I/O thread sees
+        // the capacity as soon as it wakes for the reply.
+        drop(slot);
         match wire::encode(req_id, &response) {
             Ok(bytes) => shared.replies.send(identity, bytes),
             Err(err) => error!("Failed to encode response: {err}"),
@@ -253,10 +291,26 @@ fn dispatch(shared: &Arc<Shared>, runtime: &Handle, identity: Vec<u8>, payload: 
     });
 }
 
+/// One handler's share of [`ServerOptions::max_inflight`]; released on drop,
+/// including when the handler panics.
+struct InflightSlot(Arc<Shared>);
+impl InflightSlot {
+    fn acquire(shared: &Arc<Shared>) -> Self {
+        shared.inflight.fetch_add(1, Ordering::SeqCst);
+        Self(shared.clone())
+    }
+}
+impl Drop for InflightSlot {
+    fn drop(&mut self) {
+        self.0.inflight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 fn heartbeat_loop(
     shared: &Arc<Shared>,
     proxy: &str,
     advertise: &str,
+    token: &str,
     interval: Duration,
     stop: &AtomicBool,
 ) {
@@ -274,6 +328,7 @@ fn heartbeat_loop(
         return;
     }
     let mut req_id = 0u64;
+    let mut refused = false;
     loop {
         let info = ServerInfo {
             server_id: shared.server_id,
@@ -282,7 +337,11 @@ fn heartbeat_loop(
             load: shared.load(),
         };
         req_id += 1;
-        match wire::encode(req_id, &ProxyRequest::Register(info)) {
+        let request = ProxyRequest::Register {
+            info,
+            token: token.to_string(),
+        };
+        match wire::encode(req_id, &request) {
             // DONTWAIT: while the proxy is unreachable heartbeats are simply
             // skipped; ZeroMQ reconnects on its own.
             Ok(bytes) => {
@@ -290,8 +349,21 @@ fn heartbeat_loop(
             }
             Err(err) => error!("Failed to encode heartbeat: {err}"),
         }
-        // Drain acknowledgements; they carry nothing we act on.
-        while socket.recv_bytes(zmq::DONTWAIT).is_ok() {}
+        // Drain acknowledgements; only a refusal (bad `proxy_token`) matters,
+        // logged once per change so a misconfiguration is visible but not noisy.
+        while let Ok(bytes) = socket.recv_bytes(zmq::DONTWAIT) {
+            match wire::decode::<ProxyResponse>(&bytes).map(|envelope| envelope.body) {
+                Ok(ProxyResponse::Error(err)) if !refused => {
+                    refused = true;
+                    error!("Proxy {proxy} refused registration: {}", err.message);
+                }
+                Ok(ProxyResponse::Registered) if refused => {
+                    refused = false;
+                    info!("Registered with proxy {proxy}");
+                }
+                _ => {}
+            }
+        }
         if !sleep_unless_stopped(stop, interval) {
             return;
         }
@@ -364,6 +436,8 @@ struct Shared {
     counters: Counters,
     started: Instant,
     replies: ReplyPool,
+    inflight: AtomicUsize,
+    max_inflight: usize,
 }
 
 fn not_authenticated() -> Response {
@@ -378,6 +452,34 @@ fn add(counter: &AtomicU64, n: usize) {
 }
 
 impl Shared {
+    fn saturated(&self) -> bool {
+        self.inflight.load(Ordering::SeqCst) >= self.max_inflight
+    }
+
+    /// Refuses to act on a lease held by another uid. Tokens come from a
+    /// counter, so they fence stale holders but can be guessed; ownership is
+    /// what stops one worker from renewing, completing or cancelling another's
+    /// lease. A (task_id, token) pair names one lease whose holder never
+    /// changes, so this check can't be raced by reaping or re-leasing. Leases
+    /// that are gone or held under another token pass through: the nucleus op
+    /// rejects them (or treats a `complete` as an idempotent retry).
+    fn check_owner(&self, lease: &LeaseRef, uid: &str) -> Result<(), Error> {
+        let not_owned = self
+            .api
+            .leased_tasks
+            .leases(&lease.task_type)
+            .and_then(|leases| {
+                leases
+                    .get(&lease.task_id)
+                    .map(|held| held.token == lease.token && held.user_id != uid)
+            })
+            .unwrap_or(false);
+        if not_owned {
+            return Err(Error::invalid_argument("LeaseNotOwned"));
+        }
+        Ok(())
+    }
+
     async fn handle(self: &Arc<Self>, identity: &[u8], request: Request) -> Response {
         if let Request::Hello {
             proto_ver, auth, ..
@@ -417,6 +519,7 @@ impl Shared {
                 results: leases
                     .into_iter()
                     .map(|lease| {
+                        self.check_owner(&lease, &uid)?;
                         renew(
                             self.api.clone(),
                             lease.task_type,
@@ -424,8 +527,8 @@ impl Shared {
                             lease.token,
                         )
                         .map(wire::unix_ms)
-                        .map_err(Into::into)
                     })
+                    .map(|result| result.map_err(Into::into))
                     .collect(),
             },
             Request::Complete {
@@ -433,8 +536,10 @@ impl Shared {
                 then_lease,
             } => {
                 let this = self.clone();
+                let owner = uid.clone();
                 let results =
-                    match tokio::task::spawn_blocking(move || this.complete(results)).await {
+                    match tokio::task::spawn_blocking(move || this.complete(results, &owner)).await
+                    {
                         Ok(results) => results,
                         Err(err) => return Response::Error(Error::new(err.to_string()).into()),
                     };
@@ -451,15 +556,16 @@ impl Shared {
             Request::CancelLease { leases } => {
                 let results: Vec<Result<(), WireError>> = leases
                     .into_iter()
-                    .map(
-                        |LeaseRef {
-                             task_type,
-                             task_id,
-                             token,
-                         }| {
-                            cancel(self.api.clone(), task_type, task_id, token).map_err(Into::into)
-                        },
-                    )
+                    .map(|lease| {
+                        self.check_owner(&lease, &uid)?;
+                        let LeaseRef {
+                            task_type,
+                            task_id,
+                            token,
+                        } = lease;
+                        cancel(self.api.clone(), task_type, task_id, token)
+                    })
+                    .map(|result| result.map_err(Into::into))
                     .collect();
                 add(
                     &self.counters.cancelled,
@@ -566,10 +672,11 @@ impl Shared {
         })
     }
 
-    fn complete(&self, results: Vec<TaskResult>) -> Vec<Result<(), WireError>> {
+    fn complete(&self, results: Vec<TaskResult>, uid: &str) -> Vec<Result<(), WireError>> {
         let results: Vec<Result<(), WireError>> = results
             .into_iter()
             .map(|TaskResult { lease, bytes }| {
+                self.check_owner(&lease, uid)?;
                 complete(
                     self.api.clone(),
                     lease.task_type,
@@ -577,8 +684,8 @@ impl Shared {
                     lease.token,
                     &bytes,
                 )
-                .map_err(Into::into)
             })
+            .map(|result| result.map_err(Into::into))
             .collect();
         add(
             &self.counters.completed,
@@ -629,15 +736,26 @@ impl Shared {
                                 bytes: Some(lease),
                             });
                         }
-                        let pending = self.get(task_key(&task_type, &task_id))?;
+                        if let Some(pending) = self.get(task_key(&task_type, &task_id))? {
+                            return Ok(TaskRecord {
+                                task_id,
+                                status: TaskStatus::Pending,
+                                bytes: Some(pending),
+                            });
+                        }
+                        // `complete` drops the lease, then swaps `t:` for `f:` in
+                        // one batch. A task that finished after the first check
+                        // has no lease or pending record any more but already has
+                        // its finished record, so look once more before Unknown.
+                        let finished = self.get(finished_task_key(&task_type, &task_id))?;
                         Ok(TaskRecord {
                             task_id,
-                            status: if pending.is_some() {
-                                TaskStatus::Pending
+                            status: if finished.is_some() {
+                                TaskStatus::Finished
                             } else {
                                 TaskStatus::Unknown
                             },
-                            bytes: pending,
+                            bytes: finished,
                         })
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
@@ -696,31 +814,96 @@ impl Shared {
             } => {
                 require_admin(admin)?;
                 self.require_type(&task_type)?;
-                // A queued or leased task must go through cancel/complete;
-                // deleting its record underneath would desync the dedup set.
-                if scope == Scope::Pending
-                    && let Some(queue) = api.task_queue.tasks.get(&task_type)
-                    && let Some(task_id) = ids.iter().find(|task_id| queue.2.contains(*task_id))
-                {
-                    return Err(Error::invalid_argument(format!("TaskInFlight: {task_id}")));
-                }
-                for task_id in ids {
-                    let key = match scope {
-                        Scope::Pending => task_key(&task_type, &task_id),
-                        Scope::Finished => finished_task_key(&task_type, &task_id),
-                    };
-                    db_query::query(api.clone(), DbQuery::Delete { key })?;
+                match scope {
+                    Scope::Pending => self.delete_pending(&task_type, &ids)?,
+                    Scope::Finished => {
+                        let mut batch = WriteBatch::default();
+                        for task_id in &ids {
+                            batch.delete(finished_task_key(&task_type, task_id));
+                        }
+                        write(api, batch)?;
+                    }
                 }
                 Ok(QueryResponse::Done)
             }
             Query::Purge { task_type, scope } => {
                 require_admin(admin)?;
                 self.require_type(&task_type)?;
-                let prefix = scope_prefix(&task_type, scope);
-                db_query::query(api.clone(), DbQuery::PurgePrefix { prefix })?;
+                match scope {
+                    Scope::Pending => self.purge_pending(&task_type)?,
+                    Scope::Finished => {
+                        let prefix = scope_prefix(&task_type, scope);
+                        db_query::query(api.clone(), DbQuery::PurgePrefix { prefix })?;
+                    }
+                }
                 Ok(QueryResponse::Done)
             }
             Query::Stats => Ok(QueryResponse::Stats(self.stats())),
+        }
+    }
+
+    /// Deletes the pending records of `ids`, refusing the whole request if any
+    /// is queued or leased: those must go through cancel/complete, and deleting
+    /// their record underneath would lose the task on reap or restart. Runs with
+    /// refill excluded, so no id can be queued between the check and the delete.
+    fn delete_pending(&self, task_type: &Identifier, ids: &[String]) -> Result<(), Error> {
+        let api = &self.api;
+        // Same lock order as `refill`: queue map guard, then the refill lock.
+        let queue = api.task_queue.tasks.get(task_type);
+        let dedup = queue.as_ref().map(|queue| &queue.2);
+        api.load_state.get(task_type).exclusive(|| {
+            if let Some(task_id) = ids
+                .iter()
+                .find(|task_id| dedup.is_some_and(|dedup| dedup.contains(*task_id)))
+            {
+                return Err(Error::invalid_argument(format!("TaskInFlight: {task_id}")));
+            }
+            let mut batch = WriteBatch::default();
+            for task_id in ids {
+                batch.delete(task_key(task_type, task_id));
+            }
+            write(api, batch)
+        })
+    }
+
+    /// Deletes every pending record of `task_type` that isn't queued or leased;
+    /// in-flight tasks keep their records and finish normally. Walks the prefix
+    /// a page at a time, each page with refill excluded (see `delete_pending`).
+    fn purge_pending(&self, task_type: &Identifier) -> Result<(), Error> {
+        let api = &self.api;
+        let state = api.load_state.get(task_type);
+        let prefix = task_key_prefix(task_type);
+        let mut after = None;
+        loop {
+            let queue = api.task_queue.tasks.get(task_type);
+            let dedup = queue.as_ref().map(|queue| &queue.2);
+            let next = state.exclusive(|| {
+                let QueryResult::Page(page) = db_query::query(
+                    api.clone(),
+                    DbQuery::Scan {
+                        prefix: prefix.clone(),
+                        after: after.clone(),
+                        limit: PURGE_PAGE,
+                    },
+                )?
+                else {
+                    return Err(Error::new("Unexpected scan result".into()));
+                };
+                let mut batch = WriteBatch::default();
+                for record in &page.records {
+                    let in_flight = task_id_from_key(&record.key)
+                        .is_some_and(|id| dedup.is_some_and(|dedup| dedup.contains(id)));
+                    if !in_flight {
+                        batch.delete(record.key.as_bytes());
+                    }
+                }
+                write(api, batch)?;
+                Ok(page.next)
+            })?;
+            match next {
+                Some(next) => after = Some(next),
+                None => return Ok(()),
+            }
         }
     }
 
@@ -796,6 +979,12 @@ fn scope_prefix(task_type: &Identifier, scope: Scope) -> String {
         Scope::Pending => task_key_prefix(task_type),
         Scope::Finished => finished_task_key_prefix(task_type),
     }
+}
+
+fn write(api: &ServerAPI, batch: WriteBatch) -> Result<(), Error> {
+    api.db
+        .write(&batch)
+        .map_err(|err| Error::io_error(format!("Failed to delete records: {err}")))
 }
 
 fn require_admin(admin: bool) -> Result<(), Error> {

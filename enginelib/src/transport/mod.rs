@@ -30,6 +30,16 @@ pub(crate) fn zmq_err(what: &str, err: zmq::Error) -> Error {
     Error::io_error(format!("{what}: {err}"))
 }
 
+/// Compares two secrets in time independent of where they first differ; only
+/// the length leaks.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let diff = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    std::hint::black_box(diff) == 0
+}
+
 /// Background threads of a running server or proxy. Dropping it (or calling
 /// [`Background::shutdown`]) stops them and waits for them to exit.
 pub struct Background {

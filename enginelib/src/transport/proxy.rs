@@ -1,7 +1,6 @@
 //! Discovery proxy: tells clients which server to use. Servers register with a
-//! heartbeat; clients `Resolve` and cache the answer for `ttl_secs`, so the
-//! proxy sees roughly one request per client per TTL and is never on the task
-//! hot path.
+//! heartbeat authenticated by the shared `proxy_token`; clients `Resolve` when
+//! they connect (or fail over), so the proxy is never on the task hot path.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,10 +9,10 @@ use std::time::{Duration, Instant};
 
 use tracing::{error, info, warn};
 
-use super::{Background, POLL_MS, context, zmq_err};
+use super::{Background, POLL_MS, constant_time_eq, context, zmq_err};
 use crate::config::ConfigTomlServer;
-use crate::error::Error;
-use crate::wire::{self, ProxyRequest, ProxyResponse, ServerInfo};
+use crate::error::{Error, ErrorKind};
+use crate::wire::{self, ProxyRequest, ProxyResponse, ServerInfo, WireError};
 
 #[derive(Debug, Clone)]
 pub struct ProxyOptions {
@@ -22,6 +21,10 @@ pub struct ProxyOptions {
     pub ttl_secs: u32,
     /// A server that hasn't heartbeated for this long is no longer handed out.
     pub server_expiry: Duration,
+    /// Shared secret a server must present in `Register`. `None` (or empty) refuses every
+    /// registration: otherwise anyone who can reach the proxy could advertise
+    /// their own endpoint and collect clients' `Hello` credentials.
+    pub token: Option<String>,
 }
 
 impl ProxyOptions {
@@ -31,6 +34,7 @@ impl ProxyOptions {
             endpoint: wire::endpoint(&cfg.proxy_host),
             ttl_secs: 30,
             server_expiry: Duration::from_secs(heartbeat * 3),
+            token: cfg.proxy_token.clone(),
         }
     }
 }
@@ -60,6 +64,9 @@ impl Proxy {
             _ => opts.endpoint.clone(),
         };
 
+        if opts.token.as_deref().is_none_or(str::is_empty) {
+            error!("`proxy_token` is unset: every server registration will be refused");
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let stop = stop.clone();
@@ -111,7 +118,22 @@ fn handle(
     request: ProxyRequest,
 ) -> ProxyResponse {
     match request {
-        ProxyRequest::Register(info) => {
+        ProxyRequest::Register { info, token } => {
+            let authorized = opts
+                .token
+                .as_deref()
+                .filter(|expected| !expected.is_empty())
+                .is_some_and(|expected| constant_time_eq(expected.as_bytes(), token.as_bytes()));
+            if !authorized {
+                warn!(
+                    "Refused registration of server {} ({})",
+                    info.server_id, info.endpoint
+                );
+                return ProxyResponse::Error(WireError {
+                    kind: ErrorKind::InvalidArgument,
+                    message: "RegistrationRefused".into(),
+                });
+            }
             servers.insert(info.server_id, (info, Instant::now()));
             ProxyResponse::Registered
         }

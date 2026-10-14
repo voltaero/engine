@@ -87,6 +87,11 @@ pub struct ConfigTomlServer {
     /// Interval of server -> proxy registration heartbeats.
     #[serde(default = "default_heartbeat_secs")]
     pub heartbeat_secs: u64,
+
+    /// Shared secret servers present when registering with the proxy. The proxy
+    /// refuses every registration while it is unset.
+    #[serde(default)]
+    pub proxy_token: Option<String>,
 }
 impl Default for ConfigTomlServer {
     fn default() -> Self {
@@ -103,6 +108,7 @@ impl Default for ConfigTomlServer {
             max_message_bytes: default_max_message_bytes(),
             session_idle_secs: default_session_idle_secs(),
             heartbeat_secs: default_heartbeat_secs(),
+            proxy_token: None,
         }
     }
 }

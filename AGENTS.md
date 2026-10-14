@@ -52,6 +52,13 @@ Workspace members:
   run on tokio (DB work on the blocking pool) and send replies back over an
   inproc PUSH/PULL pair. Never touch the ROUTER from a handler (zmq sockets are
   not thread-safe).
+- Transport-level guards (`transport/server.rs`): at most `max_inflight`
+  handlers run at once (the I/O thread stops reading the ROUTER when full);
+  `Renew`/`Complete`/`CancelLease` reject a lease held by another session uid
+  (`LeaseNotOwned`) since tokens are guessable; pending `Delete`/`Purge` run
+  under `LoadState::exclusive` (blocks refill) and never touch in-flight tasks.
+- The proxy only accepts `Register` carrying its `proxy_token`
+  (constant-time compare); **unset token = every registration refused**.
 
 ## Data/persistence model (important)
 

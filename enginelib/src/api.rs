@@ -415,6 +415,17 @@ impl LoadState {
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Runs `f` while no refill pass can scan this type's pending records, so no
+    /// task_id joins the dedup set (gets queued) until `f` returns. Lets a caller
+    /// check dedup membership and delete `t:` records as one atomic step.
+    pub fn exclusive<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _cursor = self
+            .cursor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        f()
+    }
+
     /// Records that a new pending record was written (by `submit`).
     pub fn note_submitted(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);

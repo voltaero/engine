@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::Identifier;
 use crate::error::{Error, ErrorKind};
 
-pub const PROTO_VERSION: u16 = 1;
+pub const PROTO_VERSION: u16 = 2;
 
 /// Upper bound on tasks handed out by one `Lease` (or `then_lease`).
 pub const MAX_LEASE_BATCH: u32 = 65_536;
@@ -269,8 +269,9 @@ pub enum ProxyRequest {
         task_type: Option<Identifier>,
         auth: Auth,
     },
-    /// Server heartbeat: announces itself and its current load.
-    Register(ServerInfo),
+    /// Server heartbeat: announces itself and its current load. `token` must
+    /// match the proxy's `proxy_token`, or the registration is refused.
+    Register { info: ServerInfo, token: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
