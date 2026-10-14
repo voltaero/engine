@@ -29,9 +29,10 @@ use crate::nucleus::{
     cancel::cancel, complete::complete, lease::lease_timeout, renew::renew, submit::submit_batch,
 };
 use crate::wire::{
-    self, Auth, LeaseRef, Leased, LeasedItem, MAX_LEASE_BATCH, MAX_SCAN_LIMIT, PROTO_VERSION,
-    PageRecord, ProxyRequest, ProxyResponse, Query, QueryResponse, Request, Response, Scope,
-    ServerInfo, Stats, TaskRecord, TaskResult, TaskStatus, TaskTypeInfo, WireError,
+    self, Auth, LeaseRef, Leased, LeasedItem, MAX_LEASE_BATCH, MAX_LEASE_WAIT_MS, MAX_SCAN_LIMIT,
+    PROTO_VERSION, PageRecord, ProxyRequest, ProxyResponse, Query, QueryResponse, Request,
+    Response, Scope, ServerInfo, Stats, TaskRecord, TaskResult, TaskStatus, TaskTypeInfo,
+    WireError,
 };
 use crate::{Identifier, Registry};
 
@@ -43,6 +44,9 @@ const RECV_BURST: usize = 1024;
 /// Default cap on requests being handled at once (see
 /// [`ServerOptions::max_inflight`]).
 pub const DEFAULT_MAX_INFLIGHT: usize = 65_536;
+/// Default cap on one session's requests being handled at once (see
+/// [`ServerOptions::max_inflight_per_session`]).
+pub const DEFAULT_MAX_INFLIGHT_PER_SESSION: usize = 1024;
 /// Pending records deleted per refill-excluding step of a `Purge`.
 const PURGE_PAGE: usize = 10_000;
 
@@ -64,6 +68,10 @@ pub struct ServerOptions {
     /// the ROUTER until a handler finishes, so ZeroMQ's high-water marks push
     /// back on clients instead of memory growing. Parked `Lease` waits count.
     pub max_inflight: usize,
+    /// Most requests one session may have in flight; beyond it requests are
+    /// refused with `TooManyRequests` instead of parking, so one client can't
+    /// take the whole `max_inflight` budget (e.g. with waiting `Lease`s).
+    pub max_inflight_per_session: usize,
 }
 
 impl ServerOptions {
@@ -78,6 +86,7 @@ impl ServerOptions {
             max_message_bytes: cfg.max_message_bytes,
             session_idle: Duration::from_secs(cfg.session_idle_secs.max(1)),
             max_inflight: DEFAULT_MAX_INFLIGHT,
+            max_inflight_per_session: DEFAULT_MAX_INFLIGHT_PER_SESSION,
         }
     }
 }
@@ -146,6 +155,7 @@ impl Server {
             started: Instant::now(),
             inflight: AtomicUsize::new(0),
             max_inflight: opts.max_inflight.max(1),
+            max_inflight_per_session: opts.max_inflight_per_session.max(1),
             replies: ReplyPool {
                 ctx,
                 endpoint: reply_endpoint,
@@ -423,6 +433,25 @@ struct Session {
     uid: String,
     admin: bool,
     last_seen: Instant,
+    /// This session's requests currently being handled.
+    inflight: Arc<AtomicUsize>,
+}
+
+/// One request's share of a session's in-flight budget; released on drop.
+struct SessionSlot(Arc<AtomicUsize>);
+impl SessionSlot {
+    fn acquire(counter: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
+        if counter.fetch_add(1, Ordering::SeqCst) >= max {
+            counter.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Self(counter.clone()))
+    }
+}
+impl Drop for SessionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Default)]
@@ -442,6 +471,7 @@ struct Shared {
     replies: ReplyPool,
     inflight: AtomicUsize,
     max_inflight: usize,
+    max_inflight_per_session: usize,
 }
 
 fn not_authenticated() -> Response {
@@ -500,14 +530,20 @@ impl Shared {
         // Every other request needs a session; refresh its idle timer. The
         // routing identity is peer-chosen (a peer can reuse a disconnected
         // client's), so the session key from `Welcome` must match too.
-        let (uid, admin) = match self.sessions.get_mut(identity) {
+        let (uid, admin, inflight) = match self.sessions.get_mut(identity) {
             Some(mut session)
                 if constant_time_eq(&session.key.to_le_bytes(), &session_key.to_le_bytes()) =>
             {
                 session.last_seen = Instant::now();
-                (session.uid.clone(), session.admin)
+                (session.uid.clone(), session.admin, session.inflight.clone())
             }
             _ => return not_authenticated(),
+        };
+        let Some(_slot) = SessionSlot::acquire(&inflight, self.max_inflight_per_session) else {
+            return Response::Error(WireError {
+                kind: ErrorKind::InvalidArgument,
+                message: "TooManyRequests".into(),
+            });
         };
 
         match request {
@@ -521,7 +557,7 @@ impl Shared {
                     task_type,
                     uid,
                     max_tasks,
-                    Duration::from_millis(wait_ms.into()),
+                    Duration::from_millis(wait_ms.min(MAX_LEASE_WAIT_MS).into()),
                 )
                 .await
             {
@@ -611,8 +647,8 @@ impl Shared {
                 message: "AuthFailed".into(),
             });
         }
-        // Only a client that presents a token is ever considered for admin, even
-        // though an unset `auth_token` makes the admin check itself permissive.
+        // Only a client that presents a token is ever considered for admin. The
+        // core handler grants it only for a configured, matching `auth_token`.
         let admin = auth.admin_token.is_some_and(|token| {
             Events::CheckAdminAuth(
                 api,
@@ -632,6 +668,7 @@ impl Shared {
                 uid: auth.uid,
                 admin,
                 last_seen: Instant::now(),
+                inflight: Arc::new(AtomicUsize::new(0)),
             },
         );
         Response::Welcome {

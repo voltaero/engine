@@ -14,7 +14,9 @@ use enginelib::task::{Task, Verifiable};
 use enginelib::transport::Background;
 use enginelib::transport::client::{Client, resolve};
 use enginelib::transport::proxy::{Proxy, ProxyOptions};
-use enginelib::transport::server::{DEFAULT_MAX_INFLIGHT, Server, ServerOptions};
+use enginelib::transport::server::{
+    DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_INFLIGHT_PER_SESSION, Server, ServerOptions,
+};
 use enginelib::wire::{
     Auth, Caps, LeaseRef, LeaseReq, Leased, Query, QueryResponse, Request, Response, Scope,
     TaskRecord, TaskResult, TaskStatus,
@@ -121,6 +123,7 @@ fn start_with(
         max_message_bytes: 16 * 1024 * 1024,
         session_idle: Duration::from_secs(60),
         max_inflight: DEFAULT_MAX_INFLIGHT,
+        max_inflight_per_session: DEFAULT_MAX_INFLIGHT_PER_SESSION,
     };
     options(&mut opts);
     let server = {
@@ -638,4 +641,53 @@ fn reused_identity_does_not_inherit_session() {
         raw_call(endpoint, b"victim", session, &stats),
         Response::Query(QueryResponse::Stats(_))
     ));
+}
+
+#[test]
+fn per_session_cap_refuses_instead_of_parking() {
+    let harness = start_with(
+        "session-cap",
+        |_| {},
+        |opts| opts.max_inflight_per_session = 1,
+    );
+    let mut greedy = connect(&harness);
+    let mut other = connect(&harness);
+
+    // The parked lease uses this session's only slot: its next request is
+    // refused at once, while another session is unaffected.
+    greedy
+        .send(&Request::Lease {
+            task_type: task_type(),
+            max_tasks: 1,
+            wait_ms: 1_000,
+        })
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    let started = Instant::now();
+    let err = greedy.stats().unwrap_err();
+    assert_eq!(err.as_ref(), "TooManyRequests");
+    assert!(started.elapsed() < Duration::from_millis(500));
+    other.stats().unwrap();
+    let envelope = greedy.recv(WAIT).unwrap();
+    assert!(matches!(envelope.body, Response::Error(err) if err.message == "QueueEmpty"));
+    // Once the lease is answered the slot is free again.
+    greedy.stats().unwrap();
+}
+
+#[test]
+fn no_configured_token_means_no_admin() {
+    let harness = start("no-admin-token", None, None);
+    let mut client = Client::connect(
+        harness.server.endpoint(),
+        auth(Some("anything")),
+        Caps::default(),
+    )
+    .unwrap();
+    let err = client
+        .query(Query::Purge {
+            task_type: task_type(),
+            scope: Scope::Pending,
+        })
+        .unwrap_err();
+    assert_eq!(err.as_ref(), "AdminRequired");
 }

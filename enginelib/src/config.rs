@@ -128,8 +128,8 @@ impl Config {
     ///
     /// # Panics
     /// If the file exists but can't be read or parsed. Falling back to defaults
-    /// there would drop the configured `auth_token`, and an unset token makes
-    /// admin auth permissive. See [`Config::try_from_file`].
+    /// there would silently drop the configured `auth_token` (disabling admin
+    /// access) and every other setting. See [`Config::try_from_file`].
     #[instrument(skip_all)]
     pub fn from_file(path: impl AsRef<Path>) -> Self {
         Self::try_from_file(path).unwrap_or_else(|err| panic!("{err}"))

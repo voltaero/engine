@@ -37,6 +37,10 @@ pool); replies return to the I/O thread over an inproc PUSH/PULL pair. At most
 `max_inflight` requests (default 65 536, parked `Lease` waits included) are
 handled at once; at the cap the I/O thread stops reading the ROUTER until a
 handler finishes, so ZeroMQ's high-water marks and TCP push back on clients.
+Each session may have at most `max_inflight_per_session` (default 1024) of
+those; beyond it a request is refused at once with `Error{InvalidArgument,
+"TooManyRequests"}` rather than parked, so one client can't hold the whole
+budget.
 
 Client: `call` waits for its own reply; replies to requests issued with `send`
 that arrive meanwhile are kept for `recv`. Late replies to timed-out `call`s are
@@ -56,7 +60,9 @@ Caps = { runners: [Cpu | Hip], max_inflight }
 - `uid` + `challenge` go through `core:auth_event` (default handler: allow; a
   mod can verify `challenge` as a proxy-issued ticket).
 - `admin_token`, if present, goes through `core:admin_auth_event`; success
-  grants `Delete`/`Purge`. No token → never admin.
+  grants `Delete`/`Purge`. No token → never admin. The core handler grants
+  admin only when the server has `auth_token` configured and it matches; with
+  none configured, only a mod handling the event can grant it.
 - The `uid` is bound to the session: the ROUTER identity **plus** the random
   `session` key from `Welcome`, which the client sends in `Envelope::session`
   on every later request (zero on the handshake, responses and proxy
@@ -87,7 +93,7 @@ Leased     { task_type, expires_at_ms, tasks: [LeasedItem { task_id, token, byte
 
 Semantics:
 
-- **Lease** waits up to `wait_ms` for the first task, then takes whatever else
+- **Lease** waits up to `wait_ms` (clamped to 60 000) for the first task, then takes whatever else
   is already queued, up to `max_tasks` (capped at 65 536). Every task gets its
   own fencing token. Nothing queued in time → `Error{NotFound, "QueueEmpty"}`.
 - **Renew**, **Complete**, **CancelLease** are batched with one result per
