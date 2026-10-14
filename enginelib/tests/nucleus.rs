@@ -18,7 +18,7 @@ use enginelib::config::{Config, TaskTypeConfig};
 use enginelib::error::ErrorKind;
 use enginelib::nucleus::complete::{CompleteItem, complete_batch};
 use enginelib::nucleus::lease::{lease_many, try_lease};
-use enginelib::nucleus::query::{get_tasks, scan_tasks};
+use enginelib::nucleus::query::{delete_tasks, get_tasks, purge_tasks, scan_tasks};
 use enginelib::nucleus::submit::{submit, submit_batch};
 use enginelib::nucleus::{cancel::cancel, complete::complete, lease::lease_timeout, renew::renew};
 use enginelib::task::{Task, TaskLimits, Verifiable};
@@ -584,6 +584,9 @@ async fn lease_many_rounds_up_to_whole_chunks() {
     );
     let payloads: Vec<Vec<u8>> = (1..=10u8).map(|i| vec![i]).collect();
     submit_batch(api.clone(), &payloads, task_type()).unwrap();
+    // The insert's background refill pushes chunks one by one; lease_many only
+    // takes what is already queued after the first.
+    wait_queued(&api, 3).await;
     let leases = lease_many(api.clone(), task_type(), "w".into(), 5, WAIT)
         .await
         .unwrap();
@@ -948,6 +951,87 @@ async fn parked_workers_drain_backlog_through_tiny_queue() {
     let mut got = [first.task_ids().remove(0), second.task_ids().remove(0)];
     got.sort();
     assert_eq!(got.to_vec(), ids);
+}
+
+#[tokio::test]
+async fn chunk_above_an_unfinished_insert_loads_once_it_lands() {
+    let (api, _dir) = setup(
+        "capped",
+        Opts {
+            chunk_size: Some(1),
+            ..Default::default()
+        },
+    );
+    let tt = task_type();
+    // Another insert (of any type) reserved a lower seq and is still writing.
+    let blocking = api.chunk_seq.reserve(&api.db, 1).unwrap();
+    let task_id = submit(api.clone(), b"a", tt.clone()).unwrap();
+    assert!(seq_of(&task_id) > blocking.start);
+
+    // Refills stop below the unfinished insert, so nothing loads yet; that
+    // must not mark the type idle.
+    assert_eq!(api.refill(&tt).unwrap(), 0);
+    let waiter = tokio::spawn(lease_timeout(api.clone(), tt.clone(), "w".into(), WAIT));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!waiter.is_finished());
+
+    // The other insert lands and releases its reservation, as `submit_batch`
+    // does: the parked worker gets the chunk without any new request.
+    drop(blocking);
+    ServerAPI::wake_capped(&api);
+    let lease = waiter.await.unwrap().unwrap();
+    assert_eq!(lease.task_ids(), vec![task_id]);
+}
+
+#[tokio::test]
+async fn finished_cleanup_keeps_done_state_of_pending_chunks() {
+    let dir = TempDir::new("cleanup");
+    let opts = Opts {
+        chunk_size: Some(4),
+        ..Default::default()
+    };
+    let tt = task_type();
+    let (done, partial) = {
+        let api = open(&dir, &opts);
+        let payloads: Vec<Vec<u8>> = (1..=8u8).map(|i| vec![i]).collect();
+        let ids = ids(submit_batch(api.clone(), &payloads, tt.clone()).unwrap());
+        let a = lease_one(&api, "w").await;
+        let b = lease_one(&api, "w").await;
+        assert!(
+            complete_ids(&api, &ids[..4], a.token, b"r")
+                .iter()
+                .all(Result::is_ok)
+        );
+        assert!(
+            complete_ids(&api, &ids[4..6], b.token, b"r")
+                .iter()
+                .all(Result::is_ok)
+        );
+
+        // While the partial chunk is leased, a purge keeps its results; the
+        // fully done chunk's record goes.
+        purge_tasks(&api, &tt, Scope::Finished).unwrap();
+        assert!(finished(&api, seq_of(&ids[0])).is_none());
+        assert_eq!(finished(&api, seq_of(&ids[4])).unwrap().done().count(), 2);
+        close(api).await;
+        (ids[..4].to_vec(), ids[4..].to_vec())
+    };
+
+    // After a restart the partial chunk is neither queued nor leased: its
+    // finished record is still the only record of what is done.
+    let api = open(&dir, &opts);
+    let seq = seq_of(&partial[0]);
+    assert!(!in_dedup(&api, seq));
+    let err = delete_tasks(&api, &tt, Scope::Finished, &partial[..1]).unwrap_err();
+    assert!(err.as_ref().starts_with("ChunkNotFinished"), "{err:?}");
+    purge_tasks(&api, &tt, Scope::Finished).unwrap();
+    assert_eq!(finished(&api, seq).unwrap().done().count(), 2);
+    // A chunk without a pending record can still be deleted.
+    delete_tasks(&api, &tt, Scope::Finished, &done[..1]).unwrap();
+
+    // Only the two open tasks run again.
+    let lease = lease_one(&api, "w").await;
+    assert_eq!(lease.task_ids(), partial[2..].to_vec());
 }
 
 #[tokio::test]

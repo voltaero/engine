@@ -158,8 +158,12 @@ trait method) > engine default (`chunk_size` 1024, no size limits). Resolved in
 - Task-level views used by the wire `Query`: `get_tasks` (Finished / Leased /
   Pending / Unknown per task id; reads `t:` before `f:` so a task finishing
   mid-request is never Unknown), `scan_tasks` (pages over tasks, `after`/`next`
-  are task ids), `delete_tasks` / `purge_tasks` (chunk granularity; never touch
-  in-flight chunks; run under `LoadState::exclusive`).
+  are task ids; copies only the page's tasks), `delete_tasks` / `purge_tasks`
+  (chunk granularity; never touch in-flight chunks; run under
+  `LoadState::exclusive`). While a chunk's `t:` record exists its `f:` record is
+  the only record of which tasks are done: finished-scope `Delete` refuses such
+  chunks (`"ChunkNotFinished"`) and `Purge` keeps the `f:` of pending chunks that
+  are in flight or partially done (range tombstones between them).
 
 ### Refill (`ServerAPI::refill`, `request_refill`, `LoadState` in `api.rs`)
 
@@ -169,8 +173,14 @@ trait method) > engine default (`chunk_size` 1024, no size limits). Resolved in
   seq whose insert is still being written). Keys only grow and nothing can land
   below `safe_upto` later, so the cursor never rescans from the start.
 - Anything that clears a dedup entry of a still-pending chunk must call
-  `LoadState::recover(chunk_seq)` *after* clearing it. `mark_rescan()` (reset the
-  cursor) is only for out-of-band `t:` writes.
+  `LoadState::recover(chunk_seq)` *after* clearing it (including a chunk whose
+  load failed on a read error; only a corrupt record is skipped until restart).
+  `mark_rescan()` (reset the cursor) is only for out-of-band `t:` writes.
+- `safe_upto` caps the cursor, so an insert still being written can hide chunks
+  other inserts already wrote above it. A pass that stopped there with
+  `safe_upto < next` sets `LoadState.capped` and never marks the type idle;
+  `submit_batch` calls `ServerAPI::wake_capped` after releasing its reservation
+  to refill those types. Anything else that releases a `SeqReservation` must too.
 - Loading a chunk reads its `f:` record to compute the open indexes (bloom filter
   keeps the "no results yet" probe cheap).
 - `generation` is bumped by `submit` and `recover`; after a pass that reached the

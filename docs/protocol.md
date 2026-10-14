@@ -128,8 +128,9 @@ Get          { task_type, ids }               -> Records [{ task_id, status, byt
 Scan         { task_type, scope, after, limit } -> Page { records: [{ task_id, bytes }], next }
 EstimateKeys                                  -> Estimate (store-wide)
 EstimateSize { task_type, scope }             -> Estimate (bytes)
-Delete       { task_type, scope, ids }        -> Done   (admin; in-flight pending → TaskInFlight)
-Purge        { task_type, scope }             -> Done   (admin; pending: skips in-flight)
+Delete       { task_type, scope, ids }        -> Done   (admin; in flight → TaskInFlight;
+                                                           finished of a pending chunk → ChunkNotFinished)
+Purge        { task_type, scope }             -> Done   (admin; skips in-flight / partially done chunks)
 Stats                                         -> Stats
 
 scope  = Pending | Finished
@@ -139,7 +140,7 @@ Stats  = { server_id, uptime_ms, inserted, leased, completed, cancelled,
 ```
 
 - Everything is O(seek): no unbounded scans; `Scan` pages are capped at 10 000.
-  Exception: `Purge` of `Pending` walks the type's pending chunk keys.
+  Exception: `Purge` (either scope) walks the type's pending chunk keys.
 - `Insert` packs the verified payloads of one call into fresh chunks of
   `chunk_size` (a partial last chunk is fine) and writes them in one
   `WriteBatch`; ids are returned only once that write is durable. Chunks are
@@ -150,14 +151,22 @@ Stats  = { server_id, uptime_ms, inserted, leased, completed, cancelled,
   `Unknown` (no such task, malformed id, or another server's id). A task that
   finishes mid-request is reported `Finished`, never `Unknown`.
 - `Scan` pages over **tasks**, in task id order: `Pending` lists tasks without
-  a result, `Finished` tasks with one. `after` / `next` are task ids.
+  a result, `Finished` tasks with one. `after` / `next` are task ids. Only the
+  tasks on the page are copied out of a chunk record.
 - `Delete` works at **chunk granularity**: each id deletes its whole chunk
   record in that scope.
 - `Delete`/`Purge` never remove the records of a queued or leased chunk (they
   would be lost on reap or restart). `Delete` refuses the whole request with
-  `InvalidArgument "TaskInFlight: <id>"`; `Purge` of `Pending` skips those
-  chunks, which then finish normally. Both run with the type's refill blocked,
-  so a chunk can't be queued between the in-flight check and the delete.
+  `InvalidArgument "TaskInFlight: <id>"`; `Purge` skips those chunks, which
+  then finish normally. Both run with the type's refill blocked, so a chunk
+  can't be queued (and gain results) between the check and the delete.
+- A chunk's finished record is the only record of which of its tasks are done
+  while its pending record exists. So `Delete` of `Finished` refuses a chunk
+  that is still pending (`InvalidArgument "ChunkNotFinished: <id>"`; delete
+  the pending chunk first, or let it finish), and `Purge` of `Finished` keeps
+  the finished records of pending chunks that are in flight or partially done.
+  `Delete`/`Purge` of `Pending` leave the finished record of a partially done
+  chunk in place; it then counts as finished and can be deleted.
 - `Stats` counters are per task (`queued` / `active_leases` count open tasks,
   not chunks). `Stats.completed` counts successful `Complete` results,
   including idempotent retries. Poll it for a live throughput counter.
@@ -278,7 +287,12 @@ finished  [0x01][n u32][done bitmap ceil(n/8) bytes]([len u32][result])*popcount
   queue full, a failed refill send), then advances a forward-only cursor over
   `t:` keys bounded by the allocator's `safe_upto` (the oldest chunk whose
   insert is still being written). Since keys only grow and nothing lands
-  below `safe_upto` later, the cursor never rescans from the start.
+  below `safe_upto` later, the cursor never rescans from the start. A pass
+  that stopped at `safe_upto` while higher seqs were already handed out never
+  marks the type idle, and the insert that releases the blocking reservation
+  wakes it, so a chunk written above an unfinished insert isn't left waiting.
+  A chunk whose load fails on a read error goes to the recovery set; a corrupt
+  record is skipped (and logged) until a restart.
 - Cancel and reaping requeue the still-open indexes of the chunk directly.
 
 ## Per-type settings

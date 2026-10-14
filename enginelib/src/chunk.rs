@@ -325,6 +325,40 @@ impl FinishedChunk {
         Ok(Self { results })
     }
 
+    /// Walks the results of an encoded record in index order without copying
+    /// them, calling `f(idx, result)` for each done task until it returns
+    /// `false`.
+    pub fn for_each_result(
+        data: &[u8],
+        mut f: impl FnMut(usize, &[u8]) -> bool,
+    ) -> Result<(), Error> {
+        let mut at = 0;
+        if data.first() != Some(&FORMAT_V1) {
+            return Err(corrupt("finished"));
+        }
+        at += 1;
+        let n = read_u32(data, &mut at).ok_or_else(|| corrupt("finished"))?;
+        if n > MAX_CHUNK_SIZE as usize {
+            return Err(corrupt("finished"));
+        }
+        let bitmap = data
+            .get(at..at + n.div_ceil(8))
+            .ok_or_else(|| corrupt("finished"))?;
+        at += bitmap.len();
+        for idx in 0..n {
+            if bitmap[idx / 8] & (1 << (idx % 8)) == 0 {
+                continue;
+            }
+            let len = read_u32(data, &mut at).ok_or_else(|| corrupt("finished"))?;
+            let bytes = data.get(at..at + len).ok_or_else(|| corrupt("finished"))?;
+            at += len;
+            if !f(idx, bytes) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Reads only the done bitmap of an encoded record.
     pub fn decode_done(data: &[u8]) -> Result<Bitmap, Error> {
         let mut at = 0;
@@ -437,6 +471,17 @@ impl SeqAllocator {
     /// The next seq that will be handed out.
     pub fn next(&self) -> u64 {
         self.lock().next
+    }
+
+    /// `(safe_upto, next)` read atomically. `safe_upto < next` means some
+    /// reservation below `next` is still being written, so records may already
+    /// exist above `safe_upto` that a refill bounded by it can't see yet.
+    pub fn bounds(&self) -> (u64, u64) {
+        let inner = self.lock();
+        (
+            inner.in_progress.first().copied().unwrap_or(inner.next),
+            inner.next,
+        )
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, SeqInner> {

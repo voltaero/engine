@@ -14,16 +14,17 @@
 //! default a fresh temp dir, removed afterwards).
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use enginelib::api::ServerAPI;
 use enginelib::config::{Config, TaskTypeConfig};
+use enginelib::nucleus::query::scan_tasks;
 use enginelib::task::{Task, Verifiable};
 use enginelib::transport::client::Client;
 use enginelib::transport::server::{DEFAULT_MAX_INFLIGHT, Server, ServerOptions};
-use enginelib::wire::{Auth, Caps, LeaseRef, LeaseReq, Leased, TaskResult};
+use enginelib::wire::{Auth, Caps, LeaseRef, LeaseReq, Leased, Scope, TaskResult};
 use enginelib::{Identifier, Registry};
 
 #[derive(Debug, Clone)]
@@ -102,7 +103,63 @@ fn parse_args() -> Args {
             other => panic!("unknown flag {other}"),
         }
     }
+    // Zero would never finish: no batch advances `next`, no thread inserts or
+    // completes anything.
+    for (flag, value) in [
+        ("--batch", args.batch),
+        ("--inserters", args.inserters as u64),
+        ("--workers", args.workers as u64),
+    ] {
+        if value == 0 {
+            eprintln!("bench: {flag} must be at least 1");
+            std::process::exit(2);
+        }
+    }
     args
+}
+
+/// Records the first failure of any bench thread (an error it returned, or a
+/// panic) so the main loop stops instead of waiting for a completion count
+/// that can no longer be reached.
+#[derive(Default)]
+struct Abort {
+    flag: AtomicBool,
+    reason: Mutex<Option<String>>,
+}
+
+impl Abort {
+    fn set(&self, reason: String) {
+        let mut slot = self.reason.lock().unwrap_or_else(|p| p.into_inner());
+        slot.get_or_insert(reason);
+        self.flag.store(true, Ordering::SeqCst);
+    }
+
+    fn is_set(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    fn reason(&self) -> Option<String> {
+        self.reason
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+}
+
+/// Spawns a bench thread whose error or panic aborts the run.
+fn spawn_guarded(
+    name: String,
+    abort: &Arc<Abort>,
+    body: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    let abort = abort.clone();
+    std::thread::spawn(
+        move || match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => abort.set(format!("{name}: {err}")),
+            Err(_) => abort.set(format!("{name} panicked")),
+        },
+    )
 }
 
 fn auth(uid: &str) -> Auth {
@@ -156,6 +213,17 @@ fn main() {
     let api = Arc::new(api);
     ServerAPI::populate(&api);
     ServerAPI::spawn_reaper(&api);
+    // Leftover pending tasks (an interrupted run in `--db`) would be leased and
+    // counted as this run's completions, skewing the rates.
+    let (leftover, _) =
+        scan_tasks(&api, &task_type(), Scope::Pending, None, 1).expect("scan the store");
+    if !leftover.is_empty() {
+        eprintln!(
+            "bench: {} already holds pending bench tasks; use an empty --db",
+            db.display()
+        );
+        std::process::exit(2);
+    }
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let server = {
@@ -195,24 +263,26 @@ fn main() {
     let completed = Arc::new(AtomicU64::new(0));
     let failed = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
+    let abort = Arc::new(Abort::default());
     let started = Instant::now();
 
     let mut inserters = Vec::new();
     for i in 0..args.inserters {
-        let (endpoint, next, inserted, failed) = (
+        let (endpoint, next, inserted, failed, done) = (
             endpoint.clone(),
             next.clone(),
             inserted.clone(),
             failed.clone(),
+            done.clone(),
         );
         let (total, batch, payload) = (args.tasks, args.batch, args.payload);
-        inserters.push(std::thread::spawn(move || {
+        inserters.push(spawn_guarded(format!("inserter {i}"), &abort, move || {
             let mut client = Client::connect(&endpoint, auth(&format!("ins{i}")), Caps::default())
-                .expect("connect");
+                .map_err(|err| format!("connect: {err}"))?;
             loop {
                 let start = next.fetch_add(batch, Ordering::Relaxed);
-                if start >= total {
-                    return;
+                if start >= total || done.load(Ordering::Relaxed) {
+                    return Ok(());
                 }
                 let end = (start + batch).min(total);
                 let payloads: Vec<Vec<u8>> = (start..end)
@@ -222,7 +292,9 @@ fn main() {
                         p
                     })
                     .collect();
-                let ids = client.insert(task_type(), payloads).expect("insert");
+                let ids = client
+                    .insert(task_type(), payloads)
+                    .map_err(|err| format!("insert: {err}"))?;
                 let ok = ids.iter().filter(|id| id.is_ok()).count() as u64;
                 failed.fetch_add(ids.len() as u64 - ok, Ordering::Relaxed);
                 inserted.fetch_add(ok, Ordering::Relaxed);
@@ -239,9 +311,9 @@ fn main() {
             done.clone(),
         );
         let lease = args.lease;
-        workers.push(std::thread::spawn(move || {
+        workers.push(spawn_guarded(format!("worker {i}"), &abort, move || {
             let mut client = Client::connect(&endpoint, auth(&format!("wrk{i}")), Caps::default())
-                .expect("connect");
+                .map_err(|err| format!("connect: {err}"))?;
             let mut held: Option<Leased> = None;
             while !done.load(Ordering::Relaxed) {
                 let leased = match held.take() {
@@ -259,12 +331,13 @@ fn main() {
                             max_tasks: lease,
                         }),
                     )
-                    .expect("complete");
+                    .map_err(|err| format!("complete: {err}"))?;
                 let ok = results.iter().filter(|r| r.is_ok()).count() as u64;
                 failed.fetch_add(results.len() as u64 - ok, Ordering::Relaxed);
                 completed.fetch_add(ok, Ordering::Relaxed);
                 held = next;
             }
+            Ok(())
         }));
     }
 
@@ -292,7 +365,7 @@ fn main() {
             );
             last = (Instant::now(), ins, comp);
         }
-        if comp >= args.tasks || failed.load(Ordering::Relaxed) > 0 {
+        if comp >= args.tasks || failed.load(Ordering::Relaxed) > 0 || abort.is_set() {
             break;
         }
     }
@@ -302,6 +375,9 @@ fn main() {
         let _ = thread.join();
     }
 
+    if let Some(reason) = abort.reason() {
+        eprintln!("bench: aborted: {reason}");
+    }
     let mut client = Client::connect(&endpoint, auth("stats"), Caps::default()).expect("connect");
     let stats = client.stats().expect("stats");
     let insert_elapsed = insert_done_at.unwrap_or(total_elapsed);
@@ -334,5 +410,8 @@ fn main() {
     drop(api);
     if temp {
         let _ = std::fs::remove_dir_all(&db);
+    }
+    if abort.is_set() || failed.load(Ordering::Relaxed) > 0 {
+        std::process::exit(1);
     }
 }

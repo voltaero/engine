@@ -88,6 +88,9 @@ pub fn submit_batch<P: AsRef<[u8]>>(
     }
     let written = api.db.write(&batch);
     drop(reservation);
+    // Releasing the reservation may advance `safe_upto` past chunks that other
+    // inserts (of any type) already wrote: refill types whose pass stopped here.
+    ServerAPI::wake_capped(&api);
     if let Err(err) = written {
         fail_all(&mut results, Error::io_error(err.to_string()));
         return Ok(results);

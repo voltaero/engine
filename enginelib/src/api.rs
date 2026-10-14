@@ -294,22 +294,29 @@ impl ServerAPI {
         data.map(|data| FinishedChunk::decode(&data)).transpose()
     }
 
-    /// Builds the queue entry of a pending chunk: every index without a result
-    /// yet. `None` when the chunk has nothing left to do.
-    fn queued_chunk(
+    /// Builds the queue entry of a pending chunk from its raw `t:` record:
+    /// every index without a result yet. `None` when the chunk has nothing left
+    /// to do.
+    fn load_chunk(
         &self,
         task_type: &Identifier,
         chunk_seq: u64,
-        payloads: ChunkPayloads,
-    ) -> Result<Option<QueuedChunk>, Error> {
+        pending: Vec<u8>,
+    ) -> Result<Option<QueuedChunk>, LoadError> {
+        let payloads = ChunkPayloads::decode(pending).map_err(LoadError::Corrupt)?;
         let finished = self
             .db
             .get_pinned_cf(self.cf_finished(), finished_task_key(task_type, chunk_seq))
-            .map_err(|err| Error::io_error(format!("Failed to read finished chunk: {err}")))?;
+            .map_err(|err| {
+                LoadError::Read(Error::io_error(format!(
+                    "Failed to read finished chunk: {err}"
+                )))
+            })?;
         let mut open = Bitmap::full(payloads.len());
         let has_finished = finished.is_some();
         if let Some(finished) = finished {
-            for idx in FinishedChunk::decode_done(&finished)?.iter() {
+            let done = FinishedChunk::decode_done(&finished).map_err(LoadError::Corrupt)?;
+            for idx in done.iter() {
                 open.clear(idx);
             }
         }
@@ -407,10 +414,16 @@ impl ServerAPI {
                 continue; // already queued or leased
             }
             let loaded = self
-                .read_pending(task_type, chunk_seq)
-                .and_then(|payloads| {
-                    payloads
-                        .map(|payloads| self.queued_chunk(task_type, chunk_seq, payloads))
+                .db
+                .get_cf(self.cf_pending(), task_key(task_type, chunk_seq))
+                .map_err(|err| {
+                    LoadError::Read(Error::io_error(format!(
+                        "Failed to read pending chunk: {err}"
+                    )))
+                })
+                .and_then(|pending| {
+                    pending
+                        .map(|pending| self.load_chunk(task_type, chunk_seq, pending))
                         .transpose()
                         .map(Option::flatten)
                 });
@@ -420,7 +433,12 @@ impl ServerAPI {
                 Ok(None) => {
                     queue.dedup.remove(&chunk_seq);
                 }
-                Err(err) => {
+                Err(LoadError::Corrupt(err)) => {
+                    // Retrying can't help; a restart re-reads it.
+                    error!("Skipping corrupt chunk {chunk_seq}: {err}");
+                    queue.dedup.remove(&chunk_seq);
+                }
+                Err(LoadError::Read(err)) => {
                     error!("Failed to recover chunk {chunk_seq}: {err}");
                     queue.dedup.remove(&chunk_seq);
                     for chunk_seq in std::iter::once(chunk_seq).chain(recovered) {
@@ -440,8 +458,15 @@ impl ServerAPI {
         //    increasing and the pass stops below `safe_upto` (the oldest chunk
         //    whose write is still in progress), so no key can ever appear
         //    behind the cursor: it never has to rescan from the start.
+        //
+        //    Flag the type as capped *before* reading the bounds: a submit that
+        //    releases its reservation after this read sees the flag and wakes
+        //    the type (`wake_capped`); one that released before is already
+        //    reflected in `safe_upto`.
+        state.capped.store(true, Ordering::SeqCst);
+        let (safe_upto, next) = self.chunk_seq.bounds();
         let prefix = task_key_prefix(task_type);
-        let upper = task_key(task_type, self.chunk_seq.safe_upto()).into_bytes();
+        let upper = task_key(task_type, safe_upto).into_bytes();
         let lower = match cursor.as_ref() {
             Some(after) => {
                 // Appending 0x00 yields the key's immediate successor.
@@ -478,17 +503,23 @@ impl ServerAPI {
                 if !queue.dedup.insert(chunk_seq) {
                     continue;
                 }
-                let loaded = ChunkPayloads::decode(value.into_vec())
-                    .and_then(|payloads| self.queued_chunk(task_type, chunk_seq, payloads));
-                match loaded {
+                match self.load_chunk(task_type, chunk_seq, value.into_vec()) {
                     Ok(Some(chunk)) => batch.push(chunk),
                     Ok(None) => {
                         warn!("Pending chunk {chunk_seq} has no open tasks; skipping");
                         queue.dedup.remove(&chunk_seq);
                     }
-                    Err(err) => {
-                        error!("Skipping unreadable chunk {chunk_seq}: {err}");
+                    Err(LoadError::Corrupt(err)) => {
+                        // Retrying can't help; a restart re-reads it.
+                        error!("Skipping corrupt chunk {chunk_seq}: {err}");
                         queue.dedup.remove(&chunk_seq);
+                    }
+                    Err(LoadError::Read(err)) => {
+                        // The cursor moves past this chunk: hand it to the
+                        // recovery set so a later pass retries it.
+                        error!("Failed to load chunk {chunk_seq}, will retry: {err}");
+                        queue.dedup.remove(&chunk_seq);
+                        state.recover(chunk_seq);
                     }
                 }
                 if batch.len() >= max {
@@ -501,13 +532,38 @@ impl ServerAPI {
             }
         }
 
-        let idle_at = if reached_end && state.recover_set().is_empty() {
+        // Stopped at `safe_upto` with seqs above it already handed out: this
+        // type may have chunks written up there that the pass couldn't see.
+        // Stay non-idle and keep `capped` set so the submit that releases the
+        // blocking reservation wakes this type.
+        let capped = reached_end && safe_upto < next;
+        if !capped {
+            state.capped.store(false, Ordering::SeqCst);
+        }
+        let idle_at = if reached_end && !capped && state.recover_set().is_empty() {
             generation
         } else {
             NOT_IDLE
         };
         state.idle_at.store(idle_at, Ordering::SeqCst);
         Ok(batch)
+    }
+
+    /// Requests a refill of every type whose last pass stopped at `safe_upto`
+    /// with seqs above it already handed out. Call after releasing a
+    /// [`crate::chunk::SeqReservation`] (`submit_batch` does): the release may
+    /// have advanced `safe_upto` past chunks another type already wrote.
+    pub fn wake_capped(api: &Arc<Self>) {
+        let capped: Vec<Identifier> = api
+            .load_state
+            .tasks
+            .iter()
+            .filter(|state| state.capped.swap(false, Ordering::SeqCst))
+            .map(|state| state.key().clone())
+            .collect();
+        for task_type in capped {
+            Self::request_refill(api, &task_type);
+        }
     }
 
     /// Puts the still-open tasks of a chunk whose lease ended (cancel, reap)
@@ -652,6 +708,14 @@ impl ServerAPI {
 /// `LoadState::idle_at` sentinel: no pass has proven the store drained.
 const NOT_IDLE: u64 = u64::MAX;
 
+/// Why a chunk couldn't be loaded. A failed read may succeed on a retry, so
+/// the chunk goes to the recovery set; a corrupt record never will, so it is
+/// skipped (and logged) until a restart re-reads it.
+enum LoadError {
+    Read(Error),
+    Corrupt(Error),
+}
+
 /// Per-type state of the refill path.
 ///
 /// - `cursor`: the last pending key examined. Chunk keys are strictly
@@ -666,6 +730,10 @@ const NOT_IDLE: u64 = u64::MAX;
 /// - `generation` is bumped by `submit` and by `recover`; `idle_at` records the
 ///   generation at which a pass found nothing more to load, letting refills
 ///   no-op while nothing has changed.
+/// - `capped`: the last pass stopped at `safe_upto` while higher seqs were
+///   already handed out (another insert still being written), so this type may
+///   have chunks the pass couldn't see. Such a pass never marks the type idle,
+///   and [`ServerAPI::wake_capped`] refills it once the reservation is released.
 ///
 /// Pending records must only be written through `submit` (there is
 /// intentionally no raw Put); out-of-band writers must call
@@ -679,6 +747,7 @@ pub struct LoadState {
     idle_at: AtomicU64,
     refilling: AtomicBool,
     refill_requested: AtomicBool,
+    capped: AtomicBool,
 }
 impl Default for LoadState {
     fn default() -> Self {
@@ -690,6 +759,7 @@ impl Default for LoadState {
             idle_at: AtomicU64::new(NOT_IDLE),
             refilling: AtomicBool::new(false),
             refill_requested: AtomicBool::new(false),
+            capped: AtomicBool::new(false),
         }
     }
 }
