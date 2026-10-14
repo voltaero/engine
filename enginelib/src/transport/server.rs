@@ -170,13 +170,6 @@ impl Server {
         // Owns the threads from the start: if a later step fails, dropping it
         // stops and joins whatever already runs, releasing the bound port.
         let mut background = Background::new(bound.clone(), stop.clone(), Vec::new());
-        // Handlers run on the caller's runtime, which may outlive this server:
-        // once the I/O thread has stopped dispatching, wake parked `Lease`s and
-        // wait for running handlers, so none takes work after shutdown returns.
-        {
-            let shared = shared.clone();
-            background.on_stop = Some(Box::new(move || shared.drain(SHUTDOWN_DRAIN)));
-        }
         {
             let shared = shared.clone();
             let stop = stop.clone();
@@ -291,6 +284,49 @@ fn io_loop(
                     session.last_seen.elapsed() < session_idle
                         || session.inflight.load(Ordering::SeqCst) > 0
                 });
+        }
+    }
+    drain(shared, router, replies_in);
+}
+
+/// Graceful stop, run by the I/O thread once it stops reading requests.
+/// Handlers live on the caller's runtime, which may outlive this server, so:
+/// wake parked `Lease`s (they answer `ServerStopping`), then keep forwarding
+/// replies until every running handler has answered (up to `SHUTDOWN_DRAIN`).
+/// A handler that leased work while stopping still reaches its worker, and
+/// none is left to take work after shutdown returns.
+fn drain(shared: &Shared, router: &zmq::Socket, replies_in: &zmq::Socket) {
+    shared.shutdown.send_replace(true);
+    let deadline = Instant::now() + SHUTDOWN_DRAIN;
+    // Handlers free their slot just before handing over the reply, so once the
+    // count hits zero keep forwarding until the reply socket has gone quiet.
+    let mut quiet_since: Option<Instant> = None;
+    loop {
+        let mut items = [replies_in.as_poll_item(zmq::POLLIN)];
+        if zmq::poll(&mut items, 10).is_err() {
+            return;
+        }
+        let mut forwarded = false;
+        while let Ok(frames) = replies_in.recv_multipart(zmq::DONTWAIT) {
+            forwarded = true;
+            if let Err(err) = router.send_multipart(frames, zmq::DONTWAIT) {
+                debug!("Dropped reply: {err}");
+            }
+        }
+        if shared.inflight.load(Ordering::SeqCst) == 0 {
+            let since = *quiet_since.get_or_insert_with(Instant::now);
+            if forwarded {
+                quiet_since = Some(Instant::now());
+            } else if since.elapsed() >= Duration::from_millis(50) {
+                return;
+            }
+        }
+        if Instant::now() >= deadline {
+            warn!(
+                "Shutdown: {} handler(s) still running after {SHUTDOWN_DRAIN:?}",
+                shared.inflight.load(Ordering::SeqCst)
+            );
+            return;
         }
     }
 }
@@ -503,23 +539,6 @@ fn add(counter: &AtomicU64, n: usize) {
 }
 
 impl Shared {
-    /// Wakes parked `Lease`s and waits up to `limit` for running handlers to
-    /// finish. Called after the I/O thread has stopped dispatching.
-    fn drain(&self, limit: Duration) {
-        self.shutdown.send_replace(true);
-        let deadline = Instant::now() + limit;
-        while self.inflight.load(Ordering::SeqCst) > 0 {
-            if Instant::now() >= deadline {
-                warn!(
-                    "Shutdown: {} handler(s) still running",
-                    self.inflight.load(Ordering::SeqCst)
-                );
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-
     fn saturated(&self) -> bool {
         self.inflight.load(Ordering::SeqCst) >= self.max_inflight
     }
@@ -739,10 +758,13 @@ impl Shared {
         // cancel-safe, and nothing after it awaits on an empty queue.
         let mut shutdown = self.shutdown.subscribe();
         let first = tokio::select! {
-            lease = lease_timeout(self.api.clone(), task_type.clone(), uid.clone(), wait) => lease?,
+            // Checked first: a lease starting after shutdown on a non-empty
+            // queue must not win a tie and take work.
+            biased;
             _ = shutdown.wait_for(|stopping| *stopping) => {
                 return Err(Error::not_found("ServerStopping"));
             }
+            lease = lease_timeout(self.api.clone(), task_type.clone(), uid.clone(), wait) => lease?,
         };
         let mut expires_at = first.expires_at;
         let mut tasks = Vec::with_capacity(max_tasks.min(1024));

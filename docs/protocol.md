@@ -41,9 +41,10 @@ Each session may have at most `max_inflight_per_session` (default 1024) of
 those; beyond it a request is refused at once with `Error{InvalidArgument,
 "TooManyRequests"}` rather than parked, so one client can't hold the whole
 budget. The counter belongs to the connection and survives a re-`Hello`.
-On shutdown the server stops reading, answers parked `Lease`s with
-`Error{NotFound, "ServerStopping"}` and waits (up to 5 s) for running handlers,
-so a stopped server never takes work afterwards.
+On shutdown the server stops reading requests, answers parked `Lease`s with
+`Error{NotFound, "ServerStopping"}`, and keeps forwarding replies until every
+running handler has answered (up to 5 s), so in-flight replies still arrive and
+a stopped server never takes work afterwards.
 
 Client: `call` waits for its own reply; replies to requests issued with `send`
 that arrive meanwhile are kept for `recv`. Late replies to timed-out `call`s are

@@ -42,9 +42,6 @@ pub struct Background {
     endpoint: String,
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
-    /// Runs once the threads have exited (e.g. the server draining handlers
-    /// that live on the tokio runtime rather than on these threads).
-    pub(crate) on_stop: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Background {
@@ -57,7 +54,6 @@ impl Background {
             endpoint,
             stop,
             threads,
-            on_stop: None,
         }
     }
 
@@ -82,9 +78,6 @@ impl Drop for Background {
         self.stop.store(true, Ordering::SeqCst);
         for thread in self.threads.drain(..) {
             let _ = thread.join();
-        }
-        if let Some(on_stop) = self.on_stop.take() {
-            on_stop();
         }
     }
 }

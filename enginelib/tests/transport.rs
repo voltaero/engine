@@ -792,6 +792,13 @@ fn shutdown_stops_parked_leases() {
     let started = Instant::now();
     drop(server);
     assert!(started.elapsed() < Duration::from_secs(3));
+    // The parked lease was answered during the drain, so its client hears it.
+    let envelope = client.recv(Duration::from_secs(2)).unwrap();
+    assert!(
+        matches!(&envelope.body, Response::Error(err) if err.message == "ServerStopping"),
+        "unexpected reply: {:?}",
+        envelope.body
+    );
 
     // The runtime is still alive; work submitted now must not be taken by the
     // stopped server's parked handler.
