@@ -269,9 +269,9 @@ async fn cancel_requeues_under_a_new_token() {
 #[tokio::test]
 async fn cursor_load_picks_up_key_before_cursor_after_full_rescan() {
     // Capacity 2 so a refill can't load everything at once and leaves the cursor
-    // mid-prefix. With capacity 2 the low watermark is an empty queue, and every
-    // lease below happens on a non-empty one, so no background refill races the
-    // explicit loads.
+    // mid-prefix. The lease that empties the queue requests a background refill,
+    // which may race the explicit one below, so this asserts what gets leased
+    // rather than how many tasks one particular refill call loaded.
     let (api, _dir) = setup("cursor", 2, 300);
     let tt = task_type();
     for id in ["b1", "b2", "b3"] {
@@ -291,14 +291,16 @@ async fn cursor_load_picks_up_key_before_cursor_after_full_rescan() {
     );
 
     // A pending record whose key sorts before the cursor (as a druid id from a
-    // skewed clock would). Written raw, so only the cursor logic can find it.
+    // skewed clock would). Written raw, so only the cursor logic can find it;
+    // `note_submitted` is what `submit` does after writing one.
     api.db.put(task_key(&tt, "a0"), b"payload").unwrap();
+    api.load_state.get(&tt).note_submitted();
 
     // The cursor pass resumes after b2: it finds b3 and reaches the end of the
     // prefix with a slot to spare, so the same refill wraps around to a full
     // pass from the prefix start, which picks a0 up (b1..b3 are skipped as
     // in-flight).
-    assert_eq!(api.refill(&tt).unwrap(), 2);
+    api.refill(&tt).unwrap();
     let c = lease_timeout(api.clone(), tt.clone(), "w".into(), WAIT)
         .await
         .unwrap();
