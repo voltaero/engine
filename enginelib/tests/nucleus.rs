@@ -1060,3 +1060,26 @@ async fn lease_times_out_on_empty_queue() {
     assert_eq!(err.as_ref(), "QueueEmpty");
     assert!(started.elapsed() >= Duration::from_millis(100));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn draining_try_lease_requests_refill() {
+    let (api, _dir) = setup(
+        "drain-refill",
+        Opts {
+            chunk_size: Some(1),
+            queue_capacity: 2,
+            ..Default::default()
+        },
+    );
+    let tt = task_type();
+    let payloads: Vec<&[u8]> = vec![b"t1", b"t2", b"t3", b"t4", b"t5"];
+    submit_batch(api.clone(), &payloads, tt.clone()).unwrap();
+    wait_queued(&api, 2).await;
+
+    // Draining the queue with non-waiting leases (as `lease_many` does) must
+    // itself ask for a refill: the check before the last take still saw the
+    // queue above the watermark.
+    assert!(try_lease(&api, &tt, "w").unwrap().is_some());
+    assert!(try_lease(&api, &tt, "w").unwrap().is_some());
+    wait_queued(&api, 2).await;
+}

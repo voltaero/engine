@@ -36,13 +36,19 @@ pub fn try_lease(
     let queue = queue_of(api, task_type)?;
     refill_if_low(api, task_type, &queue);
     match queue.rx.try_recv() {
-        Ok(chunk) => Ok(Some(grant(
-            api,
-            task_type,
-            &queue,
-            user_id.to_string(),
-            chunk,
-        ))),
+        Ok(chunk) => {
+            // As in `lease_inner`: check again after taking a chunk, or a
+            // `lease_many` that drains the queue leaves saved work waiting for
+            // the next lease request.
+            refill_if_low(api, task_type, &queue);
+            Ok(Some(grant(
+                api,
+                task_type,
+                &queue,
+                user_id.to_string(),
+                chunk,
+            )))
+        }
         Err(async_channel::TryRecvError::Empty) => Ok(None),
         Err(err) => Err(Error::new(format!("Task queue closed: {err}"))),
     }

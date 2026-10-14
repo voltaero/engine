@@ -23,12 +23,28 @@ pub const MAX_SCAN_LIMIT: u32 = 10_000;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope<T> {
     pub req_id: u64,
+    /// Session key from `Welcome`, sent with every client -> server request
+    /// after the handshake. Zero everywhere else (handshake, responses, proxy).
+    pub session: u128,
     pub body: T,
 }
 
 pub fn encode<T: Serialize>(req_id: u64, body: &T) -> Result<Vec<u8>, Error> {
-    postcard::to_allocvec(&Envelope { req_id, body })
-        .map_err(|err| Error::invalid_argument(format!("Failed to encode message: {err}")))
+    encode_in_session(req_id, 0, body)
+}
+
+/// Like [`encode`], carrying a session key.
+pub fn encode_in_session<T: Serialize>(
+    req_id: u64,
+    session: u128,
+    body: &T,
+) -> Result<Vec<u8>, Error> {
+    postcard::to_allocvec(&Envelope {
+        req_id,
+        session,
+        body,
+    })
+    .map_err(|err| Error::invalid_argument(format!("Failed to encode message: {err}")))
 }
 
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<Envelope<T>, Error> {
@@ -147,6 +163,10 @@ pub enum Response {
     Welcome {
         proto_ver: u16,
         server_id: u16,
+        /// Random per-handshake key; the client must send it in every later
+        /// `Envelope::session`. The ZeroMQ routing identity alone is
+        /// peer-chosen, so it can't authenticate a session.
+        session: u128,
         lease_ttl_secs: u64,
         task_types: Vec<TaskTypeInfo>,
     },

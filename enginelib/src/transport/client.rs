@@ -33,6 +33,8 @@ pub struct Client {
     auth: Auth,
     caps: Caps,
     next_req_id: u64,
+    /// Session key from the last `Welcome`; sent with every request.
+    session: u128,
     /// `req_id`s issued by [`Client::send`] whose reply `recv` hasn't returned.
     outstanding: HashSet<u64>,
     /// Replies to `outstanding` requests that arrived while `call` waited for
@@ -53,6 +55,7 @@ impl Client {
             auth,
             caps,
             next_req_id: 0,
+            session: 0,
             outstanding: HashSet::new(),
             buffered: VecDeque::new(),
             timeout: DEFAULT_TIMEOUT,
@@ -100,13 +103,17 @@ impl Client {
             auth: self.auth.clone(),
             caps: self.caps.clone(),
         };
+        // A stale key must not ride along on the handshake itself.
+        self.session = 0;
         match self.call_once(&request, self.timeout)? {
             Response::Welcome {
                 server_id,
+                session,
                 lease_ttl_secs,
                 task_types,
                 ..
             } => {
+                self.session = session;
                 self.server = ServerHello {
                     server_id,
                     lease_ttl_secs,
@@ -121,19 +128,30 @@ impl Client {
     /// Sends a request without waiting; returns its `req_id`. Collect the reply
     /// with [`Client::recv`]; `call`s made in between keep it for `recv`.
     pub fn send(&mut self, request: &Request) -> Result<u64, Error> {
-        let req_id = self.send_raw(request)?;
+        let req_id = self.send_raw(request, Instant::now() + self.timeout)?;
         self.outstanding.insert(req_id);
         Ok(req_id)
     }
 
-    fn send_raw(&mut self, request: &Request) -> Result<u64, Error> {
+    /// Queues one request, giving up at `deadline` if the socket stays full
+    /// (an unreachable or stalled server) instead of blocking forever.
+    fn send_raw(&mut self, request: &Request, deadline: Instant) -> Result<u64, Error> {
         self.next_req_id += 1;
         let req_id = self.next_req_id;
-        let bytes = wire::encode(req_id, request)?;
-        self.socket
-            .send(bytes, 0)
-            .map_err(|err| zmq_err("Failed to send request", err))?;
-        Ok(req_id)
+        let bytes = wire::encode_in_session(req_id, self.session, request)?;
+        loop {
+            match self.socket.send(&bytes, zmq::DONTWAIT) {
+                Ok(()) => return Ok(req_id),
+                Err(zmq::Error::EAGAIN) => {}
+                Err(err) => return Err(zmq_err("Failed to send request", err)),
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Error::io_error("Timed out sending to the server"));
+            }
+            let mut items = [self.socket.as_poll_item(zmq::POLLOUT)];
+            zmq::poll(&mut items, poll_ms(left)).map_err(|err| zmq_err("Failed to poll", err))?;
+        }
     }
 
     /// Receives the next response to a request issued by [`Client::send`],
@@ -180,8 +198,9 @@ impl Client {
     }
 
     fn call_once(&mut self, request: &Request, timeout: Duration) -> Result<Response, Error> {
-        let req_id = self.send_raw(request)?;
+        // One deadline covers both queueing the request and the reply.
         let deadline = Instant::now() + timeout;
+        let req_id = self.send_raw(request, deadline)?;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             let envelope = self.recv_raw(left)?;
@@ -345,4 +364,10 @@ fn unexpected(response: Response) -> Error {
             format!("Unexpected response: {other:?}"),
         ),
     }
+}
+
+/// A poll timeout in milliseconds, rounded up so a sub-millisecond wait still
+/// polls rather than returning immediately forever.
+fn poll_ms(left: Duration) -> i64 {
+    left.as_micros().div_ceil(1000).min(i64::MAX as u128) as i64
 }
