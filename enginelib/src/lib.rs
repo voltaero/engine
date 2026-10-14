@@ -1,5 +1,6 @@
 use std::sync::Arc;
 pub mod api;
+pub mod chunk;
 pub mod config;
 pub mod event;
 pub mod events;
@@ -9,6 +10,8 @@ pub use inventory;
 pub mod plugin;
 pub mod prelude;
 pub mod task;
+pub mod transport;
+pub mod wire;
 pub type Identifier = (String, String);
 pub type RawIdentifier = String;
 pub const GIT_VERSION: &str = env!("CARGO_PKG_VERSION"); //get commit hash

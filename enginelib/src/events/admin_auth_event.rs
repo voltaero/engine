@@ -2,6 +2,7 @@ use std::sync::{Arc, RwLock};
 
 use macros::{Event, event_handler};
 use rust_rocksdb::DB;
+use subtle::ConstantTimeEq;
 
 use crate::{Identifier, api::ServerAPI};
 
@@ -48,9 +49,34 @@ impl AdminAuthEvent {
     ctx = api.cfg.config_toml.auth_token.clone()
 )]
 fn admin_auth_handler(event: &mut AdminAuthEvent, token: &Option<String>) {
+    // No configured token grants nothing here; a mod may still grant admin by
+    // handling this event itself.
     match token.as_deref() {
-        None => *event.output.write().unwrap() = true,
-        Some(token) if token == event.payload.as_str() => *event.output.write().unwrap() = true,
+        None => {}
+        Some(token) if constant_time_eq(token.as_bytes(), event.payload.as_bytes()) => {
+            *event.output.write().unwrap() = true
+        }
         Some(_) => {}
+    }
+}
+
+/// Compares two byte strings in time independent of where they first differ, so
+/// the admin token can't be recovered byte-by-byte from response timing. Only the
+/// length is allowed to leak.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.ct_eq(b).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_bytes() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        assert!(!constant_time_eq(b"secret", b"secret!"));
+        assert!(!constant_time_eq(b"", b"x"));
     }
 }
