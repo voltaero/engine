@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use enginelib::api::ServerAPI;
 use enginelib::config::Config;
 use enginelib::error::ErrorKind;
+use enginelib::nucleus::submit::submit;
 use enginelib::task::{Task, Verifiable};
 use enginelib::transport::Background;
 use enginelib::transport::client::{Client, resolve};
@@ -79,6 +80,7 @@ impl Drop for TempDir {
 /// and store go away.
 struct Harness {
     server: Background,
+    api: Arc<ServerAPI>,
     _rt: tokio::runtime::Runtime,
     _dir: TempDir,
 }
@@ -128,10 +130,11 @@ fn start_with(
     options(&mut opts);
     let server = {
         let _guard = rt.enter();
-        Server::start(api, opts).unwrap()
+        Server::start(api.clone(), opts).unwrap()
     };
     Harness {
         server,
+        api,
         _rt: rt,
         _dir: dir,
     }
@@ -690,4 +693,110 @@ fn no_configured_token_means_no_admin() {
         })
         .unwrap_err();
     assert_eq!(err.as_ref(), "AdminRequired");
+}
+
+/// A DEALER that keeps one connection (and routing identity) for a sequence of
+/// raw requests, unlike `raw_call`.
+struct RawConn {
+    socket: zmq::Socket,
+    next: u64,
+}
+impl RawConn {
+    fn connect(endpoint: &str) -> Self {
+        let socket = zmq::Context::new().socket(zmq::DEALER).unwrap();
+        socket.set_linger(0).unwrap();
+        socket.set_rcvtimeo(5000).unwrap();
+        socket.connect(endpoint).unwrap();
+        Self { socket, next: 0 }
+    }
+    fn send(&mut self, session: u128, request: &Request) -> u64 {
+        self.next += 1;
+        let bytes = enginelib::wire::encode_in_session(self.next, session, request).unwrap();
+        self.socket.send(bytes, 0).unwrap();
+        self.next
+    }
+    fn recv_for(&mut self, req_id: u64) -> Response {
+        loop {
+            let reply = self.socket.recv_bytes(0).unwrap();
+            let envelope = enginelib::wire::decode::<Response>(&reply).unwrap();
+            if envelope.req_id == req_id {
+                return envelope.body;
+            }
+        }
+    }
+    fn hello(&mut self) -> u128 {
+        let id = self.send(
+            0,
+            &Request::Hello {
+                proto_ver: enginelib::wire::PROTO_VERSION,
+                auth: auth(None),
+                caps: Caps::default(),
+            },
+        );
+        let Response::Welcome { session, .. } = self.recv_for(id) else {
+            panic!("expected welcome");
+        };
+        session
+    }
+}
+
+#[test]
+fn rehandshake_keeps_the_session_cap() {
+    let harness = start_with(
+        "rehello-cap",
+        |_| {},
+        |opts| opts.max_inflight_per_session = 1,
+    );
+    let mut conn = RawConn::connect(harness.server.endpoint());
+    let first = conn.hello();
+    let lease = conn.send(
+        first,
+        &Request::Lease {
+            task_type: task_type(),
+            max_tasks: 1,
+            wait_ms: 1_000,
+        },
+    );
+    std::thread::sleep(Duration::from_millis(100));
+
+    // A new handshake on the same connection must not hand out a fresh budget
+    // while the parked lease still holds the old one.
+    let second = conn.hello();
+    let stats = conn.send(second, &Request::Query(Query::Stats));
+    let Response::Error(err) = conn.recv_for(stats) else {
+        panic!("re-handshake reset the per-session cap");
+    };
+    assert_eq!(err.message, "TooManyRequests");
+    assert!(matches!(conn.recv_for(lease), Response::Error(err) if err.message == "QueueEmpty"));
+}
+
+#[test]
+fn shutdown_stops_parked_leases() {
+    let harness = start("shutdown", None, None);
+    let mut client = connect(&harness);
+    client
+        .send(&Request::Lease {
+            task_type: task_type(),
+            max_tasks: 1,
+            wait_ms: 30_000,
+        })
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+
+    let Harness {
+        server,
+        api,
+        _rt,
+        _dir,
+    } = harness;
+    let started = Instant::now();
+    drop(server);
+    assert!(started.elapsed() < Duration::from_secs(3));
+
+    // The runtime is still alive; work submitted now must not be taken by the
+    // stopped server's parked handler.
+    submit(api.clone(), b"after-shutdown", task_type()).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let leased = api.leased_tasks.leases(&task_type()).map_or(0, |l| l.len());
+    assert_eq!(leased, 0, "a stopped server's handler leased new work");
 }

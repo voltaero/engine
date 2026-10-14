@@ -57,6 +57,9 @@ Workspace members:
   `Renew`/`Complete`/`CancelLease` reject a lease held by another session uid
   (`LeaseNotOwned`) since tokens are guessable; pending `Delete`/`Purge` run
   under `LoadState::exclusive` (blocks refill) and never touch in-flight tasks.
+  Handlers run on the caller's tokio runtime, so `Background` drop drains them
+  (`Shared::drain`: parked `Lease`s get `ServerStopping`) after the I/O thread
+  stops; the per-session counter survives re-`Hello`.
 - The proxy only accepts `Register` carrying its `proxy_token`
   (constant-time compare); **unset token = every registration refused**.
 
