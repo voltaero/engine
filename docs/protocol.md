@@ -41,7 +41,10 @@ handler finishes, so ZeroMQ's high-water marks and TCP push back on clients.
 Each session may have at most `max_inflight_per_session` (default 1024) of
 those; beyond it a request is refused at once with `Error{InvalidArgument,
 "TooManyRequests"}` rather than parked, so one client can't hold the whole
-budget.
+budget. The counter belongs to the connection and survives a re-`Hello`.
+On shutdown the server stops reading, answers parked `Lease`s with
+`Error{NotFound, "ServerStopping"}` and waits (up to 5 s) for running handlers,
+so a stopped server never takes work afterwards.
 
 Client: `call` waits for its own reply; replies to requests issued with `send`
 that arrive meanwhile are kept for `recv`. Late replies to timed-out `call`s are

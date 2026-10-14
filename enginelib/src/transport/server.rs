@@ -49,6 +49,8 @@ pub const DEFAULT_MAX_INFLIGHT: usize = 65_536;
 /// Default cap on one session's requests being handled at once (see
 /// [`ServerOptions::max_inflight_per_session`]).
 pub const DEFAULT_MAX_INFLIGHT_PER_SESSION: usize = 1024;
+/// How long shutdown waits for running handlers to finish.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct ServerOptions {
@@ -156,6 +158,7 @@ impl Server {
             counters: Counters::default(),
             started: Instant::now(),
             inflight: AtomicUsize::new(0),
+            shutdown: tokio::sync::watch::Sender::new(false),
             max_inflight: opts.max_inflight.max(1),
             max_inflight_per_session: opts.max_inflight_per_session.max(1),
             replies: ReplyPool {
@@ -169,6 +172,13 @@ impl Server {
         // Owns the threads from the start: if a later step fails, dropping it
         // stops and joins whatever already runs, releasing the bound port.
         let mut background = Background::new(bound.clone(), stop.clone(), Vec::new());
+        // Handlers run on the caller's runtime, which may outlive this server:
+        // once the I/O thread has stopped dispatching, wake parked `Lease`s and
+        // wait for running handlers, so none takes work after shutdown returns.
+        {
+            let shared = shared.clone();
+            background.on_stop = Some(Box::new(move || shared.drain(SHUTDOWN_DRAIN)));
+        }
         {
             let shared = shared.clone();
             let stop = stop.clone();
@@ -277,7 +287,12 @@ fn io_loop(
             last_sweep = Instant::now();
             shared
                 .sessions
-                .retain(|_, session| session.last_seen.elapsed() < session_idle);
+                // A session with requests still running stays, so its counter
+                // keeps capping that connection.
+                .retain(|_, session| {
+                    session.last_seen.elapsed() < session_idle
+                        || session.inflight.load(Ordering::SeqCst) > 0
+                });
         }
     }
 }
@@ -472,6 +487,8 @@ struct Shared {
     started: Instant,
     replies: ReplyPool,
     inflight: AtomicUsize,
+    /// Flipped to true on shutdown; waiting `Lease`s give up on it.
+    shutdown: tokio::sync::watch::Sender<bool>,
     max_inflight: usize,
     max_inflight_per_session: usize,
 }
@@ -488,6 +505,23 @@ fn add(counter: &AtomicU64, n: usize) {
 }
 
 impl Shared {
+    /// Wakes parked `Lease`s and waits up to `limit` for running handlers to
+    /// finish. Called after the I/O thread has stopped dispatching.
+    fn drain(&self, limit: Duration) {
+        self.shutdown.send_replace(true);
+        let deadline = Instant::now() + limit;
+        while self.inflight.load(Ordering::SeqCst) > 0 {
+            if Instant::now() >= deadline {
+                warn!(
+                    "Shutdown: {} handler(s) still running",
+                    self.inflight.load(Ordering::SeqCst)
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn saturated(&self) -> bool {
         self.inflight.load(Ordering::SeqCst) >= self.max_inflight
     }
@@ -690,6 +724,14 @@ impl Shared {
         // reusing someone's identity can at worst force that client to `Hello`
         // again (it does so automatically); it never inherits the session.
         let key: u128 = rand::random();
+        // Keep the connection's in-flight counter across handshakes: requests
+        // started under the old key are still running, and a fresh counter
+        // would let a client re-`Hello` its way past the per-session cap.
+        let inflight = self
+            .sessions
+            .get(identity)
+            .map(|session| session.inflight.clone())
+            .unwrap_or_default();
         self.sessions.insert(
             identity.to_vec(),
             Session {
@@ -697,7 +739,7 @@ impl Shared {
                 uid: auth.uid,
                 admin,
                 last_seen: Instant::now(),
-                inflight: Arc::new(AtomicUsize::new(0)),
+                inflight,
             },
         );
         Response::Welcome {
@@ -731,7 +773,15 @@ impl Shared {
         wait: Duration,
     ) -> Result<Leased, Error> {
         let max_tasks = max_tasks.clamp(1, MAX_LEASE_BATCH) as usize;
-        let leases = lease_many(self.api.clone(), task_type.clone(), uid, max_tasks, wait).await?;
+        // Shutdown can cut the wait short: `lease_many` only awaits the first
+        // chunk's cancel-safe `recv`; the rest is synchronous `try_lease`.
+        let mut shutdown = self.shutdown.subscribe();
+        let leases = tokio::select! {
+            leases = lease_many(self.api.clone(), task_type.clone(), uid, max_tasks, wait) => leases?,
+            _ = shutdown.wait_for(|stopping| *stopping) => {
+                return Err(Error::not_found("ServerStopping"));
+            }
+        };
         let mut expires_at = chrono::DateTime::<chrono::Utc>::MAX_UTC;
         let mut tasks = Vec::with_capacity(leases.iter().map(|lease| lease.len()).sum());
         for lease in &leases {

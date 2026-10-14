@@ -59,6 +59,9 @@ Workspace members:
   (`LeaseNotOwned`, checked against the chunk lease's recorded uid) since
   tokens are guessable. `Delete`/`Purge` run under `LoadState::exclusive`
   (blocks refill) and never touch in-flight chunks.
+  Handlers run on the caller's tokio runtime, so `Background` drop drains them
+  (`Shared::drain`: parked `Lease`s get `ServerStopping`) after the I/O thread
+  stops; the per-session counter survives re-`Hello`.
 - The proxy only accepts `Register` carrying its `proxy_token`
   (constant-time compare); **unset token = every registration refused**.
 
