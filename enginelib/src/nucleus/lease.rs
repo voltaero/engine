@@ -104,6 +104,10 @@ async fn lease_inner(
         None => queue.rx.recv().await,
     };
     let chunk = received.map_err(|err| Error::new(format!("Task queue closed: {err}")))?;
+    // Ask again after taking a chunk: other workers may be parked on this queue
+    // with their own pre-wait requests already folded into the refill that
+    // produced this chunk, and a small queue can't hold enough for all of them.
+    refill_if_low(&api, &task_type, &queue);
     Ok(grant(&api, &task_type, &queue, user_id, chunk))
 }
 

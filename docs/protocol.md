@@ -1,6 +1,6 @@
 # Engine wire protocol
 
-Status: v2 implemented over ZeroMQ (`enginelib/src/wire.rs`,
+Status: v3 (`PROTO_VERSION = 3`) implemented over ZeroMQ (`enginelib/src/wire.rs`,
 `enginelib/src/transport/*`), with chunked task storage (see
 [Chunked storage](#chunked-storage)). The message set mirrors
 `enginelib/src/nucleus/*` one-to-one. Items under **Planned** are not built yet.
@@ -34,7 +34,14 @@ Envelope { req_id: u64, body: Request | Response | ProxyRequest | ProxyResponse 
 
 Server internals: one I/O thread owns the ROUTER and only moves bytes. Each
 message is decoded and handled on the tokio runtime (DB work on the blocking
-pool); replies return to the I/O thread over an inproc PUSH/PULL pair.
+pool); replies return to the I/O thread over an inproc PUSH/PULL pair. At most
+`max_inflight` requests (default 65 536, parked `Lease` waits included) are
+handled at once; at the cap the I/O thread stops reading the ROUTER until a
+handler finishes, so ZeroMQ's high-water marks and TCP push back on clients.
+
+Client: `call` waits for its own reply; replies to requests issued with `send`
+that arrive meanwhile are kept for `recv`. Late replies to timed-out `call`s are
+dropped.
 
 ## Handshake
 
@@ -105,6 +112,10 @@ Semantics:
 - Wrong token → `InvalidArgument "LeaseTokenMismatch"`; no lease → `NotFound`;
   malformed task id → `InvalidArgument "InvalidTaskId"`; another server's id →
   `NotFound "WrongServer"`.
+- A chunk lease belongs to the session `uid` that leased it: `Renew`/`Complete`/
+  `CancelLease` naming it from another uid → `InvalidArgument "LeaseNotOwned"`.
+  Tokens are sequential (they fence, they are not secrets), so this is the
+  access check; it is only as strong as `core:auth_event`'s uid verification.
 
 ## Query
 
@@ -118,7 +129,7 @@ Scan         { task_type, scope, after, limit } -> Page { records: [{ task_id, b
 EstimateKeys                                  -> Estimate (store-wide)
 EstimateSize { task_type, scope }             -> Estimate (bytes)
 Delete       { task_type, scope, ids }        -> Done   (admin; in-flight pending → TaskInFlight)
-Purge        { task_type, scope }             -> Done   (admin)
+Purge        { task_type, scope }             -> Done   (admin; pending: skips in-flight)
 Stats                                         -> Stats
 
 scope  = Pending | Finished
@@ -128,6 +139,7 @@ Stats  = { server_id, uptime_ms, inserted, leased, completed, cancelled,
 ```
 
 - Everything is O(seek): no unbounded scans; `Scan` pages are capped at 10 000.
+  Exception: `Purge` of `Pending` walks the type's pending chunk keys.
 - `Insert` packs the verified payloads of one call into fresh chunks of
   `chunk_size` (a partial last chunk is fine) and writes them in one
   `WriteBatch`; ids are returned only once that write is durable. Chunks are
@@ -135,13 +147,17 @@ Stats  = { server_id, uptime_ms, inserted, leased, completed, cancelled,
   costs a whole chunk record). Payloads over `max_payload` →
   `InvalidArgument "PayloadTooLarge"`.
 - `Get` answers per task: `Finished` (result), `Leased` / `Pending` (payload),
-  `Unknown` (no such task, malformed id, or another server's id).
+  `Unknown` (no such task, malformed id, or another server's id). A task that
+  finishes mid-request is reported `Finished`, never `Unknown`.
 - `Scan` pages over **tasks**, in task id order: `Pending` lists tasks without
   a result, `Finished` tasks with one. `after` / `next` are task ids.
 - `Delete` works at **chunk granularity**: each id deletes its whole chunk
-  record in that scope. Refused (`InvalidArgument "TaskInFlight"`) if a named
-  chunk is queued or leased.
-- `Purge` of `Pending` does not touch tasks already queued or leased.
+  record in that scope.
+- `Delete`/`Purge` never remove the records of a queued or leased chunk (they
+  would be lost on reap or restart). `Delete` refuses the whole request with
+  `InvalidArgument "TaskInFlight: <id>"`; `Purge` of `Pending` skips those
+  chunks, which then finish normally. Both run with the type's refill blocked,
+  so a chunk can't be queued between the in-flight check and the delete.
 - `Stats` counters are per task (`queued` / `active_leases` count open tasks,
   not chunks). `Stats.completed` counts successful `Complete` results,
   including idempotent retries. Poll it for a live throughput counter.
@@ -156,18 +172,24 @@ Stats  = { server_id, uptime_ms, inserted, leased, completed, cancelled,
 ```
 C → P  Resolve  { task_type: Option<(ns, name)>, auth }
 P → C  Resolved { servers: [ServerInfo], ticket: Option<bytes>, ttl_secs }
-S → P  Register(ServerInfo)                    // heartbeat every heartbeat_secs
-P → S  Registered
+S → P  Register { info: ServerInfo, token }    // heartbeat every heartbeat_secs
+P → S  Registered | Error { InvalidArgument, "RegistrationRefused" }
 
 ServerInfo = { server_id, endpoint, task_types, load }   // load = queued + leased
 ```
 
+- `Register.token` must equal the proxy's `proxy_token` (constant-time
+  compare); otherwise the registration is refused and the server is never
+  handed out, so nobody can advertise a fake server and collect clients'
+  `Hello` credentials. **A proxy without `proxy_token` refuses every
+  registration** (logged at startup). The token travels in clear: keep proxy
+  traffic on a trusted network.
 - `Resolved.servers` holds live servers serving `task_type`, least loaded
   first. A server missing three heartbeats drops out.
-- Clients cache the answer for `ttl_secs` and re-resolve only on expiry or
-  disconnect, so proxy load is about one request per client per TTL.
-  `Client::connect_via_proxy` resolves, then connects to the first server that
-  accepts the handshake, using `ticket` (if any) as `auth.challenge`.
+- `Client::connect_via_proxy` resolves once, then connects to the first server
+  that accepts the handshake, using `ticket` (if any) as `auth.challenge`. The
+  client keeps no discovery cache: to fail over, call it again when the server
+  stops answering. `ttl_secs` is advisory, for callers that cache `resolve`.
 - Forwarded auth: the core proxy issues no ticket; that is a mod's job.
 - A server bound to a wildcard address must set `advertise` to the address
   clients should dial.
@@ -180,6 +202,7 @@ server_id = 0
 advertise = "10.0.0.5:50051"   # announced to the proxy (default: bound endpoint)
 proxy = "10.0.0.2:50050"       # register with this proxy (default: none)
 proxy_host = "[::1]:50050"     # proxy bin bind address
+proxy_token = "..."            # shared server <-> proxy registration secret
 heartbeat_secs = 5
 max_message_bytes = 67108864
 session_idle_secs = 900
@@ -276,4 +299,6 @@ type in `ServerAPI::populate`, surfaced in `Welcome.task_types`.
   server could answer `Error{Moved}` with its endpoint (today: `WrongServer`).
 - **Per-type `lease_ttl_secs`** alongside the other per-type settings.
 - **Stats push** over a ZeroMQ PUB socket instead of polling.
+- **Discovery cache** in the client: keep the `Resolved` answer for `ttl_secs`
+  and re-resolve on expiry or disconnect automatically.
 - **Ticket scheme** for forwarded auth (HMAC vs. ed25519).

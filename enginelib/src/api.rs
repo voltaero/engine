@@ -708,6 +708,18 @@ impl LoadState {
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Runs `f` while no refill pass can run for this type, so no chunk joins the
+    /// dedup set (gets queued) until `f` returns: refill passes are the only
+    /// place dedup entries are added, and they hold the same lock. Lets a caller
+    /// check dedup membership and delete `t:`/`f:` records as one atomic step.
+    pub fn exclusive<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _cursor = self
+            .cursor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        f()
+    }
+
     /// Records that new pending chunks were written (by `submit`).
     pub fn note_submitted(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);

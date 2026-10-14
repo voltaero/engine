@@ -4,6 +4,7 @@
 //! is request/response; [`Client::send`] + [`Client::recv`] let a caller keep
 //! several requests in flight on one connection (responses carry the `req_id`).
 
+use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use super::{context, zmq_err};
@@ -32,6 +33,11 @@ pub struct Client {
     auth: Auth,
     caps: Caps,
     next_req_id: u64,
+    /// `req_id`s issued by [`Client::send`] whose reply `recv` hasn't returned.
+    outstanding: HashSet<u64>,
+    /// Replies to `outstanding` requests that arrived while `call` waited for
+    /// its own; `recv` hands them out first.
+    buffered: VecDeque<Envelope<Response>>,
     pub timeout: Duration,
     pub server: ServerHello,
 }
@@ -47,6 +53,8 @@ impl Client {
             auth,
             caps,
             next_req_id: 0,
+            outstanding: HashSet::new(),
+            buffered: VecDeque::new(),
             timeout: DEFAULT_TIMEOUT,
             server: ServerHello {
                 server_id: 0,
@@ -60,7 +68,8 @@ impl Client {
 
     /// Asks the proxy which server to use, then connects to the first candidate
     /// that accepts the handshake. A proxy-issued ticket, if any, replaces
-    /// `auth.challenge`.
+    /// `auth.challenge`. Resolves once: the client keeps no discovery cache, so
+    /// to fail over, call this again when the server stops answering.
     pub fn connect_via_proxy(
         proxy: &str,
         task_type: Option<Identifier>,
@@ -109,8 +118,15 @@ impl Client {
         }
     }
 
-    /// Sends a request without waiting; returns its `req_id`.
+    /// Sends a request without waiting; returns its `req_id`. Collect the reply
+    /// with [`Client::recv`]; `call`s made in between keep it for `recv`.
     pub fn send(&mut self, request: &Request) -> Result<u64, Error> {
+        let req_id = self.send_raw(request)?;
+        self.outstanding.insert(req_id);
+        Ok(req_id)
+    }
+
+    fn send_raw(&mut self, request: &Request) -> Result<u64, Error> {
         self.next_req_id += 1;
         let req_id = self.next_req_id;
         let bytes = wire::encode(req_id, request)?;
@@ -120,8 +136,25 @@ impl Client {
         Ok(req_id)
     }
 
-    /// Receives the next response, whichever request it answers.
+    /// Receives the next response to a request issued by [`Client::send`],
+    /// whichever one it answers. Late replies to `call`s that timed out are
+    /// skipped.
     pub fn recv(&mut self, timeout: Duration) -> Result<Envelope<Response>, Error> {
+        if let Some(envelope) = self.buffered.pop_front() {
+            self.outstanding.remove(&envelope.req_id);
+            return Ok(envelope);
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let envelope = self.recv_raw(left)?;
+            if self.outstanding.remove(&envelope.req_id) {
+                return Ok(envelope);
+            }
+        }
+    }
+
+    fn recv_raw(&mut self, timeout: Duration) -> Result<Envelope<Response>, Error> {
         let mut items = [self.socket.as_poll_item(zmq::POLLIN)];
         let ready = zmq::poll(&mut items, timeout.as_millis().min(i64::MAX as u128) as i64)
             .map_err(|err| zmq_err("Failed to poll", err))?;
@@ -147,14 +180,18 @@ impl Client {
     }
 
     fn call_once(&mut self, request: &Request, timeout: Duration) -> Result<Response, Error> {
-        let req_id = self.send(request)?;
+        let req_id = self.send_raw(request)?;
         let deadline = Instant::now() + timeout;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            let envelope = self.recv(left)?;
-            // Skip late replies to earlier requests that timed out.
+            let envelope = self.recv_raw(left)?;
             if envelope.req_id == req_id {
                 return Ok(envelope.body);
+            }
+            // Keep replies to live `send` requests for `recv`; anything else is
+            // a late reply to an earlier `call` that timed out.
+            if self.outstanding.contains(&envelope.req_id) {
+                self.buffered.push_back(envelope);
             }
         }
     }

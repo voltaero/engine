@@ -233,8 +233,15 @@ pub fn get_tasks(
         let (finished, pending) = match chunks.entry(id.chunk_seq) {
             Entry::Occupied(chunk) => chunk.into_mut(),
             Entry::Vacant(slot) => {
-                let finished = api.read_finished(task_type, id.chunk_seq)?;
+                // `t:` first, then `f:`. Results are only ever added to `f:`,
+                // and the last `complete` of a chunk writes its final `f:`
+                // record and deletes `t:` in one batch. So a task done before
+                // the `t:` read is in the later `f:` read, and a chunk whose
+                // `t:` is already gone has all its results there: no task that
+                // finished concurrently is answered Unknown. (This is the
+                // chunk form of "finished, leased, pending, finished again".)
                 let pending = api.read_pending(task_type, id.chunk_seq)?;
+                let finished = api.read_finished(task_type, id.chunk_seq)?;
                 slot.insert((finished, pending))
             }
         };
@@ -346,10 +353,16 @@ pub fn scan_tasks(
     Ok((records, None))
 }
 
+/// Pending chunks examined per refill-excluding step of [`purge_tasks`].
+const PURGE_PAGE: usize = 10_000;
+
 /// Deletes the chunks holding `ids` from one scope (chunk granularity: every
 /// task of a named chunk goes). Refused with InvalidArgument `"TaskInFlight"`
 /// if any named chunk is queued or leased — those must go through
-/// cancel/complete so the dedup and lease state stay consistent.
+/// cancel/complete, and deleting their records underneath would lose the tasks
+/// on reap or restart. Runs with refill excluded
+/// ([`crate::api::LoadState::exclusive`]), so no chunk can be queued between
+/// the check and the delete.
 pub fn delete_tasks(
     api: &ServerAPI,
     task_type: &Identifier,
@@ -360,22 +373,96 @@ pub fn delete_tasks(
     for task_id in ids {
         chunks.push((task_id, api.parse_task_id(task_id)?.chunk_seq));
     }
-    if let Some(queue) = api.task_queue.get(task_type)
-        && let Some((task_id, _)) = chunks
-            .iter()
-            .find(|(_, chunk_seq)| queue.dedup.contains(chunk_seq))
-    {
-        return Err(Error::invalid_argument(format!("TaskInFlight: {task_id}")));
-    }
-    let mut batch = WriteBatch::default();
-    for (_, chunk_seq) in chunks {
-        match scope {
-            Scope::Pending => batch.delete_cf(api.cf_pending(), task_key(task_type, chunk_seq)),
-            Scope::Finished => {
-                batch.delete_cf(api.cf_finished(), finished_task_key(task_type, chunk_seq))
+    let queue = api.task_queue.get(task_type);
+    api.load_state.get(task_type).exclusive(|| {
+        if let Some(queue) = &queue
+            && let Some((task_id, _)) = chunks
+                .iter()
+                .find(|(_, chunk_seq)| queue.dedup.contains(chunk_seq))
+        {
+            return Err(Error::invalid_argument(format!("TaskInFlight: {task_id}")));
+        }
+        let mut batch = WriteBatch::default();
+        for (_, chunk_seq) in &chunks {
+            match scope {
+                Scope::Pending => {
+                    batch.delete_cf(api.cf_pending(), task_key(task_type, *chunk_seq))
+                }
+                Scope::Finished => {
+                    batch.delete_cf(api.cf_finished(), finished_task_key(task_type, *chunk_seq))
+                }
             }
         }
+        write_deletes(api, batch)
+    })
+}
+
+/// Deletes the records of one scope of `task_type`.
+///
+/// `Pending`: deletes every pending chunk that isn't queued or leased;
+/// in-flight chunks keep their records and finish normally. Walks the prefix a
+/// page at a time, each page with refill excluded (see [`delete_tasks`]).
+pub fn purge_tasks(api: &ServerAPI, task_type: &Identifier, scope: Scope) -> Result<(), Error> {
+    match scope {
+        Scope::Pending => purge_pending(api, task_type),
+        Scope::Finished => {
+            let prefix = finished_task_key_prefix(task_type);
+            let end = prefix_successor(prefix.as_bytes())
+                .ok_or_else(|| Error::invalid_argument("Cannot purge an unbounded prefix"))?;
+            let mut batch = WriteBatch::default();
+            batch.delete_range_cf(api.cf_finished(), prefix.as_bytes(), end.as_slice());
+            write_deletes(api, batch)
+        }
     }
+}
+
+fn purge_pending(api: &ServerAPI, task_type: &Identifier) -> Result<(), Error> {
+    let state = api.load_state.get(task_type);
+    let queue = api.task_queue.get(task_type);
+    let prefix = task_key_prefix(task_type);
+    let upper = prefix_successor(prefix.as_bytes())
+        .ok_or_else(|| Error::invalid_argument("Cannot purge an unbounded prefix"))?;
+    let mut lower = prefix.into_bytes();
+    loop {
+        let more = state.exclusive(|| {
+            let mut opts = ReadOptions::default();
+            opts.set_iterate_lower_bound(lower.clone());
+            opts.set_iterate_upper_bound(upper.clone());
+            let mut iter = api.db.raw_iterator_cf_opt(api.cf_pending(), opts);
+            iter.seek_to_first();
+            let mut batch = WriteBatch::default();
+            let mut more = false;
+            let mut seen = 0;
+            while let Some(key) = iter.key() {
+                if seen == PURGE_PAGE {
+                    // Resume at this key on the next page.
+                    lower = key.to_vec();
+                    more = true;
+                    break;
+                }
+                seen += 1;
+                let in_flight = chunk_seq_from_key(key).is_some_and(|chunk_seq| {
+                    queue
+                        .as_ref()
+                        .is_some_and(|queue| queue.dedup.contains(&chunk_seq))
+                });
+                if !in_flight {
+                    batch.delete_cf(api.cf_pending(), key);
+                }
+                iter.next();
+            }
+            iter.status()
+                .map_err(|err| Error::io_error(format!("Failed to read record: {err}")))?;
+            write_deletes(api, batch)?;
+            Ok::<bool, Error>(more)
+        })?;
+        if !more {
+            return Ok(());
+        }
+    }
+}
+
+fn write_deletes(api: &ServerAPI, batch: WriteBatch) -> Result<(), Error> {
     api.db
         .write(&batch)
         .map_err(|err| Error::io_error(format!("Failed to delete records: {err}")))

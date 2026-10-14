@@ -13,7 +13,7 @@ use enginelib::api::rust_rocksdb::IteratorMode;
 use enginelib::api::{
     Lease, LeasedTaskQueue, ServerAPI, TaskSettings, finished_task_key, task_key, task_key_prefix,
 };
-use enginelib::chunk::{FinishedChunk, TaskId};
+use enginelib::chunk::{FinishedChunk, TaskId, encode_pending};
 use enginelib::config::{Config, TaskTypeConfig};
 use enginelib::error::ErrorKind;
 use enginelib::nucleus::complete::{CompleteItem, complete_batch};
@@ -867,6 +867,87 @@ async fn refill_cursor_only_moves_forward() {
             .unwrap()
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn drained_queue_finds_key_behind_cursor_at_prefix_end() {
+    // Capacity 2 chunks of one task: the first load fills the queue exactly at
+    // the last key, so the cursor stops there without reaching the prefix end.
+    let (api, _dir) = setup(
+        "cursor-tail",
+        Opts {
+            chunk_size: Some(1),
+            queue_capacity: 2,
+            ..Default::default()
+        },
+    );
+    let tt = task_type();
+    // A seq reserved but never written (a failed insert) sorts before b1/b2.
+    let behind = api.chunk_seq.reserve(&api.db, 1).unwrap().start;
+    let ids = ids(submit_batch(api.clone(), &[b"b1", b"b2"], tt.clone()).unwrap());
+    api.refill(&tt).unwrap();
+    wait_queued(&api, 2).await;
+
+    // While the queue is full (no refill is requested), a new chunk is
+    // submitted and an out-of-band writer puts a record *behind* the cursor,
+    // announcing it with `mark_rescan` as the refill contract requires.
+    let after = submit(api.clone(), b"c", tt.clone()).unwrap();
+    api.db
+        .put_cf(
+            api.cf_pending(),
+            task_key(&tt, behind),
+            encode_pending([&b"a0"[..]].into_iter()),
+        )
+        .unwrap();
+    api.load_state.get(&tt).mark_rescan();
+
+    // Draining a full queue of capacity 2 never dips below the watermark
+    // before the last lease.
+    let a = lease_one(&api, "w").await;
+    let b = lease_one(&api, "w").await;
+    assert_eq!(
+        (a.task_ids(), b.task_ids()),
+        (ids[..1].to_vec(), ids[1..].to_vec())
+    );
+
+    // The refill on the drained queue must load both remaining chunks rather
+    // than leave a worker waiting for another trigger.
+    let c = lease_one(&api, "w").await;
+    let d = lease_one(&api, "w").await;
+    let mut got: Vec<u64> = vec![c.chunk_seq, d.chunk_seq];
+    got.sort();
+    assert_eq!(got, vec![behind, seq_of(&after)]);
+}
+
+#[tokio::test]
+async fn parked_workers_drain_backlog_through_tiny_queue() {
+    let (api, _dir) = setup(
+        "tiny",
+        Opts {
+            chunk_size: Some(1),
+            queue_capacity: 1,
+            ..Default::default()
+        },
+    );
+    let tt = task_type();
+
+    // Two workers park on an empty store. The first one's refill finds nothing
+    // and marks the type idle, so the second one's request is a no-op.
+    let w1 = tokio::spawn(lease_timeout(api.clone(), tt.clone(), "a".into(), WAIT));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let w2 = tokio::spawn(lease_timeout(api.clone(), tt.clone(), "b".into(), WAIT));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Two chunks arrive; the insert's single refill pass can only queue one.
+    let ids = ids(submit_batch(api.clone(), &[b"t1", b"t2"], tt.clone()).unwrap());
+
+    // The worker that takes the first chunk must ask for another refill so the
+    // other one gets the second instead of waiting out its timeout.
+    let first = w1.await.unwrap().unwrap();
+    let second = w2.await.unwrap().unwrap();
+    let mut got = [first.task_ids().remove(0), second.task_ids().remove(0)];
+    got.sort();
+    assert_eq!(got.to_vec(), ids);
 }
 
 #[tokio::test]

@@ -22,7 +22,7 @@ use enginelib::api::ServerAPI;
 use enginelib::config::{Config, TaskTypeConfig};
 use enginelib::task::{Task, Verifiable};
 use enginelib::transport::client::Client;
-use enginelib::transport::server::{Server, ServerOptions};
+use enginelib::transport::server::{DEFAULT_MAX_INFLIGHT, Server, ServerOptions};
 use enginelib::wire::{Auth, Caps, LeaseRef, LeaseReq, Leased, TaskResult};
 use enginelib::{Identifier, Registry};
 
@@ -167,9 +167,11 @@ fn main() {
                 server_id: 0,
                 advertise: None,
                 proxy: None,
+                proxy_token: None,
                 heartbeat: Duration::from_secs(5),
                 max_message_bytes: 256 * 1024 * 1024,
                 session_idle: Duration::from_secs(900),
+                max_inflight: DEFAULT_MAX_INFLIGHT,
             },
         )
         .expect("server start")

@@ -53,6 +53,14 @@ Workspace members:
   run on tokio (DB work on the blocking pool) and send replies back over an
   inproc PUSH/PULL pair. Never touch the ROUTER from a handler (zmq sockets are
   not thread-safe).
+- Transport-level guards (`transport/server.rs`): at most `max_inflight`
+  handlers run at once (the I/O thread stops reading the ROUTER when full);
+  `Renew`/`Complete`/`CancelLease` reject a lease held by another session uid
+  (`LeaseNotOwned`, checked against the chunk lease's recorded uid) since
+  tokens are guessable. `Delete`/`Purge` run under `LoadState::exclusive`
+  (blocks refill) and never touch in-flight chunks.
+- The proxy only accepts `Register` carrying its `proxy_token`
+  (constant-time compare); **unset token = every registration refused**.
 
 ## Data/persistence model (important)
 
@@ -95,9 +103,13 @@ In-memory state on `ServerAPI` (rebuilt from the DB by the refill path), keyed b
 
 Config (`config.toml`, loaded by `ServerAPI::default()` via `Config::new()`;
 `ServerAPI::open(path, cfg)` takes an explicit store path + config, e.g. for tests):
-`host`, `server_id`, `auth_token` (alias `cgrpc_token`), `lease_ttl_secs` (default
-300), `reap_interval_secs` (default 15), `queue_capacity` (tasks, default 65536),
-and per-type `[tasks."ns:name"]` { `chunk_size`, `max_payload`, `max_result` }.
+`host`, `server_id`, `auth_token` (alias `cgrpc_token`), `proxy_token`,
+`lease_ttl_secs` (default 300), `reap_interval_secs` (default 15),
+`queue_capacity` (tasks, default 65536), and per-type `[tasks."ns:name"]`
+{ `chunk_size`, `max_payload`, `max_result` }. A missing `config.toml` means
+defaults; one that exists but fails to read/parse makes `Config::new()`/
+`from_file` panic (fail closed: defaults would drop `auth_token`).
+`Config::try_from_file` returns the error instead.
 
 Per-type settings (`api.settings(&type) -> TaskSettings`): precedence
 `config.toml` `[tasks."ns:name"]` > mod `Task::limits() -> TaskLimits` (defaulted
@@ -117,7 +129,8 @@ trait method) > engine default (`chunk_size` 1024, no size limits). Resolved in
   `token`, `expires_at`; `lease.tasks()` yields `(task_id, payload)`), `try_lease`
   (non-blocking), `lease_many(max_tasks, wait)` (whole chunks until >= max_tasks;
   never splits a chunk). `lease_timeout` fails with NotFound `"QueueEmpty"`.
-  Requests a refill below the 25% watermark.
+  Requests a refill below the 25% watermark, both before waiting and again after
+  taking a chunk (so workers still parked on a small queue aren't left waiting).
 - `renew` / `renew_batch` — extends the chunk lease named by `(task_id, token)`.
 - `complete` / `complete_batch(items)` — verifies each result (+ `max_result`),
   groups items per (type, chunk, token) and merges each group into the `f:`
@@ -143,8 +156,10 @@ trait method) > engine default (`chunk_size` 1024, no size limits). Resolved in
   (`t:` pending, `f:` finished, else default). Raw `Delete`/`PurgePrefix` bypass
   dedup/lease state. There is intentionally no raw `Put`.
 - Task-level views used by the wire `Query`: `get_tasks` (Finished / Leased /
-  Pending / Unknown per task id), `scan_tasks` (pages over tasks, `after`/`next`
-  are task ids), `delete_tasks` (chunk granularity; refuses in-flight chunks).
+  Pending / Unknown per task id; reads `t:` before `f:` so a task finishing
+  mid-request is never Unknown), `scan_tasks` (pages over tasks, `after`/`next`
+  are task ids), `delete_tasks` / `purge_tasks` (chunk granularity; never touch
+  in-flight chunks; run under `LoadState::exclusive`).
 
 ### Refill (`ServerAPI::refill`, `request_refill`, `LoadState` in `api.rs`)
 
@@ -160,9 +175,16 @@ trait method) > engine default (`chunk_size` 1024, no size limits). Resolved in
   keeps the "no results yet" probe cheap).
 - `generation` is bumped by `submit` and `recover`; after a pass that reached the
   end with an empty recovery set, refills no-op until it changes.
-- Triggers: `lease()` below the 25% watermark, `submit()` below the watermark, a
-  requeue overflow. `request_refill` runs at most one refill per type (on tokio's
-  blocking pool inside a runtime, else inline).
+- Dedup entries are only ever *added* by a refill pass, under the per-type cursor
+  lock. `LoadState::exclusive(f)` holds that lock, so inside `f` no chunk can
+  become queued: that is what makes "check in-flight, then delete" atomic for
+  `delete_tasks`/`purge_tasks`. Keep it that way (requeue keeps the existing
+  entry; it never inserts).
+- Triggers: `lease()` below the 25% watermark (before waiting and after
+  receiving), `submit()` below the watermark, a requeue overflow.
+  `request_refill` runs at most one refill per type (`AtomicBool` slot; requests
+  that arrive mid-run cause one more pass), on tokio's blocking pool inside a
+  runtime, else inline.
 
 ## Mod ABI contract (must keep)
 
@@ -182,8 +204,8 @@ Strict compatibility check is enabled when `GE_STRICT_MODS` is set.
 - User auth/admin auth are event-driven.
 - Default `AuthEvent` handler currently allows auth (`true`).
 - Admin auth checks the `config.toml` token (`auth_token`, aliased from the old
-  `cgrpc_token`) in `events/admin_auth_event.rs` with a constant-time compare;
-  **unset token = allow** (permissive).
+  `cgrpc_token`) in `events/admin_auth_event.rs` with a constant-time compare
+  (`subtle`); **unset token = allow** (permissive).
 
 Do not assume secure defaults without verifying handlers/mods.
 
@@ -211,7 +233,7 @@ Do not assume secure defaults without verifying handlers/mods.
 
 ### Wire/transport change
 - Messages: `enginelib/src/wire.rs` (bump `PROTO_VERSION` on incompatible
-  changes; currently 2); server/client/proxy: `enginelib/src/transport/*`; keep
+  changes; currently 3); server/client/proxy: `enginelib/src/transport/*`; keep
   `docs/protocol.md` in sync.
 - Each wire request must map onto a nucleus op so the dedup/lease/RocksDB
   invariants stay enforced in one place. No raw `Put` over the wire.
