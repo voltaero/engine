@@ -47,6 +47,17 @@ pub struct Client {
 impl Client {
     /// Connects to a server and performs the `Hello` handshake.
     pub fn connect(endpoint: &str, auth: Auth, caps: Caps) -> Result<Self, Error> {
+        Self::connect_timeout(endpoint, auth, caps, DEFAULT_TIMEOUT)
+    }
+
+    /// Like [`Client::connect`], with `timeout` as the handshake deadline and as
+    /// the default response timeout afterwards.
+    pub fn connect_timeout(
+        endpoint: &str,
+        auth: Auth,
+        caps: Caps,
+        timeout: Duration,
+    ) -> Result<Self, Error> {
         let endpoint = wire::endpoint(endpoint);
         let socket = dealer(&endpoint)?;
         let mut client = Self {
@@ -58,7 +69,7 @@ impl Client {
             session: 0,
             outstanding: HashSet::new(),
             buffered: VecDeque::new(),
-            timeout: DEFAULT_TIMEOUT,
+            timeout,
             server: ServerHello {
                 server_id: 0,
                 lease_ttl_secs: 0,
