@@ -4,10 +4,17 @@
 //! Tasks are stored and leased in *chunks*. Every task is still an individual
 //! payload with its own verified result; only the storage and lease unit is a
 //! chunk. See `docs/protocol.md` ("Chunked storage") for the layout.
+//!
+//! A *derived* chunk (task types with `TaskLimits::derived`) stores no
+//! per-task payloads: just one base payload and an index range. Workers derive
+//! each task from `(base, idx)` themselves and complete the whole chunk with
+//! one result, so to the engine it is a chunk with a single task slot (idx 0).
 
 use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Mutex;
+
+use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
 
@@ -176,11 +183,28 @@ impl Bitmap {
 // little-endian u32.
 //
 //   pending  (t:)  [0x01][n u32][len u32, bytes] * n
+//   derived  (t:)  [0x02][start u64][count u64][base bytes]
 //   finished (f:)  [0x01][n u32][done bitmap, ceil(n/8) bytes][len u32, bytes] * popcount(done)
 //
-// The finished record lists results in index order, one per set bit.
+// The finished record lists results in index order, one per set bit. A derived
+// chunk has one slot, so its finished record holds the single chunk result.
 
 const FORMAT_V1: u8 = 1;
+const FORMAT_DERIVED: u8 = 2;
+
+/// The task indexes `start..start + count` a derived chunk covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivedRange {
+    pub start: u64,
+    pub count: u64,
+}
+
+impl DerivedRange {
+    /// The covered task indexes.
+    pub fn indexes(&self) -> std::ops::Range<u64> {
+        self.start..self.start.saturating_add(self.count)
+    }
+}
 
 fn put_u32(out: &mut Vec<u8>, value: usize) {
     out.extend_from_slice(&(value as u32).to_le_bytes());
@@ -210,17 +234,45 @@ pub fn encode_pending<'a>(payloads: impl ExactSizeIterator<Item = &'a [u8]> + Cl
     out
 }
 
+/// Encodes a derived chunk record: one base payload and the index range.
+pub fn encode_derived(base: &[u8], range: DerivedRange) -> Vec<u8> {
+    let mut out = Vec::with_capacity(17 + base.len());
+    out.push(FORMAT_DERIVED);
+    out.extend_from_slice(&range.start.to_le_bytes());
+    out.extend_from_slice(&range.count.to_le_bytes());
+    out.extend_from_slice(base);
+    out
+}
+
 /// The payloads of one chunk: the raw record plus offsets into it, so decoding
-/// is one allocation and leasing hands out slices.
+/// is one allocation and leasing hands out slices. A derived chunk has a single
+/// slot whose payload is the base; `range` says which indexes it covers.
 #[derive(Debug, Clone, Default)]
 pub struct ChunkPayloads {
     data: Vec<u8>,
     spans: Vec<(u32, u32)>,
+    range: Option<DerivedRange>,
 }
 
 impl ChunkPayloads {
     pub fn decode(data: Vec<u8>) -> Result<Self, Error> {
         let mut at = 0;
+        if data.first() == Some(&FORMAT_DERIVED) {
+            let word = |at: usize| {
+                data.get(at..at + 8)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u64::from_le_bytes)
+            };
+            let (Some(start), Some(count)) = (word(1), word(9)) else {
+                return Err(corrupt("pending"));
+            };
+            if count == 0 || u32::try_from(data.len() - 17).is_err() {
+                return Err(corrupt("pending"));
+            }
+            let spans = vec![(17, (data.len() - 17) as u32)];
+            let range = Some(DerivedRange { start, count });
+            return Ok(Self { data, spans, range });
+        }
         if data.first() != Some(&FORMAT_V1) {
             return Err(corrupt("pending"));
         }
@@ -237,7 +289,16 @@ impl ChunkPayloads {
             spans.push((at as u32, len as u32));
             at = end;
         }
-        Ok(Self { data, spans })
+        Ok(Self {
+            data,
+            spans,
+            range: None,
+        })
+    }
+
+    /// The index range of a derived chunk; `None` for a regular one.
+    pub fn range(&self) -> Option<DerivedRange> {
+        self.range
     }
 
     pub fn len(&self) -> usize {
@@ -553,5 +614,27 @@ mod tests {
             vec![3, 9]
         );
         assert!(ChunkPayloads::decode(vec![9, 9]).is_err());
+    }
+
+    #[test]
+    fn derived_record_round_trips() {
+        let range = DerivedRange {
+            start: 1 << 40,
+            count: 1_000_000,
+        };
+        let decoded = ChunkPayloads::decode(encode_derived(b"base", range)).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded.get(0), Some(&b"base"[..]));
+        assert_eq!(decoded.range(), Some(range));
+        assert_eq!(range.indexes().count(), 1_000_000);
+        assert_eq!(
+            ChunkPayloads::decode(encode_derived(b"", range))
+                .unwrap()
+                .get(0),
+            Some(&b""[..])
+        );
+        let empty = DerivedRange { start: 0, count: 0 };
+        assert!(ChunkPayloads::decode(encode_derived(b"x", empty)).is_err());
+        assert!(ChunkPayloads::decode(vec![FORMAT_DERIVED, 0, 0]).is_err());
     }
 }

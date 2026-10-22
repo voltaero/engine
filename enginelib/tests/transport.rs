@@ -11,7 +11,7 @@ use enginelib::api::ServerAPI;
 use enginelib::config::{Config, TaskTypeConfig};
 use enginelib::error::ErrorKind;
 use enginelib::nucleus::submit::submit;
-use enginelib::task::{Task, Verifiable};
+use enginelib::task::{Task, TaskLimits, Verifiable};
 use enginelib::transport::Background;
 use enginelib::transport::client::{Client, resolve};
 use enginelib::transport::proxy::{Proxy, ProxyOptions};
@@ -19,8 +19,8 @@ use enginelib::transport::server::{
     DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_INFLIGHT_PER_SESSION, Server, ServerOptions,
 };
 use enginelib::wire::{
-    Auth, Caps, LeaseRef, LeaseReq, Leased, Query, QueryResponse, Request, Response, Scope,
-    TaskRecord, TaskResult, TaskStatus,
+    Auth, Caps, DerivedRange, LeaseRef, LeaseReq, Leased, Query, QueryResponse, Request, Response,
+    Scope, TaskRecord, TaskResult, TaskStatus,
 };
 use enginelib::{Identifier, Registry};
 
@@ -54,6 +54,46 @@ impl Task for TestTask {
 
 fn task_type() -> Identifier {
     ("test".to_string(), "task".to_string())
+}
+
+/// A derived type: chunks are a base plus an index range.
+#[derive(Debug, Clone)]
+struct DerivedTask;
+impl Verifiable for DerivedTask {
+    fn verify(&self, b: &[u8]) -> bool {
+        !b.is_empty()
+    }
+}
+impl Task for DerivedTask {
+    fn get_id(&self) -> Identifier {
+        derived_type()
+    }
+    fn clone_box(&self) -> Box<dyn Task> {
+        Box::new(self.clone())
+    }
+    fn limits(&self) -> TaskLimits {
+        TaskLimits {
+            chunk_size: Some(100_000),
+            derived: true,
+            ..Default::default()
+        }
+    }
+    fn to_bytes(&self) -> Vec<u8> {
+        vec![1]
+    }
+    fn from_bytes(&self, _bytes: &[u8]) -> Box<dyn Task> {
+        Box::new(self.clone())
+    }
+    fn from_toml(&self, _d: String) -> Box<dyn Task> {
+        Box::new(self.clone())
+    }
+    fn to_toml(&self) -> String {
+        String::new()
+    }
+}
+
+fn derived_type() -> Identifier {
+    ("test".to_string(), "derived".to_string())
 }
 
 struct TempDir(PathBuf);
@@ -123,6 +163,8 @@ fn start_with(
     let server_id = cfg.config_toml.server_id;
     let mut api = ServerAPI::open(&dir.0, cfg);
     api.task_registry.register(Arc::new(TestTask), task_type());
+    api.task_registry
+        .register(Arc::new(DerivedTask), derived_type());
     let api = Arc::new(api);
     ServerAPI::populate(&api);
 
@@ -199,8 +241,11 @@ const WAIT: Duration = Duration::from_secs(5);
 fn full_lifecycle_over_tcp() {
     let harness = start("lifecycle", None, None);
     let mut client = connect(&harness);
-    assert_eq!(client.server.task_types.len(), 1);
-    assert_eq!(client.server.task_types[0].chunk_size, 10);
+    // Sorted: test:derived, test:task.
+    assert_eq!(client.server.task_types.len(), 2);
+    assert_eq!(client.server.task_types[1].task_type, task_type());
+    assert_eq!(client.server.task_types[1].chunk_size, 10);
+    assert!(!client.server.task_types[1].derived);
 
     // Insert 100 valid payloads plus one that fails verification.
     let mut payloads: Vec<Vec<u8>> = (0..100u32).map(|i| i.to_be_bytes().to_vec()).collect();
@@ -843,4 +888,79 @@ fn shutdown_stops_parked_leases() {
     std::thread::sleep(Duration::from_millis(300));
     let leased = api.leased_tasks.leases(&task_type()).map_or(0, |l| l.len());
     assert_eq!(leased, 0, "a stopped server's handler leased new work");
+}
+
+#[test]
+fn derived_chunks_over_tcp() {
+    let harness = start("derived", None, None);
+    let mut client = connect(&harness);
+    let info = client
+        .server
+        .task_types
+        .iter()
+        .find(|info| info.task_type == derived_type())
+        .unwrap();
+    assert!(info.derived);
+    assert_eq!(info.chunk_size, 100_000);
+
+    // Regular inserts don't apply to a derived type.
+    let err = client
+        .insert(derived_type(), vec![b"x".to_vec()])
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidArgument);
+
+    let ids: Vec<String> = client
+        .insert_derived(derived_type(), b"primes".to_vec(), 0, 250_000)
+        .unwrap()
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(ids.len(), 3);
+
+    // max_tasks counts chunks for a derived type.
+    let leased = client.lease(derived_type(), 2, WAIT).unwrap();
+    assert_eq!(leased.tasks.len(), 2);
+    assert_eq!(leased.tasks[0].bytes, b"primes");
+    assert_eq!(
+        leased.tasks[1].range,
+        Some(DerivedRange {
+            start: 100_000,
+            count: 100_000
+        })
+    );
+
+    // One result per chunk, then lease the last one.
+    let (results, next) = client
+        .complete(
+            results_for(&leased),
+            Some(LeaseReq {
+                task_type: derived_type(),
+                max_tasks: 1,
+            }),
+        )
+        .unwrap();
+    assert!(results.iter().all(Result::is_ok));
+    let next = next.unwrap();
+    assert_eq!(
+        next.tasks[0].range,
+        Some(DerivedRange {
+            start: 200_000,
+            count: 50_000
+        })
+    );
+
+    let records = match client
+        .query(Query::Get {
+            task_type: derived_type(),
+            ids: ids.clone(),
+        })
+        .unwrap()
+    {
+        QueryResponse::Records(records) => records,
+        other => panic!("unexpected {other:?}"),
+    };
+    assert_eq!(records[0].status, TaskStatus::Finished);
+    assert_eq!(records[0].bytes.as_deref(), Some(&b"semirp"[..]));
+    assert_eq!(records[2].status, TaskStatus::Leased);
+    assert_eq!(records[2].range, next.tasks[0].range);
 }

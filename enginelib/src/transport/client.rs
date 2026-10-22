@@ -287,6 +287,26 @@ impl Client {
         }
     }
 
+    /// Submits the indexes `start..start + count` of a derived type; one id per
+    /// chunk, in range order.
+    pub fn insert_derived(
+        &mut self,
+        task_type: Identifier,
+        base: Vec<u8>,
+        start: u64,
+        count: u64,
+    ) -> Result<Results<String>, Error> {
+        match self.query(Query::InsertDerived {
+            task_type,
+            base,
+            start,
+            count,
+        })? {
+            QueryResponse::Ids(ids) => Ok(ids),
+            other => Err(Error::new(format!("Unexpected query response: {other:?}"))),
+        }
+    }
+
     pub fn stats(&mut self) -> Result<Stats, Error> {
         match self.query(Query::Stats)? {
             QueryResponse::Stats(stats) => Ok(stats),

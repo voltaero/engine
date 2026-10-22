@@ -8,12 +8,18 @@ use tracing::{error, instrument, warn};
 /// entries override both. See [`crate::api::TaskSettings`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TaskLimits {
-    /// Tasks per storage/lease chunk (1..=65536).
+    /// Tasks per storage/lease chunk (1..=65536); for a derived type, task
+    /// indexes per chunk (1..=u32::MAX).
     pub chunk_size: Option<u32>,
     /// Largest accepted payload, in bytes.
     pub max_payload: Option<u32>,
     /// Largest accepted result, in bytes.
     pub max_result: Option<u32>,
+    /// Derived type: a chunk stores one base payload and an index range, not
+    /// per-task payloads. Workers derive each task from `(base, idx)` and
+    /// complete the chunk with one result. Set by the mod only (config can't
+    /// override it); such a type only accepts `submit_derived`.
+    pub derived: bool,
 }
 
 pub trait Verifiable {

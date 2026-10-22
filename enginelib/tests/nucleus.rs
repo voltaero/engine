@@ -13,13 +13,13 @@ use enginelib::api::rust_rocksdb::IteratorMode;
 use enginelib::api::{
     Lease, LeasedTaskQueue, ServerAPI, TaskSettings, finished_task_key, task_key, task_key_prefix,
 };
-use enginelib::chunk::{FinishedChunk, TaskId, encode_pending};
+use enginelib::chunk::{DerivedRange, FinishedChunk, TaskId, encode_pending};
 use enginelib::config::{Config, TaskTypeConfig};
 use enginelib::error::ErrorKind;
 use enginelib::nucleus::complete::{CompleteItem, complete_batch};
 use enginelib::nucleus::lease::{lease_many, try_lease};
 use enginelib::nucleus::query::{delete_tasks, get_tasks, purge_tasks, scan_tasks};
-use enginelib::nucleus::submit::{submit, submit_batch};
+use enginelib::nucleus::submit::{MAX_DERIVED_CHUNKS, submit, submit_batch, submit_derived};
 use enginelib::nucleus::{cancel::cancel, complete::complete, lease::lease_timeout, renew::renew};
 use enginelib::task::{Task, TaskLimits, Verifiable};
 use enginelib::wire::{Scope, TaskStatus};
@@ -92,6 +92,8 @@ struct Opts {
     lease_ttl_secs: u64,
     /// Set through `config.toml`'s `[tasks."test:task"]`.
     chunk_size: Option<u32>,
+    /// Registers `test:task` as a derived type.
+    derived: bool,
 }
 impl Default for Opts {
     fn default() -> Self {
@@ -99,6 +101,7 @@ impl Default for Opts {
             queue_capacity: 1024,
             lease_ttl_secs: 300,
             chunk_size: None,
+            derived: false,
         }
     }
 }
@@ -121,7 +124,10 @@ fn open(dir: &TempDir, opts: &Opts) -> Arc<ServerAPI> {
     api.task_registry.register(
         Arc::new(TestTask {
             id: task_type(),
-            limits: TaskLimits::default(),
+            limits: TaskLimits {
+                derived: opts.derived,
+                ..Default::default()
+            },
         }),
         task_type(),
     );
@@ -778,6 +784,7 @@ async fn chunk_size_precedence() {
         chunk_size: Some(8),
         max_payload: Some(100),
         max_result: Some(3),
+        ..Default::default()
     };
     register(&mut api, "both", from_mod);
     register(&mut api, "mod", from_mod);
@@ -792,6 +799,7 @@ async fn chunk_size_precedence() {
             chunk_size: 5,
             max_payload: Some(2),
             max_result: Some(3),
+            derived: false,
         }
     );
     assert_eq!(settings("mod").chunk_size, 8);
@@ -1082,4 +1090,181 @@ async fn draining_try_lease_requests_refill() {
     assert!(try_lease(&api, &tt, "w").unwrap().is_some());
     assert!(try_lease(&api, &tt, "w").unwrap().is_some());
     wait_queued(&api, 2).await;
+}
+
+#[tokio::test]
+async fn derived_chunks() {
+    let (api, _dir) = setup(
+        "derived",
+        Opts {
+            // More indexes per chunk than a regular chunk can hold.
+            chunk_size: Some(1_000_000),
+            derived: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(api.settings(&task_type()).chunk_size, 1_000_000);
+
+    // Regular inserts are refused, and so is a bad base or range.
+    let err = submit(api.clone(), b"x", task_type()).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidArgument);
+    assert!(submit_derived(api.clone(), b"", 0, 10, task_type()).is_err());
+    assert!(submit_derived(api.clone(), b"p", 0, 0, task_type()).is_err());
+    assert!(submit_derived(api.clone(), b"p", u64::MAX, 2, task_type()).is_err());
+    assert!(
+        submit_derived(
+            api.clone(),
+            b"p",
+            0,
+            (MAX_DERIVED_CHUNKS + 1) * 1_000_000,
+            task_type()
+        )
+        .is_err()
+    );
+
+    // 2.5M indexes from 10 -> three chunks, the last one partial.
+    let ids = submit_derived(api.clone(), b"primes", 10, 2_500_000, task_type()).unwrap();
+    assert_eq!(ids.len(), 3);
+    assert!(ids.iter().all(|id| idx_of(id) == 0));
+
+    let mut leases = Vec::new();
+    for _ in 0..3 {
+        leases.push(
+            lease_timeout(api.clone(), task_type(), "w".into(), WAIT)
+                .await
+                .unwrap(),
+        );
+    }
+    let ranges: Vec<_> = leases.iter().map(|lease| lease.range().unwrap()).collect();
+    assert_eq!(
+        ranges,
+        vec![
+            DerivedRange {
+                start: 10,
+                count: 1_000_000
+            },
+            DerivedRange {
+                start: 1_000_010,
+                count: 1_000_000
+            },
+            DerivedRange {
+                start: 2_000_010,
+                count: 500_000
+            },
+        ]
+    );
+    for lease in &leases {
+        assert_eq!(lease.len(), 1);
+        let tasks: Vec<_> = lease.tasks().collect();
+        assert_eq!(
+            tasks,
+            vec![(api.task_id(lease.chunk_seq, 0), &b"primes"[..])]
+        );
+    }
+
+    // Pending view carries the range; the finished view the one chunk result.
+    let records = get_tasks(&api, &task_type(), ids.clone()).unwrap();
+    assert!(
+        records
+            .iter()
+            .all(|record| record.status == TaskStatus::Leased)
+    );
+    assert_eq!(records[2].range, Some(ranges[2]));
+    assert_eq!(records[2].bytes.as_deref(), Some(&b"primes"[..]));
+
+    // Cancel one lease: the chunk comes back whole.
+    cancel(api.clone(), task_type(), ids[1].clone(), leases[1].token).unwrap();
+    let again = lease_timeout(api.clone(), task_type(), "w".into(), WAIT)
+        .await
+        .unwrap();
+    assert_eq!(again.range(), Some(ranges[1]));
+
+    let chunk_result = b"largest:2499997".to_vec();
+    complete(
+        api.clone(),
+        task_type(),
+        ids[0].clone(),
+        leases[0].token,
+        &chunk_result,
+    )
+    .unwrap();
+    complete(api.clone(), task_type(), ids[1].clone(), again.token, b"r1").unwrap();
+    // Idempotent retry.
+    complete(
+        api.clone(),
+        task_type(),
+        ids[0].clone(),
+        leases[0].token,
+        &chunk_result,
+    )
+    .unwrap();
+    assert!(!pending_exists(&api, seq_of(&ids[0])));
+    assert!(!in_dedup(&api, seq_of(&ids[0])));
+
+    let records = get_tasks(&api, &task_type(), ids.clone()).unwrap();
+    assert_eq!(records[0].status, TaskStatus::Finished);
+    assert_eq!(records[0].bytes.as_deref(), Some(&chunk_result[..]));
+    assert_eq!(records[0].range, None);
+
+    let (pending, _) = scan_tasks(&api, &task_type(), Scope::Pending, None, 10).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].task_id, ids[2]);
+    assert_eq!(pending[0].range, Some(ranges[2]));
+    let (done, _) = scan_tasks(&api, &task_type(), Scope::Finished, None, 10).unwrap();
+    assert_eq!(done.len(), 2);
+    drop(leases);
+    drop(again);
+    close(api).await;
+}
+
+#[tokio::test]
+async fn derived_chunks_survive_restart() {
+    let dir = TempDir::new("derived-restart");
+    let opts = Opts {
+        chunk_size: Some(100),
+        derived: true,
+        ..Default::default()
+    };
+    let api = open(&dir, &opts);
+    let ids = submit_derived(api.clone(), b"b", 0, 250, task_type()).unwrap();
+    let lease = lease_timeout(api.clone(), task_type(), "w".into(), WAIT)
+        .await
+        .unwrap();
+    complete(
+        api.clone(),
+        task_type(),
+        ids[0].clone(),
+        lease.token,
+        b"done",
+    )
+    .unwrap();
+    drop(lease);
+    close(api).await;
+
+    let api = open(&dir, &opts);
+    let mut ranges = Vec::new();
+    while let Ok(lease) = lease_timeout(
+        api.clone(),
+        task_type(),
+        "w".into(),
+        Duration::from_millis(200),
+    )
+    .await
+    {
+        ranges.push(lease.range().unwrap());
+    }
+    assert_eq!(
+        ranges,
+        vec![
+            DerivedRange {
+                start: 100,
+                count: 100
+            },
+            DerivedRange {
+                start: 200,
+                count: 50
+            },
+        ]
+    );
+    close(api).await;
 }
