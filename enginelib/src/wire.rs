@@ -9,12 +9,14 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::Identifier;
+pub use crate::chunk::DerivedRange;
 use crate::error::{Error, ErrorKind};
 
 /// v2: authenticated proxy `Register { info, token }`.
 /// v3: session key in `Envelope::session` / `Welcome.session`.
 /// v4: chunked storage (12-byte task ids, per-type settings in `TaskTypeInfo`).
-pub const PROTO_VERSION: u16 = 4;
+/// v5: derived task types (`InsertDerived`, `range` on leased/queried tasks).
+pub const PROTO_VERSION: u16 = 5;
 
 /// Upper bound on tasks handed out by one `Lease` (or `then_lease`).
 pub const MAX_LEASE_BATCH: u32 = 65_536;
@@ -139,7 +141,11 @@ pub struct TaskResult {
 pub struct LeasedItem {
     pub task_id: String,
     pub token: u64,
+    /// The task payload; for a derived chunk, the base.
     pub bytes: Vec<u8>,
+    /// Derived chunk: the task indexes to derive from `bytes`. Complete the
+    /// whole range with one result under `task_id`.
+    pub range: Option<DerivedRange>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,6 +166,10 @@ pub struct TaskTypeInfo {
     pub max_payload: Option<u32>,
     /// Largest accepted result in bytes (`None` = unlimited).
     pub max_result: Option<u32>,
+    /// Derived type: insert with `InsertDerived`; every leased item is a whole
+    /// chunk (`range` set) completed with one result. `chunk_size` is then
+    /// indexes per chunk, and `max_tasks`/stats count chunks.
+    pub derived: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +218,15 @@ pub enum Query {
     Insert {
         task_type: Identifier,
         payloads: Vec<Vec<u8>>,
+    },
+    /// Submit the indexes `start..start + count` of a derived type. `base` is
+    /// verified once; the range is cut into chunks of `chunk_size` indexes.
+    /// Returns one id per chunk, in range order.
+    InsertDerived {
+        task_type: Identifier,
+        base: Vec<u8>,
+        start: u64,
+        count: u64,
     },
     /// Status (and payload or result) of individual tasks.
     Get {
@@ -258,12 +277,16 @@ pub struct TaskRecord {
     pub status: TaskStatus,
     /// The pending payload, or the result once finished.
     pub bytes: Option<Vec<u8>>,
+    /// Derived chunk not finished yet: its index range (`bytes` is the base).
+    pub range: Option<DerivedRange>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PageRecord {
     pub task_id: String,
     pub bytes: Vec<u8>,
+    /// Pending derived chunk: its index range (`bytes` is the base).
+    pub range: Option<DerivedRange>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

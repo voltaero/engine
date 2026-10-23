@@ -56,8 +56,9 @@ pub struct ConfigTomlServer {
 
     /// Approximate number of *tasks* each per-type in-memory queue holds. The
     /// queue holds chunks, so its capacity is `queue_capacity / chunk_size`
-    /// chunks (at least one). The refill path tops a queue up from RocksDB once
-    /// it drains below a quarter of that.
+    /// chunks (at least one); a derived type's chunk counts as one task. The
+    /// refill path tops a queue up from RocksDB once it drains below a quarter
+    /// of that.
     #[serde(default = "default_queue_capacity")]
     pub queue_capacity: usize,
 

@@ -1,8 +1,8 @@
 # Engine wire protocol
 
-Status: v4 (`PROTO_VERSION = 4`) implemented over ZeroMQ (`enginelib/src/wire.rs`,
+Status: v5 (`PROTO_VERSION = 5`) implemented over ZeroMQ (`enginelib/src/wire.rs`,
 `enginelib/src/transport/*`), with chunked task storage (see
-[Chunked storage](#chunked-storage)). The message set mirrors
+[Chunked storage](#chunked-storage)) and [derived types](#derived-types). The message set mirrors
 `enginelib/src/nucleus/*` one-to-one. Items under **Planned** are not built yet.
 
 ## Roles
@@ -60,7 +60,7 @@ S → C  Welcome { proto_ver, server_id, session: u128, lease_ttl_secs, task_typ
 
 Auth         = { uid, challenge, admin_token: Option<String> }
 Caps         = { runners: [Cpu | Hip], max_inflight }
-TaskTypeInfo = { task_type, chunk_size, max_payload: Option<u32>, max_result: Option<u32> }
+TaskTypeInfo = { task_type, chunk_size, max_payload: Option<u32>, max_result: Option<u32>, derived: bool }
 ```
 
 `TaskTypeInfo` carries the effective [per-type settings](#per-type-settings).
@@ -96,7 +96,8 @@ TaskTypeInfo = { task_type, chunk_size, max_payload: Option<u32>, max_result: Op
 LeaseRef   { task_type, task_id, token }
 TaskResult { lease: LeaseRef, bytes }
 LeaseReq   { task_type, max_tasks }
-Leased     { task_type, expires_at_ms, tasks: [LeasedItem { task_id, token, bytes }] }
+Leased     { task_type, expires_at_ms, tasks: [LeasedItem { task_id, token, bytes, range: Option<DerivedRange> }] }
+DerivedRange { start: u64, count: u64 }
 ```
 
 Semantics:
@@ -139,8 +140,9 @@ Submit is `Insert`. Typed queries only accept registered task types.
 
 ```
 Insert       { task_type, payloads }          -> Ids [Result<task_id>]    (one WriteBatch)
-Get          { task_type, ids }               -> Records [{ task_id, status, bytes }]
-Scan         { task_type, scope, after, limit } -> Page { records: [{ task_id, bytes }], next }
+InsertDerived { task_type, base, start, count } -> Ids [Ok(task_id)]      (one id per chunk; derived types)
+Get          { task_type, ids }               -> Records [{ task_id, status, bytes, range }]
+Scan         { task_type, scope, after, limit } -> Page { records: [{ task_id, bytes, range }], next }
 EstimateKeys                                  -> Estimate (store-wide)
 EstimateSize { task_type, scope }             -> Estimate (bytes)
 Delete       { task_type, scope, ids }        -> Done   (admin; in flight → TaskInFlight;
@@ -162,6 +164,9 @@ Stats  = { server_id, uptime_ms, inserted, leased, completed, cancelled,
   never shared across calls, so batch your inserts (a single-payload insert
   costs a whole chunk record). Payloads over `max_payload` →
   `InvalidArgument "PayloadTooLarge"`.
+- `InsertDerived` / derived types: see [Derived types](#derived-types).
+  `Insert` on a derived type → `InvalidArgument "DerivedTaskType"`, and
+  `InsertDerived` on a regular one → `"NotDerivedTaskType"`.
 - `Get` answers per task: `Finished` (result), `Leased` / `Pending` (payload),
   `Unknown` (no such task, malformed id, or another server's id). A task that
   finishes mid-request is reported `Finished`, never `Unknown`.
@@ -278,6 +283,7 @@ with a few ops and one lease per chunk.
 
 ```
 pending   [0x01][n u32]([len u32][payload])*n
+derived   [0x02][start u64][count u64][base]          (pending record of a derived chunk)
 finished  [0x01][n u32][done bitmap ceil(n/8) bytes]([len u32][result])*popcount(done)
 ```
 
@@ -294,7 +300,7 @@ finished  [0x01][n u32][done bitmap ceil(n/8) bytes]([len u32][result])*popcount
 ### In-memory state (per task type)
 
 - Queue of chunks (`TypeQueue`), capacity `queue_capacity / chunk_size`
-  chunks; each entry carries the chunk's payloads and open-index bitmap.
+  chunks (`queue_capacity` for a derived type); each entry carries the chunk's payloads and open-index bitmap.
 - Dedup set of `chunk_seq`: a chunk is in it **iff** it is queued or leased.
 - Leases keyed by `chunk_seq`, one fencing token each.
 - Refill: first drains a *recovery set* (chunks whose dedup entry was cleared
@@ -314,13 +320,46 @@ finished  [0x01][n u32][done bitmap ceil(n/8) bytes]([len u32][result])*popcount
 
 | Setting | Meaning | Engine default |
 |---|---|---|
-| `chunk_size` | tasks per chunk, 1..=65 536 | 1024 |
+| `chunk_size` | tasks per chunk, 1..=65 536 (derived: indexes per chunk, 1..=u32::MAX) | 1024 |
 | `max_payload` | largest accepted payload (bytes) | unlimited |
 | `max_result` | largest accepted result (bytes) | unlimited |
+
+| `derived` | [derived type](#derived-types); set by the mod only (`TaskLimits::derived`) | false |
 
 Precedence: `config.toml` `[tasks."ns:name"]` > mod (`Task::limits() ->
 TaskLimits`, a defaulted trait method) > engine default. Resolved once per
 type in `ServerAPI::populate`, surfaced in `Welcome.task_types`.
+
+## Derived types
+
+For work that is a huge range of tasks generated from one input (say, test
+every number for primality). The server stores no per-task payloads: a derived
+chunk is just `(base, start, count)`. The worker derives task `idx` from
+`(base, idx)` for every `idx` in `start..start + count` itself, and completes
+the whole chunk with **one result** (the largest prime found, all of them,
+...). There are no per-task results.
+
+- A mod opts in with `TaskLimits { derived: true, .. }`. `chunk_size` is then
+  the indexes per chunk and may exceed 65 536 (e.g. 1 000 000).
+- `InsertDerived { task_type, base, start, count }` verifies `base` once
+  (`verify` + `max_payload`), cuts `start..start + count` into chunks of
+  `chunk_size` indexes (the last one may be shorter) and writes them in one
+  `WriteBatch`. At most 65 536 chunks per call (`InvalidArgument
+  "TooManyChunks"`), and every chunk record holds its own copy of `base`, so
+  `chunks × (base + 17)` bytes may not exceed 64 MiB (`"InsertTooLarge"`);
+  `count = 0` or an overflowing range → `"InvalidRange"`.
+  It returns one id per chunk, in range order.
+- To the engine a derived chunk is a chunk with one task slot (`idx` 0): its
+  `task_id` names the chunk. Lease, renew, complete, cancel, reaping, restart,
+  `Delete`/`Purge` all work as for a regular chunk. `LeasedItem.bytes` is the
+  base and `LeasedItem.range` its index range; a regular chunk's items have
+  `range: None`.
+- `Complete` takes one result per chunk (`verify` + `max_result`, idempotent
+  as usual). `Get`/`Scan` show the base and `range` while pending, the chunk
+  result once finished.
+- Counting is in chunks: `Lease.max_tasks`, `Stats` (`inserted`, `leased`,
+  `queued`, ...) and the in-memory queue (`queue_capacity` chunks) count a
+  derived chunk as one task.
 
 ## Planned
 

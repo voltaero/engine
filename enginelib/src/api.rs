@@ -65,12 +65,16 @@ pub fn chunk_seq_from_key(key: &[u8]) -> Option<u64> {
 /// `config.toml` `[tasks."ns:name"]` > mod (`Task::limits`) > engine default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TaskSettings {
-    /// Tasks per chunk (storage and lease unit), 1..=65536.
+    /// Tasks per chunk (storage and lease unit), 1..=65536. For a derived type,
+    /// task indexes per chunk, 1..=u32::MAX.
     pub chunk_size: u32,
     /// Largest accepted payload in bytes; `None` = unlimited.
     pub max_payload: Option<u32>,
     /// Largest accepted result in bytes; `None` = unlimited.
     pub max_result: Option<u32>,
+    /// Derived type (see [`TaskLimits::derived`]): every chunk is one task slot
+    /// holding a base payload and an index range.
+    pub derived: bool,
 }
 
 impl TaskSettings {
@@ -79,12 +83,26 @@ impl TaskSettings {
         let chunk_size = config
             .chunk_size
             .or(limits.chunk_size)
-            .unwrap_or(DEFAULT_CHUNK_SIZE)
-            .clamp(1, MAX_CHUNK_SIZE);
+            .unwrap_or(DEFAULT_CHUNK_SIZE);
+        let chunk_size = if limits.derived {
+            chunk_size.max(1)
+        } else {
+            chunk_size.clamp(1, MAX_CHUNK_SIZE)
+        };
         Self {
             chunk_size,
             max_payload: config.max_payload.or(limits.max_payload),
             max_result: config.max_result.or(limits.max_result),
+            derived: limits.derived,
+        }
+    }
+
+    /// Task slots per stored chunk: `chunk_size`, or 1 for a derived type.
+    pub fn slots_per_chunk(&self) -> usize {
+        if self.derived {
+            1
+        } else {
+            self.chunk_size as usize
         }
     }
 }
@@ -671,7 +689,7 @@ impl ServerAPI {
                 .cfg
                 .config_toml
                 .queue_capacity
-                .div_ceil(settings.chunk_size as usize)
+                .div_ceil(settings.slots_per_chunk())
                 .max(1);
             api.task_queue
                 .tasks
@@ -1005,6 +1023,12 @@ impl Lease {
 
     pub fn is_empty(&self) -> bool {
         self.open.none()
+    }
+
+    /// The index range of a derived chunk lease (its one task's payload is the
+    /// base); `None` for a regular chunk.
+    pub fn range(&self) -> Option<crate::chunk::DerivedRange> {
+        self.payloads.range()
     }
 
     /// `(task_id, payload)` of every leased task, in index order.
