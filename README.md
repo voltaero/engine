@@ -1,8 +1,8 @@
-# Volt Engine [![Rust](https://github.com/VoltAero/engine/actions/workflows/rust.yml/badge.svg)](https://github.com/GrandEngineering/engine/actions/workflows/rust.yml)
+# Engine [![Rust](https://github.com/VoltAero/engine/actions/workflows/rust.yml/badge.svg)](https://github.com/GrandEngineering/engine/actions/workflows/rust.yml)
 A blazingly fast distrubted computing framework made with Rust and Tonic.
 
 ## Modding
-Volt Engine provides an API with an event system and tasks allowing for great adaptability. To create a mod dev env use rustforge our own tool that manages it all for you.
+Engine provides an API with an event system and tasks allowing for great adaptability. To create a mod dev env use rustforge our own tool that manages it all for you.
 
 ## License & Use
  **AGPL-3.0** (open-source license) - see [`LICENSE.md`](./LICENSE.md)
