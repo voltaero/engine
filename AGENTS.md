@@ -116,6 +116,16 @@ defaults; one that exists but fails to read/parse makes `Config::new()`/
 `from_file` panic (fail closed: defaults would drop `auth_token`).
 `Config::try_from_file` returns the error instead.
 
+Derived types (`TaskLimits::derived`, mod-only): a chunk's `t:` record is
+`[0x02][start u64][count u64][base]` (`chunk::encode_derived`, `DerivedRange`)
+instead of per-task payloads; the worker derives each task from `(base, idx)`
+and completes the chunk with one result. To the engine it is a one-slot chunk
+(idx 0), so dedup/lease/refill/complete are unchanged. Submitted only through
+`submit_derived(base, start, count)` (wire `InsertDerived`; at most 65536 chunks
+and 64 MiB of records per call, since each chunk copies `base`); `chunk_size` is
+indexes per chunk (may exceed 65536); queue capacity, `max_tasks` and stats
+count derived chunks as one task. Spec: `docs/protocol.md` "Derived types".
+
 Per-type settings (`api.settings(&type) -> TaskSettings`): precedence
 `config.toml` `[tasks."ns:name"]` > mod `Task::limits() -> TaskLimits` (defaulted
 trait method) > engine default (`chunk_size` 1024, no size limits). Resolved in
@@ -249,7 +259,7 @@ Do not assume secure defaults without verifying handlers/mods.
 
 ### Wire/transport change
 - Messages: `enginelib/src/wire.rs` (bump `PROTO_VERSION` on incompatible
-  changes; currently 3); server/client/proxy: `enginelib/src/transport/*`; keep
+  changes; currently 5); server/client/proxy: `enginelib/src/transport/*`; keep
   `docs/protocol.md` in sync.
 - Each wire request must map onto a nucleus op so the dedup/lease/RocksDB
   invariants stay enforced in one place. No raw `Put` over the wire.

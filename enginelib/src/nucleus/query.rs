@@ -11,7 +11,7 @@ use crate::api::{
     chunk_seq_from_key, finished_task_key, finished_task_key_prefix, lock_lease, task_key,
     task_key_prefix,
 };
-use crate::chunk::{Bitmap, ChunkPayloads, FinishedChunk};
+use crate::chunk::{Bitmap, ChunkPayloads, DerivedRange, FinishedChunk};
 use crate::wire::{PageRecord, Scope, TaskRecord, TaskStatus};
 use crate::{api::ServerAPI, error::Error};
 
@@ -226,6 +226,7 @@ pub fn get_tasks(
                 task_id,
                 status: TaskStatus::Unknown,
                 bytes: None,
+                range: None,
             });
             continue;
         };
@@ -249,6 +250,7 @@ pub fn get_tasks(
         let result = finished
             .as_ref()
             .and_then(|finished| finished.results.get(idx).cloned().flatten());
+        let mut range = None;
         let (status, bytes) = if let Some(result) = result {
             (TaskStatus::Finished, Some(result))
         } else if let Some(payload) = pending.as_ref().and_then(|pending| pending.get(idx)) {
@@ -264,6 +266,7 @@ pub fn get_tasks(
             } else {
                 TaskStatus::Pending
             };
+            range = pending.as_ref().and_then(ChunkPayloads::range);
             (status, Some(payload.to_vec()))
         } else {
             (TaskStatus::Unknown, None)
@@ -272,6 +275,7 @@ pub fn get_tasks(
             task_id,
             status,
             bytes,
+            range,
         });
     }
     Ok(records)
@@ -325,7 +329,7 @@ pub fn scan_tasks(
             _ => 0,
         };
         // Takes one task: false once the page is full and another task exists.
-        let mut take = |idx: usize, bytes: &[u8]| {
+        let mut take = |idx: usize, bytes: &[u8], range: Option<DerivedRange>| {
             if records.len() >= limit {
                 more = true;
                 return false;
@@ -333,6 +337,7 @@ pub fn scan_tasks(
             records.push(PageRecord {
                 task_id: api.task_id(chunk_seq, idx as u16),
                 bytes: bytes.to_vec(),
+                range,
             });
             true
         };
@@ -351,13 +356,13 @@ pub fn scan_tasks(
                     if done.get(idx) {
                         continue;
                     }
-                    if !take(idx, payloads.get(idx).unwrap_or_default()) {
+                    if !take(idx, payloads.get(idx).unwrap_or_default(), payloads.range()) {
                         break;
                     }
                 }
             }
             Scope::Finished => FinishedChunk::for_each_result(&value, |idx, result| {
-                idx < first || take(idx, result)
+                idx < first || take(idx, result, None)
             })?,
         }
         if more {

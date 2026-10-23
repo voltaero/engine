@@ -29,7 +29,7 @@ use crate::nucleus::{
     complete::{CompleteItem, complete_batch},
     lease::lease_many,
     renew::renew_batch,
-    submit::submit_batch,
+    submit::{submit_batch, submit_derived},
 };
 use crate::wire::{
     self, Auth, LeaseRef, Leased, LeasedItem, MAX_LEASE_BATCH, MAX_LEASE_WAIT_MS, MAX_SCAN_LIMIT,
@@ -776,6 +776,7 @@ impl Shared {
                         chunk_size: settings.chunk_size,
                         max_payload: settings.max_payload,
                         max_result: settings.max_result,
+                        derived: settings.derived,
                     }
                 })
                 .collect(),
@@ -812,6 +813,7 @@ impl Shared {
                 task_id,
                 token: lease.token,
                 bytes: bytes.to_vec(),
+                range: lease.range(),
             }));
         }
         add(&self.counters.leased, tasks.len());
@@ -868,6 +870,16 @@ impl Shared {
                     results.iter().filter(|result| result.is_ok()).count(),
                 );
                 Ok(QueryResponse::Ids(results))
+            }
+            Query::InsertDerived {
+                task_type,
+                base,
+                start,
+                count,
+            } => {
+                let ids = submit_derived(api.clone(), &base, start, count, task_type)?;
+                add(&self.counters.inserted, ids.len());
+                Ok(QueryResponse::Ids(ids.into_iter().map(Ok).collect()))
             }
             Query::Get { task_type, ids } => {
                 self.require_type(&task_type)?;
