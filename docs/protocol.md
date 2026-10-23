@@ -345,7 +345,9 @@ the whole chunk with **one result** (the largest prime found, all of them,
   (`verify` + `max_payload`), cuts `start..start + count` into chunks of
   `chunk_size` indexes (the last one may be shorter) and writes them in one
   `WriteBatch`. At most 65 536 chunks per call (`InvalidArgument
-  "TooManyChunks"`); `count = 0` or an overflowing range → `"InvalidRange"`.
+  "TooManyChunks"`), and every chunk record holds its own copy of `base`, so
+  `chunks × (base + 17)` bytes may not exceed 64 MiB (`"InsertTooLarge"`);
+  `count = 0` or an overflowing range → `"InvalidRange"`.
   It returns one id per chunk, in range order.
 - To the engine a derived chunk is a chunk with one task slot (`idx` 0): its
   `task_id` names the chunk. Lease, renew, complete, cancel, reaping, restart,

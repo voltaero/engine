@@ -87,6 +87,12 @@ pub fn submit_batch<P: AsRef<[u8]>>(
 
 /// Most chunks one [`submit_derived`] call may create.
 pub const MAX_DERIVED_CHUNKS: u64 = 65_536;
+/// Most bytes of chunk records one [`submit_derived`] call may write. Every
+/// chunk stores its own copy of `base`, so this bounds the amplification of one
+/// small request into a huge in-memory `WriteBatch`.
+pub const MAX_DERIVED_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+/// Fixed bytes of a derived chunk record besides its base.
+const DERIVED_RECORD_OVERHEAD: u64 = 17;
 
 /// Submits the task indexes `start..start + count` of a derived type (see
 /// [`crate::task::TaskLimits::derived`]): `base` is verified once, then the
@@ -115,6 +121,10 @@ pub fn submit_derived(
     let n = count.div_ceil(chunk_size);
     if n > MAX_DERIVED_CHUNKS {
         return Err(Error::invalid_argument("TooManyChunks"));
+    }
+    let record_bytes = (base.len() as u64).saturating_add(DERIVED_RECORD_OVERHEAD);
+    if n.saturating_mul(record_bytes) > MAX_DERIVED_BATCH_BYTES {
+        return Err(Error::invalid_argument("InsertTooLarge"));
     }
     if settings
         .max_payload

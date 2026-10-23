@@ -121,7 +121,8 @@ Derived types (`TaskLimits::derived`, mod-only): a chunk's `t:` record is
 instead of per-task payloads; the worker derives each task from `(base, idx)`
 and completes the chunk with one result. To the engine it is a one-slot chunk
 (idx 0), so dedup/lease/refill/complete are unchanged. Submitted only through
-`submit_derived(base, start, count)` (wire `InsertDerived`); `chunk_size` is
+`submit_derived(base, start, count)` (wire `InsertDerived`; at most 65536 chunks
+and 64 MiB of records per call, since each chunk copies `base`); `chunk_size` is
 indexes per chunk (may exceed 65536); queue capacity, `max_tasks` and stats
 count derived chunks as one task. Spec: `docs/protocol.md` "Derived types".
 

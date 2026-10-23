@@ -19,7 +19,9 @@ use enginelib::error::ErrorKind;
 use enginelib::nucleus::complete::{CompleteItem, complete_batch};
 use enginelib::nucleus::lease::{lease_many, try_lease};
 use enginelib::nucleus::query::{delete_tasks, get_tasks, purge_tasks, scan_tasks};
-use enginelib::nucleus::submit::{MAX_DERIVED_CHUNKS, submit, submit_batch, submit_derived};
+use enginelib::nucleus::submit::{
+    MAX_DERIVED_BATCH_BYTES, MAX_DERIVED_CHUNKS, submit, submit_batch, submit_derived,
+};
 use enginelib::nucleus::{cancel::cancel, complete::complete, lease::lease_timeout, renew::renew};
 use enginelib::task::{Task, TaskLimits, Verifiable};
 use enginelib::wire::{Scope, TaskStatus};
@@ -1121,6 +1123,11 @@ async fn derived_chunks() {
         )
         .is_err()
     );
+    // Within the chunk cap, but the base copied into every chunk is too much.
+    let big = vec![1u8; (MAX_DERIVED_BATCH_BYTES / 1000) as usize];
+    let err = submit_derived(api.clone(), &big, 0, 1000 * 1_000_000, task_type()).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidArgument);
+    assert!(String::from(err).contains("InsertTooLarge"));
 
     // 2.5M indexes from 10 -> three chunks, the last one partial.
     let ids = submit_derived(api.clone(), b"primes", 10, 2_500_000, task_type()).unwrap();
