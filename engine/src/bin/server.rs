@@ -26,8 +26,14 @@ fn init_api() -> std::sync::Arc<ServerAPI> {
 /// `ServerAPI::init`, with `./mods/*.wasm` registered before `populate`.
 #[cfg(feature = "wasm")]
 fn init_api() -> std::sync::Arc<ServerAPI> {
+    // Fail closed, like the engine's own config: a broken [wasm] table must not
+    // silently fall back to defaults (or drop grants an operator narrowed).
+    let config = enginewasm::WasmConfig::from_file("config.toml").unwrap_or_else(|err| {
+        error!("config.toml [wasm]: {err}");
+        std::process::exit(1);
+    });
     let mut api = ServerAPI::default();
-    enginewasm::load_mods(&mut api, "./mods", enginewasm::SandboxLimits::default());
+    enginewasm::load_mods(&mut api, "./mods", &config);
     let api = std::sync::Arc::new(api);
     ServerAPI::populate(&api);
     ServerAPI::spawn_reaper(&api);

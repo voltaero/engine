@@ -11,7 +11,9 @@
 pub mod error;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+pub mod host;
 pub mod meta;
+pub mod policy;
 pub mod sandbox;
 
 use std::path::Path;
@@ -23,7 +25,8 @@ use enginelib::{Identifier, Registry};
 use tracing::{error, info, warn};
 
 pub use error::{Error, Result};
-pub use sandbox::{SandboxLimits, WasmMod};
+pub use policy::{FsGrant, SandboxLimits, WasmConfig};
+pub use sandbox::WasmMod;
 
 /// Adapts a [`WasmMod`] to the engine's [`Task`] registry.
 #[derive(Debug, Clone)]
@@ -77,7 +80,7 @@ pub fn register(api: &mut ServerAPI, m: Arc<WasmMod>) -> Result<()> {
 
 /// Loads and registers every `*.wasm` in `dir`. Call before
 /// `ServerAPI::populate`. A mod that fails to load is logged and skipped.
-pub fn load_mods(api: &mut ServerAPI, dir: impl AsRef<Path>, limits: SandboxLimits) -> usize {
+pub fn load_mods(api: &mut ServerAPI, dir: impl AsRef<Path>, config: &WasmConfig) -> usize {
     let dir = dir.as_ref();
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -93,7 +96,7 @@ pub fn load_mods(api: &mut ServerAPI, dir: impl AsRef<Path>, limits: SandboxLimi
     paths.sort();
     let mut loaded = 0;
     for path in paths {
-        match WasmMod::from_file(&path, limits).and_then(|m| {
+        match WasmMod::from_file(&path, config).and_then(|m| {
             let gpu = m.wgsl().is_some();
             register(api, m.clone()).map(|()| (m, gpu))
         }) {

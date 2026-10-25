@@ -1,22 +1,36 @@
 //! Example wasm task mod: each payload is little-endian u32 words, each result
-//! is `ROUNDS` rounds of the lowbias32 integer hash applied to every word. The same
-//! function ships as a WGSL kernel (`kernel.wgsl`) for the GPU path.
-//! ABI: `docs/wasm.md`.
+//! is `mix::ROUNDS` rounds of the lowbias32 integer hash applied to every word.
+//! The same function ships as a WGSL kernel (`kernel.wgsl`) for the GPU path.
+//! ABI: `docs/wasm.md`. Builds for wasm32 and, on nightly, wasm64:
+//!
+//! ```sh
+//! cargo build --release --target wasm32-unknown-unknown
+//! cargo +nightly build --release --target wasm64-unknown-unknown -Zbuild-std=core,alloc
+//! ```
 
 #![no_std]
+// wasm64 intrinsics (`core::arch::wasm64`) are nightly-only.
+#![cfg_attr(target_arch = "wasm64", feature(simd_wasm64))]
 
 extern crate alloc;
+
+mod mix;
 
 use alloc::boxed::Box;
 use alloc::vec;
 use core::slice;
+
+#[cfg(target_arch = "wasm32")]
+use core::arch::wasm32 as arch;
+#[cfg(target_arch = "wasm64")]
+use core::arch::wasm64 as arch;
 
 #[global_allocator]
 static ALLOC: Bump = Bump;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    core::arch::wasm32::unreachable()
+    arch::unreachable()
 }
 
 // Metadata and kernel are custom sections: the host reads them without
@@ -29,53 +43,35 @@ static META: [u8; include_bytes!("../meta.toml").len()] = *include_bytes!("../me
 #[unsafe(link_section = "ge:wgsl")]
 static WGSL: [u8; include_bytes!("kernel.wgsl").len()] = *include_bytes!("kernel.wgsl");
 
-/// Hash rounds per word; keep in sync with `kernel.wgsl`. High enough that the
-/// work is compute-bound rather than PCIe-bound.
-const ROUNDS: u32 = 1024;
-
-fn mix(mut x: u32) -> u32 {
-    for _ in 0..ROUNDS {
-        x ^= x >> 16;
-        x = x.wrapping_mul(0x7feb352d);
-        x ^= x >> 15;
-        x = x.wrapping_mul(0x846ca68b);
-        x ^= x >> 16;
-    }
-    x
-}
-
 #[unsafe(no_mangle)]
-pub extern "C" fn ge_alloc(len: u32) -> *mut u8 {
-    Box::into_raw(vec![0u8; len as usize].into_boxed_slice()).cast()
+pub extern "C" fn ge_alloc(len: usize) -> *mut u8 {
+    Box::into_raw(vec![0u8; len].into_boxed_slice()).cast()
 }
 
 /// # Safety
 /// `ptr`/`len` must come from `ge_alloc` or `ge_run` and be freed once.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ge_free(ptr: *mut u8, len: u32) {
-    drop(unsafe { Box::from_raw(slice::from_raw_parts_mut(ptr, len as usize)) });
+pub unsafe extern "C" fn ge_free(ptr: *mut u8, len: usize) {
+    drop(unsafe { Box::from_raw(slice::from_raw_parts_mut(ptr, len)) });
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ge_verify(_ptr: *const u8, len: u32) -> u32 {
-    (len != 0 && len % 4 == 0) as u32
+pub extern "C" fn ge_verify(_ptr: *const u8, len: usize) -> i32 {
+    (len != 0 && len % 4 == 0) as i32
 }
 
 /// # Safety
-/// `ptr`/`len` must be a live `ge_alloc` buffer.
+/// `ptr`/`len` must be a live `ge_alloc` buffer and `out` the host's slot.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ge_run(ptr: *const u8, len: u32) -> i64 {
+pub unsafe extern "C" fn ge_run(ptr: *const u8, len: usize, out: *mut [usize; 2]) -> i32 {
     if len % 4 != 0 {
         return -1;
     }
-    let input = unsafe { slice::from_raw_parts(ptr, len as usize) };
-    let mut out = vec![0u8; input.len()].into_boxed_slice();
-    for (dst, src) in out.chunks_exact_mut(4).zip(input.chunks_exact(4)) {
-        let word = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
-        dst.copy_from_slice(&mix(word).to_le_bytes());
-    }
-    let out_ptr = Box::into_raw(out) as *mut u8 as u32;
-    ((out_ptr as i64) << 32) | len as i64
+    let input = unsafe { slice::from_raw_parts(ptr, len) };
+    let mut result = vec![0u8; len].into_boxed_slice();
+    mix::mix_words(input, &mut result);
+    unsafe { *out = [Box::into_raw(result) as *mut u8 as usize, len] };
+    0
 }
 
 /// Minimal allocator over `memory.grow`; frees only the most recent block,
@@ -88,14 +84,14 @@ unsafe impl core::alloc::GlobalAlloc for Bump {
     unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
         unsafe {
             if TOP == 0 {
-                TOP = core::arch::wasm32::memory_size(0) << 16;
+                TOP = arch::memory_size(0) << 16;
             }
             let start = (TOP + layout.align() - 1) & !(layout.align() - 1);
             let end = start + layout.size();
-            let have = core::arch::wasm32::memory_size(0) << 16;
+            let have = arch::memory_size(0) << 16;
             if end > have {
                 let pages = (end - have).div_ceil(1 << 16);
-                if core::arch::wasm32::memory_grow(0, pages) == usize::MAX {
+                if arch::memory_grow(0, pages) == usize::MAX {
                     return core::ptr::null_mut();
                 }
             }

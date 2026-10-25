@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use enginelib::api::ServerAPI;
 use enginelib::config::Config;
 use enginelib::nucleus::submit::submit_batch;
-use enginewasm::{Error, SandboxLimits, WasmMod};
+use enginewasm::{Error, FsGrant, SandboxLimits, WasmConfig, WasmMod};
 
 const META: &str = "namespace = \"demo\"\nname = \"mix\"\nmax_payload = 1048576\n";
 const GPU_META: &str = "[gpu]\nentry = \"main\"\n";
@@ -41,10 +41,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 ";
 
-/// Bump allocator (LIFO `ge_free`), a word-wise `mix` in `ge_run`, and
-/// "non-empty, whole words" in `ge_verify`.
-const MIX_FUNCS: &str = r#"
-  (import "ge" "log" (func $log (param i32 i32)))
+/// Bump allocator (LIFO `ge_free`) and "non-empty, whole words" `ge_verify`.
+/// Imports go before it (WAT wants imports first).
+const ALLOC: &str = r#"
   (memory (export "memory") 1)
   (global $top (mut i32) (i32.const 1024))
   (func $alloc (export "ge_alloc") (param $len i32) (result i32)
@@ -78,9 +77,13 @@ const MIX_FUNCS: &str = r#"
   (func (export "ge_verify") (param $p i32) (param $len i32) (result i32)
     (i32.and (i32.ne (local.get $len) (i32.const 0))
              (i32.eqz (i32.and (local.get $len) (i32.const 3)))))
-  (func (export "ge_run") (param $p i32) (param $len i32) (result i64)
+"#;
+
+/// Word-wise `mix` in `ge_run`.
+const MIX_RUN: &str = r#"
+  (func (export "ge_run") (param $p i32) (param $len i32) (param $slot i32) (result i32)
     (local $out i32) (local $i i32)
-    (if (i32.and (local.get $len) (i32.const 3)) (then (return (i64.const -1))))
+    (if (i32.and (local.get $len) (i32.const 3)) (then (return (i32.const -1))))
     (local.set $out (call $alloc (local.get $len)))
     (block $done
       (loop $l
@@ -89,9 +92,14 @@ const MIX_FUNCS: &str = r#"
           (call $mix (i32.load (i32.add (local.get $p) (local.get $i)))))
         (local.set $i (i32.add (local.get $i) (i32.const 4)))
         (br $l)))
-    (i64.or (i64.shl (i64.extend_i32_u (local.get $out)) (i64.const 32))
-            (i64.extend_i32_u (local.get $len))))
+    (i32.store (local.get $slot) (local.get $out))
+    (i32.store offset=4 (local.get $slot) (local.get $len))
+    (i32.const 0))
 "#;
+
+fn mix_funcs() -> String {
+    format!(r#"(import "ge" "log" (func $log (param i32 i32))) {ALLOC} {MIX_RUN}"#)
+}
 
 /// Hex-escapes `data` into a WAT custom section.
 fn custom(name: &str, data: &str) -> String {
@@ -108,7 +116,7 @@ fn module(funcs: &str, meta: &str, wgsl: Option<&str>) -> Vec<u8> {
 }
 
 fn mix_module() -> Vec<u8> {
-    module(MIX_FUNCS, &format!("{META}{GPU_META}"), Some(WGSL))
+    module(&mix_funcs(), &format!("{META}{GPU_META}"), Some(WGSL))
 }
 
 fn limits() -> SandboxLimits {
@@ -178,7 +186,7 @@ const SPIN: &str = r#"
   (memory (export "memory") 1)
   (func (export "ge_alloc") (param i32) (result i32) (i32.const 1024))
   (func (export "ge_verify") (param i32 i32) (result i32) (loop $l (br $l)) (i32.const 1))
-  (func (export "ge_run") (param i32 i32) (result i64) (loop $l (br $l)) (i64.const 0))
+  (func (export "ge_run") (param i32 i32 i32) (result i32) (loop $l (br $l)) (i32.const 0))
 "#;
 
 #[test]
@@ -202,11 +210,11 @@ const GROW: &str = r#"
   (memory (export "memory") 1)
   (func (export "ge_alloc") (param i32) (result i32) (i32.const 1024))
   (func (export "ge_verify") (param i32 i32) (result i32) (i32.const 1))
-  (func (export "ge_run") (param i32 i32) (result i64)
+  (func (export "ge_run") (param i32 i32 i32) (result i32)
     ;; 128 MiB: over the 64 MiB cap, so grow fails and returns -1.
     (if (i32.eq (memory.grow (i32.const 2048)) (i32.const -1))
-      (then (return (i64.const -2))))
-    (i64.const 0))
+      (then (return (i32.const -2))))
+    (i32.const 0))
 "#;
 
 #[test]
@@ -231,8 +239,10 @@ fn out_of_bounds_result_is_rejected() {
       (memory (export "memory") 1)
       (func (export "ge_alloc") (param i32) (result i32) (i32.const 1024))
       (func (export "ge_verify") (param i32 i32) (result i32) (i32.const 1))
-      (func (export "ge_run") (param i32 i32) (result i64)
-        (i64.const 0x0000fff000001000))
+      (func (export "ge_run") (param i32 i32 i32) (result i32)
+        (i32.store (local.get 2) (i32.const 0xfff000))
+        (i32.store offset=4 (local.get 2) (i32.const 0x1000))
+        (i32.const 0))
     "#;
     let m = WasmMod::from_bytes(&module(funcs, META, None), limits()).unwrap();
     assert!(matches!(m.run(&[0; 4]), Err(Error::Invalid(_))));
@@ -242,12 +252,13 @@ fn out_of_bounds_result_is_rejected() {
 fn out_of_bounds_alloc_is_rejected() {
     let funcs = r#"
       (memory (export "memory") 1)
-      (func (export "ge_alloc") (param i32) (result i32) (i32.const 65534))
+      (func (export "ge_alloc") (param i32) (result i32) (i32.const 65520))
       (func (export "ge_verify") (param i32 i32) (result i32) (i32.const 1))
-      (func (export "ge_run") (param i32 i32) (result i64) (i64.const 0))
+      (func (export "ge_run") (param i32 i32 i32) (result i32) (i32.const 0))
     "#;
     let m = WasmMod::from_bytes(&module(funcs, META, None), limits()).unwrap();
-    assert!(matches!(m.run(&[0; 16]), Err(Error::Invalid(_))));
+    // The 8-byte result slot fits at 65520; a 32-byte input does not.
+    assert!(matches!(m.run(&[0; 32]), Err(Error::Invalid(_))));
 }
 
 fn load_err(funcs: &str, meta: &str, wgsl: Option<&str>) -> String {
@@ -260,7 +271,7 @@ fn load_err(funcs: &str, meta: &str, wgsl: Option<&str>) -> String {
 
 #[test]
 fn foreign_imports_are_rejected() {
-    let funcs = MIX_FUNCS.replace(
+    let funcs = mix_funcs().replace(
         r#"(import "ge" "log" (func $log (param i32 i32)))"#,
         r#"(import "wasi_snapshot_preview1" "fd_write" (func $log (param i32 i32 i32 i32) (result i32)))"#,
     );
@@ -270,23 +281,23 @@ fn foreign_imports_are_rejected() {
 
 #[test]
 fn bad_metadata_is_rejected() {
-    let no_meta = wat::parse_str(format!("(module {MIX_FUNCS})")).unwrap();
+    let no_meta = wat::parse_str(format!("(module {})", mix_funcs())).unwrap();
     assert!(matches!(
         WasmMod::from_bytes(&no_meta, limits()),
         Err(Error::Load(msg)) if msg.contains("missing")
     ));
     // ':' would let one type's key prefix reach into another's.
-    load_err(MIX_FUNCS, "namespace = \"a:b\"\nname = \"c\"\n", None);
+    load_err(&mix_funcs(), "namespace = \"a:b\"\nname = \"c\"\n", None);
     load_err(
-        MIX_FUNCS,
+        &mix_funcs(),
         "namespace = \"a\"\nname = \"c\"\nsurprise = 1\n",
         None,
     );
     // A kernel without [gpu], and [gpu] without a kernel.
-    load_err(MIX_FUNCS, META, Some(WGSL));
-    load_err(MIX_FUNCS, &format!("{META}{GPU_META}"), None);
+    load_err(&mix_funcs(), META, Some(WGSL));
+    load_err(&mix_funcs(), &format!("{META}{GPU_META}"), None);
     // Missing export.
-    let msg = load_err(&MIX_FUNCS.replace("\"ge_run\"", "\"other\""), META, None);
+    let msg = load_err(&mix_funcs().replace("\"ge_run\"", "\"other\""), META, None);
     assert!(msg.contains("ge_run"), "{msg}");
 }
 
@@ -309,7 +320,7 @@ fn bad_kernels_are_rejected() {
         WGSL.replace("@workgroup_size(64)", "@workgroup_size(8, 8)"),
     ];
     for wgsl in cases {
-        let msg = load_err(MIX_FUNCS, &meta, Some(&wgsl));
+        let msg = load_err(&mix_funcs(), &meta, Some(&wgsl));
         assert!(
             msg.contains("wgsl")
                 || msg.contains("binding")
@@ -367,7 +378,7 @@ fn load_mods_skips_bad_files() {
     std::fs::write(dir.0.join("mods/junk.wasm"), b"not wasm").unwrap();
     let mut api = ServerAPI::open(dir.0.join("db"), Config::default());
     assert_eq!(
-        enginewasm::load_mods(&mut api, dir.0.join("mods"), limits()),
+        enginewasm::load_mods(&mut api, dir.0.join("mods"), &WasmConfig::default()),
         1
     );
     assert!(
@@ -510,4 +521,317 @@ fn end_to_end_over_transport() {
     );
     drop(client);
     server.shutdown();
+}
+
+const W64_ALLOC: &str = r#"
+  (memory (export "memory") i64 1)
+  (global $top (mut i64) (i64.const 1024))
+  (func $alloc (export "ge_alloc") (param $len i64) (result i64)
+    (local $p i64)
+    (local.set $p (global.get $top))
+    (global.set $top
+      (i64.and (i64.add (i64.add (local.get $p) (local.get $len)) (i64.const 7)) (i64.const -8)))
+    (block $ok
+      (br_if $ok (i64.le_u (global.get $top) (i64.shl (memory.size) (i64.const 16))))
+      (br_if $ok (i64.ne (i64.const -1)
+        (memory.grow (i64.shr_u
+          (i64.add (i64.sub (global.get $top) (i64.shl (memory.size) (i64.const 16))) (i64.const 65535))
+          (i64.const 16)))))
+      unreachable)
+    (local.get $p))
+  (func (export "ge_verify") (param i64 i64) (result i32) (i32.const 1))
+"#;
+
+/// wasm64: flips every byte.
+const W64_FLIP: &str = r#"
+  (func (export "ge_run") (param $p i64) (param $len i64) (param $slot i64) (result i32)
+    (local $out i64) (local $i i64)
+    (local.set $out (call $alloc (local.get $len)))
+    (block $done
+      (loop $l
+        (br_if $done (i64.ge_u (local.get $i) (local.get $len)))
+        (i32.store8 (i64.add (local.get $out) (local.get $i))
+          (i32.xor (i32.load8_u (i64.add (local.get $p) (local.get $i))) (i32.const 0xff)))
+        (local.set $i (i64.add (local.get $i) (i64.const 1)))
+        (br $l)))
+    (i64.store (local.get $slot) (local.get $out))
+    (i64.store offset=8 (local.get $slot) (local.get $len))
+    (i32.const 0))
+"#;
+
+#[test]
+fn wasm64_runs_and_can_be_disabled() {
+    let wasm = module(&format!("{W64_ALLOC} {W64_FLIP}"), META, None);
+    let m = WasmMod::from_bytes(&wasm, limits()).unwrap();
+    assert!(m.is_wasm64());
+    assert_eq!(m.run(&[0, 1, 0xff]).unwrap(), vec![0xff, 0xfe, 0]);
+    let off = SandboxLimits {
+        memory64: false,
+        ..limits()
+    };
+    assert!(matches!(
+        WasmMod::from_bytes(&wasm, off),
+        Err(Error::Load(_))
+    ));
+}
+
+#[test]
+fn wasm64_memory_can_exceed_4_gib() {
+    // Grows to 5 GiB (81920 pages); pages stay untouched, so this is address
+    // space, not RAM.
+    let grow = r#"
+      (func (export "ge_run") (param i64 i64) (param $slot i64) (result i32)
+        (if (i64.eq (memory.grow (i64.const 81920)) (i64.const -1))
+          (then (return (i32.const -2))))
+        (i64.store (local.get $slot) (i64.const 0x140000000))
+        (i64.store offset=8 (local.get $slot) (i64.const 0))
+        (i32.const 0))
+    "#;
+    let wasm = module(&format!("{W64_ALLOC} {grow}"), META, None);
+    let capped = WasmMod::from_bytes(&wasm, limits()).unwrap();
+    assert_eq!(capped.run(&[1]), Err(Error::Guest(-2)));
+    let roomy = SandboxLimits {
+        max_memory: 6 << 30,
+        ..limits()
+    };
+    let m = WasmMod::from_bytes(&wasm, roomy).unwrap();
+    assert_eq!(m.run(&[1]).unwrap(), Vec::<u8>::new());
+}
+
+fn fs_read_guest() -> String {
+    format!(
+        r#"(import "ge" "fs_read" (func $fs_read (param i32 i32 i32) (result i32)))
+        {ALLOC}
+        (func (export "ge_run") (param $p i32) (param $len i32) (param $slot i32) (result i32)
+          (call $fs_read (local.get $p) (local.get $len) (local.get $slot)))"#
+    )
+}
+
+fn fs_write_guest() -> String {
+    // Writes the payload (a path) to that path.
+    format!(
+        r#"(import "ge" "fs_write" (func $fs_write (param i32 i32 i32 i32) (result i32)))
+        {ALLOC}
+        (func (export "ge_run") (param $p i32) (param $len i32) (param $slot i32) (result i32)
+          (local $s i32)
+          (local.set $s (call $fs_write (local.get $p) (local.get $len) (local.get $p) (local.get $len)))
+          (if (i32.lt_s (local.get $s) (i32.const 0)) (then (return (local.get $s))))
+          (i32.store (local.get $slot) (local.get $p))
+          (i32.store offset=4 (local.get $slot) (i32.const 0))
+          (i32.const 0))"#
+    )
+}
+
+fn grant(name: &str, path: &std::path::Path, write: bool) -> FsGrant {
+    FsGrant {
+        name: name.into(),
+        path: path.into(),
+        write,
+    }
+}
+
+#[test]
+fn fs_read_needs_a_grant_and_stays_inside_it() {
+    let dir = TempDir::new("fs-read");
+    std::fs::create_dir_all(dir.0.join("data/sub")).unwrap();
+    std::fs::write(dir.0.join("data/sub/hello.txt"), b"hi there").unwrap();
+    std::fs::write(dir.0.join("secret.txt"), b"nope").unwrap();
+    let wasm = module(&fs_read_guest(), META, None);
+
+    let denied = WasmMod::from_bytes(&wasm, limits()).unwrap();
+    assert_eq!(denied.run(b"data/sub/hello.txt"), Err(Error::Guest(-1)));
+
+    let granted = WasmMod::from_bytes(
+        &wasm,
+        SandboxLimits {
+            fs: vec![grant("data", &dir.0.join("data"), false)],
+            ..limits()
+        },
+    )
+    .unwrap();
+    assert_eq!(granted.run(b"data/sub/hello.txt").unwrap(), b"hi there");
+    for escape in ["data/../secret.txt", "data//etc/passwd", "data/", "other/x"] {
+        assert_eq!(
+            granted.run(escape.as_bytes()),
+            Err(Error::Guest(-1)),
+            "{escape}"
+        );
+    }
+    assert_eq!(granted.run(b"data/missing.txt"), Err(Error::Guest(-3)));
+
+    // A symlink pointing out of the mount is refused by cap-std.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(dir.0.join("secret.txt"), dir.0.join("data/link")).unwrap();
+        assert_eq!(granted.run(b"data/link"), Err(Error::Guest(-3)));
+    }
+}
+
+#[test]
+fn wasm64_uses_the_same_host_calls() {
+    let dir = TempDir::new("fs-read64");
+    std::fs::create_dir_all(&dir.0).unwrap();
+    std::fs::write(dir.0.join("a.bin"), [1, 2, 3]).unwrap();
+    let funcs = format!(
+        r#"(import "ge" "fs_read" (func $fs_read (param i64 i64 i64) (result i32)))
+        {W64_ALLOC}
+        (func (export "ge_run") (param $p i64) (param $len i64) (param $slot i64) (result i32)
+          (call $fs_read (local.get $p) (local.get $len) (local.get $slot)))"#
+    );
+    let m = WasmMod::from_bytes(
+        &module(&funcs, META, None),
+        SandboxLimits {
+            fs: vec![grant("d", &dir.0, false)],
+            ..limits()
+        },
+    )
+    .unwrap();
+    assert!(m.is_wasm64());
+    assert_eq!(m.run(b"d/a.bin").unwrap(), vec![1, 2, 3]);
+}
+
+#[test]
+fn fs_write_needs_a_writable_mount() {
+    let dir = TempDir::new("fs-write");
+    std::fs::create_dir_all(dir.0.join("ro")).unwrap();
+    std::fs::create_dir_all(dir.0.join("rw")).unwrap();
+    let m = WasmMod::from_bytes(
+        &module(&fs_write_guest(), META, None),
+        SandboxLimits {
+            fs: vec![
+                grant("ro", &dir.0.join("ro"), false),
+                grant("rw", &dir.0.join("rw"), true),
+            ],
+            ..limits()
+        },
+    )
+    .unwrap();
+    assert_eq!(m.run(b"ro/out.txt"), Err(Error::Guest(-1)));
+    assert!(!dir.0.join("ro/out.txt").exists());
+    assert_eq!(m.run(b"rw/out.txt").unwrap(), b"");
+    assert_eq!(
+        std::fs::read(dir.0.join("rw/out.txt")).unwrap(),
+        b"rw/out.txt"
+    );
+    assert_eq!(m.run(b"rw/../escape.txt"), Err(Error::Guest(-1)));
+}
+
+fn echo_server() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 256];
+            if let Ok(n) = stream.read(&mut buf) {
+                let _ = stream.write_all(&buf[..n]);
+            }
+        }
+    });
+    addr
+}
+
+fn net_guest() -> String {
+    // Connects to the payload (host:port), sends it, returns what comes back.
+    format!(
+        r#"(import "ge" "net_connect" (func $connect (param i32 i32) (result i32)))
+        (import "ge" "net_send" (func $send (param i32 i32 i32) (result i64)))
+        (import "ge" "net_recv" (func $recv (param i32 i32 i32) (result i64)))
+        {ALLOC}
+        (func (export "ge_run") (param $p i32) (param $len i32) (param $slot i32) (result i32)
+          (local $h i32) (local $n i64) (local $buf i32)
+          (local.set $h (call $connect (local.get $p) (local.get $len)))
+          (if (i32.lt_s (local.get $h) (i32.const 0)) (then (return (local.get $h))))
+          (local.set $n (call $send (local.get $h) (local.get $p) (local.get $len)))
+          (if (i64.lt_s (local.get $n) (i64.const 0)) (then (return (i32.wrap_i64 (local.get $n)))))
+          (local.set $buf (call $alloc (i32.const 256)))
+          (local.set $n (call $recv (local.get $h) (local.get $buf) (i32.const 256)))
+          (if (i64.lt_s (local.get $n) (i64.const 0)) (then (return (i32.wrap_i64 (local.get $n)))))
+          (i32.store (local.get $slot) (local.get $buf))
+          (i32.store offset=4 (local.get $slot) (i32.wrap_i64 (local.get $n)))
+          (i32.const 0))"#
+    )
+}
+
+#[test]
+fn net_needs_an_allowlisted_endpoint() {
+    let addr = echo_server();
+    let other = echo_server();
+    let wasm = module(&net_guest(), META, None);
+
+    let denied = WasmMod::from_bytes(&wasm, limits()).unwrap();
+    assert_eq!(denied.run(addr.as_bytes()), Err(Error::Guest(-1)));
+
+    let granted = WasmMod::from_bytes(
+        &wasm,
+        SandboxLimits {
+            net: vec![addr.clone()],
+            ..limits()
+        },
+    )
+    .unwrap();
+    assert_eq!(granted.run(addr.as_bytes()).unwrap(), addr.as_bytes());
+    assert_eq!(granted.run(other.as_bytes()), Err(Error::Guest(-1)));
+}
+
+#[test]
+fn config_sets_defaults_and_per_mod_overrides() {
+    let cfg = WasmConfig::from_toml(
+        r#"
+        host = "[::1]:50051"
+
+        [wasm]
+        max_memory_mb = 512
+        call_timeout_ms = 50
+        memory64 = false
+
+        [wasm.mods."demo:mix"]
+        max_memory_mb = 8192
+        memory64 = true
+        fs = [{ name = "data", path = "/srv/data" }]
+        net = ["Example.com:443"]
+        "#,
+    )
+    .unwrap();
+    let other = cfg.limits_for(&("x".into(), "y".into())).unwrap();
+    assert_eq!(other.max_memory, 512 << 20);
+    assert_eq!(other.call_timeout, Duration::from_millis(50));
+    assert!(!other.memory64 && other.fs.is_empty() && other.net.is_empty());
+
+    let mix = cfg.limits_for(&("demo".into(), "mix".into())).unwrap();
+    assert_eq!(mix.max_memory, 8192 << 20);
+    assert_eq!(mix.call_timeout, Duration::from_millis(50), "inherited");
+    assert!(mix.memory64);
+    assert_eq!(
+        mix.fs,
+        vec![grant("data", std::path::Path::new("/srv/data"), false)]
+    );
+    assert_eq!(mix.net, vec!["example.com:443".to_string()]);
+
+    // No [wasm] table: defaults.
+    let none = WasmConfig::from_toml("host = \"x\"").unwrap();
+    assert_eq!(
+        none.limits_for(&("a".into(), "b".into()))
+            .unwrap()
+            .max_memory,
+        256 << 20
+    );
+
+    for bad in [
+        "[wasm]\nmax_memroy_mb = 1",
+        "[wasm]\nnet = [\"no-port\"]",
+        "[wasm]\nfs = [{ name = \"a/b\", path = \"/x\" }]",
+        "[wasm.mods.nocolon]\nmax_memory_mb = 1",
+        "[wasm]\nmax_io_mb = 5000",
+    ] {
+        assert!(WasmConfig::from_toml(bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn load_applies_config_for_the_mods_type() {
+    let cfg = WasmConfig::from_toml("[wasm.mods.\"demo:mix\"]\nmemory64 = false\n").unwrap();
+    let wasm = module(&format!("{W64_ALLOC} {W64_FLIP}"), META, None);
+    assert!(matches!(WasmMod::load(&wasm, &cfg), Err(Error::Load(_))));
+    assert!(WasmMod::load(&mix_module(), &cfg).is_ok());
 }

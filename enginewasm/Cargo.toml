@@ -24,6 +24,7 @@ wasmtime = { version = "49.0.2", default-features = false, features = [
     "runtime",
     "std",
 ] }
+cap-std = "4"
 wasmparser = { version = "0.258.3", default-features = false, features = ["std"] }
 wgpu = { version = "30.0.1", optional = true }
 naga = { version = "30.0.1", features = ["wgsl-in"], optional = true }
