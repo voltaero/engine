@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["engine", "enginelib", "enginelib/macros"]
+members = ["engine", "enginelib", "enginelib/macros", "enginewasm"]
+# Standalone wasm32 guest crate; built with its own `cargo build --target wasm32-unknown-unknown`.
+exclude = ["examples/wasm-mix"]
 [workspace.dependencies]
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 toml = "1.1.2"

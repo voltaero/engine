@@ -1,0 +1,10 @@
+namespace = "demo"
+name = "mix"
+version = "0.1.0"
+chunk_size = 1024
+max_payload = 1048576
+max_result = 1048576
+
+[gpu]
+entry = "main"
+record_words = 1

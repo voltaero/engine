@@ -224,6 +224,17 @@ Exported symbols required:
 
 Strict compatibility check is enabled when `GE_STRICT_MODS` is set.
 
+### Wasm mods (experimental, `enginewasm` crate)
+
+Untrusted task mods as core wasm (`./mods/*.wasm`, loaded only by
+`engine --features wasm`'s server via `enginewasm::load_mods` before
+`populate`). The ABI is `ge_alloc`/`ge_free`/`ge_verify`/`ge_run`, the only
+import is `ge.log`, and metadata lives in the `ge:meta` custom section. An
+optional WGSL kernel in `ge:wgsl` runs on wgpu (`enginewasm::gpu`) and must
+match `ge_run` byte for byte. Sandbox limits (memory, epoch timeout, io caps)
+are in `SandboxLimits`. Spec: `docs/wasm.md`. Tests: `enginewasm/tests/sandbox.rs`
+(the GPU test skips without an adapter). Worker: `engine/src/bin/wasm_worker.rs`.
+
 ## Auth behavior warning
 
 - User auth/admin auth are event-driven.

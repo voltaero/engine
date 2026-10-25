@@ -8,8 +8,15 @@ description = "A Blazingly fast distributed task system"
 [features]
 default = []
 dev = []
+# Experimental: sandboxed `.wasm` task mods (server) and the `wasm_worker` bin.
+wasm = ["dep:enginewasm"]
 [dependencies]
+enginewasm = { path = "../enginewasm", optional = true }
 
 enginelib = { path = "../enginelib" }
 tokio = { version = "1.50.0", features = ["full"] }
 tracing = "0.1.44"
+
+[[bin]]
+name = "wasm_worker"
+required-features = ["wasm"]
