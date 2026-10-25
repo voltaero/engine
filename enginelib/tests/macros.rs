@@ -30,3 +30,22 @@ fn module_macro_expands_and_runs() {
     drop(api);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[derive(serde::Serialize, serde::Deserialize, Verifiable)]
+struct Payload {
+    id: u32,
+    name: String,
+}
+
+#[test]
+fn derive_verifiable_accepts_only_decodable_payloads() {
+    let payload = Payload {
+        id: 7,
+        name: "seven".into(),
+    };
+    let bytes = enginelib::api::to_allocvec(&payload).unwrap();
+    assert!(payload.verify(&bytes));
+    // Truncated: the string length promises more bytes than are left.
+    assert!(!payload.verify(&bytes[..bytes.len() - 1]));
+    assert!(!payload.verify(&[]));
+}

@@ -10,6 +10,8 @@ Workspace members:
 - `engine` (binaries: `server`, `proxy`, `bench`)
 - `enginelib` (shared runtime API, events, tasks, plugin loader, task nucleus)
 - `enginelib/macros` (proc macros used by mods and core)
+The management mod (web dashboard, token auth, `mgmtctl`) lives in its own
+repo, [voltaero/magnesium](https://github.com/voltaero/magnesium).
 
 > **Repo is mid-rewrite.** The earlier design (gRPC/proto, `client`/`packer`
 > binaries, and the RFC1002/1003/1004 design docs) was removed in the "rewrite:
@@ -223,6 +225,14 @@ Exported symbols required:
 `#[metadata]` and `#[module]` macros are the preferred way to provide these.
 
 Strict compatibility check is enabled when `GE_STRICT_MODS` is set.
+
+Mods statically link enginelib, so enginelib must stay allocator-neutral.
+RocksDB's `jemalloc` feature replaces `malloc` process-wide; it is enabled only
+by the host binaries (`engine/Cargo.toml`). A mod that links its own copy gets a
+private heap: memory crossing `run(&mut ServerAPI)` corrupts it, or `dlopen`
+fails with "cannot allocate memory in static TLS block". Build mods on their
+own (as a separate project, like the voltaero/mod template), never inside a
+`--workspace` build with the engine, where features unify.
 
 ## Auth behavior warning
 

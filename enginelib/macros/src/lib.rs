@@ -47,10 +47,10 @@ pub fn module(_attr: TokenStream, item: TokenStream) -> TokenStream {
             env!("CARGO_PKG_NAME"),
         );),
     );
-    item_fn.block.stmts.insert(
-        0,
-        parse_quote!(::enginelib::api::init_tracing();),
-    );
+    item_fn
+        .block
+        .stmts
+        .insert(0, parse_quote!(::enginelib::api::init_tracing();));
     item_fn
         .attrs
         .push(parse_quote!(#[unsafe(export_name="run")]));
@@ -64,8 +64,8 @@ pub fn derive_verifiable(input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         impl ::enginelib::task::Verifiable for #name {
-            fn verify(&self, b: Vec<u8>) -> bool {
-                let k: Result<#name, _> = enginelib::api::postcard::from_bytes(b.as_slice());
+            fn verify(&self, b: &[u8]) -> bool {
+                let k: Result<#name, _> = ::enginelib::api::postcard::from_bytes(b);
                 k.is_ok()
             }
         }
