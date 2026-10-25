@@ -344,6 +344,40 @@ fn empty_queue_lease_times_out() {
 }
 
 #[test]
+fn connect_timeout_bounds_the_handshake() {
+    // Accepts TCP connections (backlog) but never speaks ZMTP, so `Hello` is
+    // never answered.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("tcp://{}", silent.local_addr().unwrap());
+    let timeout = Duration::from_millis(300);
+    let started = Instant::now();
+    let err = Client::connect_timeout(&endpoint, auth(None), Caps::default(), timeout)
+        .err()
+        .expect("handshake against a silent endpoint must fail");
+    let elapsed = started.elapsed();
+    assert_eq!(err.kind(), ErrorKind::IOError, "{err:?}");
+    // zmq's poll may wake a hair before the deadline.
+    assert!(elapsed >= timeout * 9 / 10, "returned early ({elapsed:?})");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "ignored the deadline ({elapsed:?})"
+    );
+
+    // A successful handshake keeps the timeout for later calls.
+    let harness = start("connect-timeout", None, None);
+    let timeout = Duration::from_millis(1500);
+    let mut client = Client::connect_timeout(
+        harness.server.endpoint(),
+        auth(None),
+        Caps::default(),
+        timeout,
+    )
+    .unwrap();
+    assert_eq!(client.timeout, timeout);
+    client.stats().unwrap();
+}
+
+#[test]
 fn cancelled_lease_is_released_and_stale_token_rejected() {
     let harness = start("cancel", None, None);
     let mut client = connect(&harness);
