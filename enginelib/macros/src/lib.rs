@@ -49,7 +49,7 @@ pub fn module(_attr: TokenStream, item: TokenStream) -> TokenStream {
     );
     item_fn.block.stmts.insert(
         0,
-        parse_quote!(::enginelib::api::ServerAPI::setup_logger();),
+        parse_quote!(::enginelib::api::init_tracing();),
     );
     item_fn
         .attrs
