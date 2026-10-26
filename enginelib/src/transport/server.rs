@@ -7,6 +7,7 @@
 //! peer. ZeroMQ sockets are not thread-safe, so handlers never touch the ROUTER
 //! directly.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -17,7 +18,7 @@ use tracing::{debug, error, info, warn};
 
 use super::{Background, POLL_MS, constant_time_eq, context, sleep_unless_stopped, zmq_err};
 use crate::Identifier;
-use crate::api::{ServerAPI, lock_lease};
+use crate::api::{LeaseCell, ServerAPI, lock_lease};
 use crate::config::ConfigTomlServer;
 use crate::error::{Error, ErrorKind};
 use crate::events::Events;
@@ -565,6 +566,9 @@ struct Shared {
     max_inflight_per_session: usize,
 }
 
+/// One task type's chunk leases (`LeasedTaskQueue::tasks` value).
+type TypeLeases = Arc<DashMap<u64, LeaseCell>>;
+
 fn not_authenticated() -> Response {
     Response::Error(WireError {
         kind: ErrorKind::InvalidArgument,
@@ -588,21 +592,25 @@ impl Shared {
     /// changes, so this check can't be raced by reaping or re-leasing. Leases
     /// that are gone or held under another token pass through: the nucleus op
     /// rejects them (or treats a `complete` as an idempotent retry).
-    fn check_owner(&self, task_type: (&str, &str), chunk_seq: u64, token: u64, uid: &str) -> bool {
+    ///
+    /// `leases` is the type's lease map (see [`Shared::type_leases`]).
+    fn check_owner(leases: Option<&TypeLeases>, chunk_seq: u64, token: u64, uid: &str) -> bool {
         // Leases are per chunk: every task of a chunk lease shares its holder.
-        // Find the type's lease map without building an owned `Identifier`.
-        let leases = self
-            .api
-            .leased_tasks
-            .tasks
-            .iter()
-            .find(|entry| entry.key().0 == task_type.0 && entry.key().1 == task_type.1)
-            .map(|entry| entry.value().clone());
         let cell = leases.and_then(|leases| leases.get(&chunk_seq).map(|cell| cell.clone()));
         !cell.is_some_and(|cell| {
             let held = lock_lease(&cell);
             !held.gone && held.token == token && held.user_id != uid
         })
+    }
+
+    /// The lease map of one task type, if it has ever been leased.
+    fn type_leases(&self, (a, b): (&str, &str)) -> Option<TypeLeases> {
+        let task_type: Identifier = (a.to_owned(), b.to_owned());
+        self.api
+            .leased_tasks
+            .tasks
+            .get(&task_type)
+            .map(|entry| entry.value().clone())
     }
 
     /// Runs the batch op `op` on the items whose lease `uid` may act on and
@@ -616,6 +624,8 @@ impl Shared {
         lease_of: impl Fn(&I) -> LeaseRefIn<'_>,
         op: impl FnOnce(Vec<I>) -> Vec<Result<T, Error>>,
     ) -> Vec<Result<T, Error>> {
+        // Each named type's lease map is resolved once per request.
+        let mut types: HashMap<(&str, &str), Option<TypeLeases>> = HashMap::new();
         let mut last: Option<((&str, &str), u64, u64, bool)> = None;
         let checks: Vec<bool> = items
             .iter()
@@ -634,8 +644,11 @@ impl Shared {
                         owned
                     }
                     _ => {
+                        let leases = types
+                            .entry(lease.task_type)
+                            .or_insert_with(|| self.type_leases(lease.task_type));
                         let owned =
-                            self.check_owner(lease.task_type, id.chunk_seq, lease.token, uid);
+                            Self::check_owner(leases.as_ref(), id.chunk_seq, lease.token, uid);
                         last = Some((lease.task_type, id.chunk_seq, lease.token, owned));
                         owned
                     }

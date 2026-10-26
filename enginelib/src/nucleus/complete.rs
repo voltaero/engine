@@ -86,9 +86,12 @@ pub fn complete_refs<'a>(
 ) -> Vec<Result<(), Error>> {
     let items = items.into_iter();
     let mut results: Vec<Result<(), Error>> = Vec::with_capacity(items.size_hint().0);
-    // Task types seen in this call; a batch rarely has more than one, so a
-    // linear scan beats hashing two strings per item.
+    // Task types seen in this call, looked up by the borrowed names (no owned
+    // key per item). A batch rarely has more than one, so the previous item's
+    // type is checked first and the map is only hashed when the type changes.
     let mut types: Vec<(Identifier, Option<TypeInfo>)> = Vec::new();
+    let mut type_index: HashMap<(&'a str, &'a str), usize> = HashMap::new();
+    let mut last_type: Option<((&'a str, &'a str), usize)> = None;
     // Groups keyed by (type, chunk, token), in first-seen order. Items of one
     // chunk usually arrive together, so the last group is checked first.
     let mut index: HashMap<GroupKey, usize> = HashMap::new();
@@ -96,17 +99,21 @@ pub fn complete_refs<'a>(
 
     for (pos, item) in items.enumerate() {
         let checked = (|| {
-            let (a, b) = item.task_type;
-            let ty = match types.iter().position(|(t, _)| t.0 == a && t.1 == b) {
-                Some(ty) => ty,
-                None => {
-                    let task_type = (a.to_owned(), b.to_owned());
-                    let info = api
-                        .task_registry
-                        .get(&task_type)
-                        .map(|task| (task, api.settings(&task_type)));
-                    types.push((task_type, info));
-                    types.len() - 1
+            let ty = match last_type {
+                Some((name, ty)) if name == item.task_type => ty,
+                _ => {
+                    let ty = *type_index.entry(item.task_type).or_insert_with(|| {
+                        let (a, b) = item.task_type;
+                        let task_type = (a.to_owned(), b.to_owned());
+                        let info = api
+                            .task_registry
+                            .get(&task_type)
+                            .map(|task| (task, api.settings(&task_type)));
+                        types.push((task_type, info));
+                        types.len() - 1
+                    });
+                    last_type = Some((item.task_type, ty));
+                    ty
                 }
             };
             let (task, settings) = types[ty]
