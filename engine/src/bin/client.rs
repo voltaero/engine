@@ -1,18 +1,23 @@
 //! Worker client: loads the mods in `./mods`, connects to a server (directly or
 //! through the proxy) and leases, runs and completes tasks of every type it has
-//! a mod for. Each connection (`--conns`, default 1) has one updater thread
-//! doing all the I/O and `--threads` compute threads (see `enginelib::worker`).
+//! a mod for. Each connection has one updater thread doing all the I/O and
+//! `threads` compute threads (see `enginelib::worker`).
 //!
-//! ```text
-//! cargo run -p engine --bin client -- --server tcp://[::1]:50051 --threads 8
+//! Takes no arguments: everything comes from the `[client]` table of
+//! `config.toml` (`enginelib::config::ClientConfig`):
+//!
+//! ```toml
+//! [client]
+//! server = "tcp://[::1]:50051"   # default: `advertise`, else `host`
+//! # proxy = "tcp://[::1]:50050"  # resolve the server through a proxy instead
+//! uid = "worker-1"               # default: worker-<pid>
+//! challenge = ""
+//! threads = 8                    # compute threads per connection; default: CPU count
+//! conns = 1
+//! task_types = ["ns:name"]       # default: every type the mods provide
+//! max_tasks = 1024               # per lease
+//! hip = false                    # prefer the HIP runner
 //! ```
-//!
-//! Flags (all optional): `--server` (default `advertise`, else `host` from
-//! `config.toml`), `--proxy` (resolve the server through a proxy instead),
-//! `--uid`, `--challenge` (or `ENGINE_CHALLENGE`), `--threads` (compute threads
-//! per connection; default: CPU count), `--conns`, `--types ns:name,...`
-//! (default: every type the mods provide), `--max-tasks` (per lease, default
-//! 1024), `--hip` (prefer the HIP runner).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,109 +32,80 @@ use enginelib::wire::Auth;
 use enginelib::worker::{self, WorkerOptions};
 use tracing::{error, info};
 
-struct Args {
-    server: Option<String>,
-    proxy: Option<String>,
-    uid: String,
-    challenge: String,
-    conns: usize,
-    opts: WorkerOptions,
-}
-
-fn parse_args() -> Args {
-    let mut args = Args {
-        server: None,
-        proxy: None,
-        uid: format!("worker-{}", std::process::id()),
-        challenge: std::env::var("ENGINE_CHALLENGE").unwrap_or_default(),
-        conns: 1,
-        opts: WorkerOptions::default(),
-    };
-    let mut it = std::env::args().skip(1);
-    while let Some(flag) = it.next() {
-        if flag == "--hip" {
-            args.opts.runner = Some(Runner::HIP);
-            continue;
-        }
-        let value = it
-            .next()
-            .unwrap_or_else(|| usage(&format!("missing value for {flag}")));
-        let num = || -> u64 {
-            value
-                .parse()
-                .unwrap_or_else(|_| usage(&format!("bad {flag}: {value}")))
-        };
-        match flag.as_str() {
-            "--server" => args.server = Some(value),
-            "--proxy" => args.proxy = Some(value),
-            "--uid" => args.uid = value,
-            "--challenge" => args.challenge = value,
-            "--threads" => args.opts.threads = num() as usize,
-            "--conns" => args.conns = num() as usize,
-            "--max-tasks" => args.opts.max_tasks = num().min(u32::MAX as u64) as u32,
-            "--types" => {
-                args.opts.task_types = value
-                    .split(',')
-                    .map(|name| match name.split_once(':') {
-                        Some((ns, name)) => (ns.to_string(), name.to_string()),
-                        None => usage(&format!("bad task type {name}, expected ns:name")),
-                    })
-                    .collect::<Vec<Identifier>>();
-            }
-            other => usage(&format!("unknown flag {other}")),
-        }
-    }
-    if args.opts.threads == 0 || args.conns == 0 || args.opts.max_tasks == 0 {
-        usage("--threads, --conns and --max-tasks must be at least 1");
-    }
-    args
-}
-
-fn usage(message: &str) -> ! {
-    eprintln!("client: {message}");
+fn fail(message: &str) -> ! {
+    error!("client: {message}");
     std::process::exit(2);
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let args = parse_args();
-
     let api = Arc::new(ServerAPI::client(Config::new()));
-    Events::ClientStart(&api);
+    let toml = &api.cfg.config_toml;
+    let cfg = toml.client.clone();
 
-    let server = args.server.clone().unwrap_or_else(|| {
-        let toml = &api.cfg.config_toml;
-        toml.advertise.clone().unwrap_or_else(|| toml.host.clone())
-    });
+    let mut opts = WorkerOptions {
+        max_tasks: cfg.max_tasks,
+        runner: cfg.hip.then_some(Runner::HIP),
+        ..Default::default()
+    };
+    if let Some(threads) = cfg.threads {
+        opts.threads = threads;
+    }
+    opts.task_types = cfg
+        .task_types
+        .iter()
+        .map(|name| match name.split_once(':') {
+            Some((ns, name)) => (ns.to_string(), name.to_string()),
+            None => fail(&format!(
+                "bad task type {name:?} in [client], expected \"ns:name\""
+            )),
+        })
+        .collect::<Vec<Identifier>>();
+    if opts.threads == 0 || cfg.conns == 0 || opts.max_tasks == 0 {
+        fail("[client] threads, conns and max_tasks must be at least 1");
+    }
+    let server = cfg
+        .server
+        .clone()
+        .or_else(|| toml.advertise.clone())
+        .unwrap_or_else(|| toml.host.clone());
+
+    Events::ClientStart(&api);
     let auth = worker::auth(
         &api,
         Auth {
-            uid: args.uid.clone(),
-            challenge: args.challenge.clone(),
+            uid: cfg
+                .uid
+                .clone()
+                .unwrap_or_else(|| format!("worker-{}", std::process::id())),
+            challenge: cfg.challenge.clone(),
             admin_token: None,
         },
     );
-    let caps = worker::caps(args.opts.runner);
-    match &args.proxy {
-        Some(proxy) => info!("Client: {} connection(s) via proxy {proxy}", args.conns),
-        None => info!("Client: {} connection(s) to {server}", args.conns),
+    let caps = worker::caps(opts.runner);
+    match &cfg.proxy {
+        Some(proxy) => info!("Client: {} connection(s) via proxy {proxy}", cfg.conns),
+        None => info!("Client: {} connection(s) to {server}", cfg.conns),
     }
 
     let stop = Arc::new(AtomicBool::new(false));
     let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut threads = Vec::with_capacity(args.conns);
-    for id in 0..args.conns {
+    let mut threads = Vec::with_capacity(cfg.conns);
+    for id in 0..cfg.conns {
         let (api, stop, done_tx) = (api.clone(), stop.clone(), done_tx.clone());
-        let (server, proxy, opts) = (server.clone(), args.proxy.clone(), args.opts.clone());
+        let (server, proxy, opts) = (server.clone(), cfg.proxy.clone(), opts.clone());
         let (auth, caps) = (auth.clone(), caps.clone());
         let thread = std::thread::Builder::new()
             .name(format!("updater-{id}"))
             .spawn(move || {
-                let connect = || match &proxy {
-                    Some(proxy) => {
+                // `home` is the server holding this worker's leases: go back
+                // there, even when a proxy would pick another.
+                let connect = |home: Option<&str>| match (home, &proxy) {
+                    (Some(home), _) => Client::connect(home, auth.clone(), caps.clone()),
+                    (None, Some(proxy)) => {
                         Client::connect_via_proxy(proxy, None, auth.clone(), caps.clone())
                     }
-                    None => Client::connect(&server, auth.clone(), caps.clone()),
+                    (None, None) => Client::connect(&server, auth.clone(), caps.clone()),
                 };
                 let result = worker::run(&api, connect, &opts, &stop);
                 let _ = done_tx.send(result);

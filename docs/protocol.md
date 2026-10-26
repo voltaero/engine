@@ -20,7 +20,9 @@ Status: v5 (`PROTO_VERSION = 5`) implemented over ZeroMQ (`enginelib/src/wire.rs
   `Lease` (up to two ahead) / `Complete` (with `then_lease`) / `Renew` while
   compute threads run the batches. Tasks that panic, or are skipped on
   shutdown, are handed back with `CancelLease` after the batch's `Complete`
-  is acknowledged.
+  is acknowledged. After a disconnect it reconnects to the server that
+  leased its unfinished batches (ids only exist there), not via the proxy.
+  Configured only by the `[client]` table of `config.toml`.
 - **Proxy** (`engine` bin `proxy`) — discovery only: tells a client which
   server to use. Never on the task hot path.
 

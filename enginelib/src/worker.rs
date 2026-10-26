@@ -46,7 +46,7 @@ use crate::transport::client::Client;
 use crate::transport::{context, sleep_unless_stopped, zmq_err};
 use crate::wire::{
     Auth, Caps, Envelope, LeaseRef, LeaseReq, Leased, LeasedItem, Request, Response, RunnerKind,
-    TaskResult, TaskTypeInfo,
+    TaskResult, TaskTypeInfo, WireError,
 };
 
 #[derive(Debug, Clone)]
@@ -117,14 +117,16 @@ pub fn runnable_types(api: &ServerAPI, client: &Client, opts: &WorkerOptions) ->
 }
 
 /// Works until `stop` is set, (re)connecting with `connect` whenever the
-/// connection fails; batches finished meanwhile are completed on the new
-/// connection (leases belong to the uid, not the connection). On stop,
+/// connection fails. `connect(Some(endpoint))` must reach that server: it holds
+/// the leases of batches still to complete (leases belong to the uid, not the
+/// connection), and is asked for until those leases would have expired;
+/// `connect(None)` may pick any server (e.g. through the proxy). On stop,
 /// unstarted tasks are handed back and finished ones completed before it
 /// returns. Errors only when the server offers no task type this worker can
 /// run, or the compute pool can't be set up.
 pub fn run(
     api: &ServerAPI,
-    mut connect: impl FnMut() -> Result<Client, Error>,
+    mut connect: impl FnMut(Option<&str>) -> Result<Client, Error>,
     opts: &WorkerOptions,
     stop: &AtomicBool,
 ) -> Result<(), Error> {
@@ -179,6 +181,9 @@ pub fn run(
             next_batch: 0,
             pending: HashMap::new(),
             leases_inflight: 0,
+            home: None,
+            lost_at: None,
+            lease_ttl: Duration::ZERO,
         };
         // Dropping the updater closes the job channel, which ends the compute
         // threads once they drain it.
@@ -283,10 +288,39 @@ impl Hooks {
 struct Held {
     batch: Arc<Batch>,
     /// Set once the batch ran: the `Complete` to (re)send until acknowledged.
+    /// After a retryable rejection it holds only the results to retry.
     complete: Option<Request>,
-    /// Leases of tasks that didn't run, cancelled after the completion lands
-    /// (cancelling first would requeue the tasks being completed).
+    /// Leases of tasks that didn't run (or whose results the server can't
+    /// accept), cancelled after the completion lands (cancelling first would
+    /// requeue the tasks being completed).
     failed: Vec<LeaseRef>,
+    /// `complete` is on the wire on the current connection.
+    sending: bool,
+    /// Failed `Complete` attempts, and when to try again.
+    attempts: u32,
+    retry_at: Option<Instant>,
+}
+
+/// `Complete` attempts per batch before its remaining leases are handed back.
+const MAX_COMPLETE_ATTEMPTS: u32 = 6;
+
+/// What to do with a result the server rejected.
+enum Rejected {
+    /// Transient (a failed store write): the lease is intact, send it again.
+    Retry,
+    /// The result itself is unacceptable (`verify`, `max_result`), but the
+    /// lease is still ours: hand it back so the task is requeued now.
+    HandBack,
+    /// The lease isn't ours (any more): nothing left to do.
+    Drop,
+}
+
+fn classify(err: &WireError) -> Rejected {
+    match (err.kind, err.message.as_str()) {
+        (ErrorKind::IOError, _) => Rejected::Retry,
+        (_, "ResultTooLarge" | "Failed to verify task bytes") => Rejected::HandBack,
+        _ => Rejected::Drop,
+    }
 }
 
 enum Pending {
@@ -319,16 +353,27 @@ struct Updater<'a> {
     pending: HashMap<u64, (Pending, Instant)>,
     /// Outstanding `Lease`s (and `Complete`s with `then_lease`).
     leases_inflight: usize,
+    /// Endpoint and server id of the server the held batches were leased
+    /// from: their ids and leases only exist there.
+    home: Option<(String, u16)>,
+    /// When the connection to `home` was lost, and its lease TTL: once that
+    /// has passed the leases are gone and the held batches are dropped.
+    lost_at: Option<Instant>,
+    lease_ttl: Duration,
 }
 
 impl Updater<'_> {
-    fn run(&mut self, connect: &mut impl FnMut() -> Result<Client, Error>) -> Result<(), Error> {
+    fn run(
+        &mut self,
+        connect: &mut impl FnMut(Option<&str>) -> Result<Client, Error>,
+    ) -> Result<(), Error> {
         let mut backoff = Duration::from_millis(100);
         loop {
             if self.stopping() {
                 return Ok(());
             }
-            let mut client = match connect() {
+            let home = self.home_target();
+            let mut client = match connect(home.as_deref()) {
                 Ok(client) => client,
                 Err(err) => {
                     warn!("Worker: failed to connect: {err}");
@@ -338,6 +383,21 @@ impl Updater<'_> {
                 }
             };
             backoff = Duration::from_millis(100);
+            if let Some((endpoint, server_id)) = &self.home
+                && *server_id != client.server.server_id
+                && !self.batches.is_empty()
+            {
+                warn!(
+                    "Worker: {} reached server {} instead of {server_id}; dropping {} batch(es) leased there",
+                    endpoint,
+                    client.server.server_id,
+                    self.batches.len()
+                );
+                self.batches.clear();
+            }
+            self.home = Some((client.endpoint().to_string(), client.server.server_id));
+            self.lost_at = None;
+            self.lease_ttl = Duration::from_secs(client.server.lease_ttl_secs);
             self.types = runnable_types(self.api, &client, self.opts);
             if self.types.is_empty() {
                 return Err(Error::not_found("NoRunnableTaskTypes"));
@@ -355,9 +415,34 @@ impl Updater<'_> {
                     warn!("Worker: connection to {} failed: {err}", client.endpoint());
                     self.pending.clear();
                     self.leases_inflight = 0;
+                    self.lost_at.get_or_insert_with(Instant::now);
+                    for held in self.batches.values_mut() {
+                        held.sending = false;
+                    }
                 }
             }
         }
+    }
+
+    /// Where to reconnect: the server holding our leases while there are
+    /// batches to finish there and their leases can still be alive, else
+    /// wherever `connect` picks (`None`).
+    fn home_target(&mut self) -> Option<String> {
+        if self.batches.is_empty() {
+            return None;
+        }
+        if self
+            .lost_at
+            .is_some_and(|lost| lost.elapsed() > self.lease_ttl)
+        {
+            warn!(
+                "Worker: leases of {} batch(es) expired while disconnected; dropping them",
+                self.batches.len()
+            );
+            self.batches.clear();
+            return None;
+        }
+        self.home.as_ref().map(|(endpoint, _)| endpoint.clone())
     }
 
     fn stopping(&self) -> bool {
@@ -367,35 +452,34 @@ impl Updater<'_> {
     /// Runs one connection until stopped and drained (`Ok`) or the connection
     /// fails (`Err`).
     fn serve(&mut self, client: &mut Client) -> Result<(), Error> {
-        // Completions that were in flight on a previous connection.
-        let unacked: Vec<u64> = self
-            .batches
-            .iter()
-            .filter(|(_, held)| held.complete.is_some())
-            .map(|(id, _)| *id)
-            .collect();
-        for id in unacked {
-            self.send_complete(client, id)?;
-        }
-
         let renew_every =
             Duration::from_secs(client.server.lease_ttl_secs / 3).max(Duration::from_secs(1));
         let mut next_renew = Instant::now() + renew_every;
         loop {
             let stopping = self.stopping();
-            if stopping
-                && self.batches.is_empty()
-                && !self
-                    .pending
-                    .values()
-                    .any(|(kind, _)| !matches!(kind, Pending::Other))
-            {
+            // Wait for every reply, cancellations included: the socket drops
+            // unsent messages on close (linger 0).
+            if stopping && self.batches.is_empty() && self.pending.is_empty() {
                 return Ok(());
             }
             if !stopping {
                 self.maybe_lease(client)?;
             }
             let now = Instant::now();
+            // Completions due: retries, and ones lost with a connection.
+            let due: Vec<u64> = self
+                .batches
+                .iter()
+                .filter(|(_, held)| {
+                    held.complete.is_some()
+                        && !held.sending
+                        && held.retry_at.is_none_or(|at| at <= now)
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            for id in due {
+                self.send_complete(client, id)?;
+            }
             if now >= next_renew {
                 self.renew(client)?;
                 next_renew = now + renew_every;
@@ -509,27 +593,30 @@ impl Updater<'_> {
                     self.leases_inflight -= 1;
                 }
                 let held = self.batches.remove(&batch);
-                match body {
+                let next = match body {
                     Response::Completed { results, next } => {
-                        if let Some(held) = &held {
-                            for (item, result) in held.batch.items.iter().zip(&results) {
-                                if let Err(err) = result {
-                                    warn!(
-                                        "Worker: completing {} failed: {}",
-                                        item.task_id, err.message
-                                    );
-                                }
-                            }
+                        if let Some(held) = held {
+                            self.completed(client, held, results)?;
                         }
-                        if let Some(next) = next {
-                            self.dispatch(client, next)?;
-                        }
+                        next
                     }
-                    Response::Error(err) => warn!("Worker: complete failed: {}", err.message),
-                    other => warn!("Worker: unexpected complete reply: {other:?}"),
-                }
-                if let Some(held) = held {
-                    self.cancel(client, &held.failed)?;
+                    Response::Error(err) => {
+                        warn!("Worker: complete failed: {}", err.message);
+                        if let Some(held) = held {
+                            self.retry(client, held)?;
+                        }
+                        None
+                    }
+                    other => {
+                        warn!("Worker: unexpected complete reply: {other:?}");
+                        if let Some(held) = held {
+                            self.retry(client, held)?;
+                        }
+                        None
+                    }
+                };
+                if let Some(next) = next {
+                    self.dispatch(client, next)?;
                 }
             }
             (Pending::Other, Response::Renewed { results }) => {
@@ -541,6 +628,65 @@ impl Updater<'_> {
             }
             (Pending::Other, _) => {}
         }
+        Ok(())
+    }
+
+    /// Sorts the per-result answers to a batch's `Complete`: retryable
+    /// rejections are sent again, the rest of the batch is done.
+    fn completed(
+        &mut self,
+        client: &mut Client,
+        mut held: Held,
+        results: Vec<Result<(), WireError>>,
+    ) -> Result<(), Error> {
+        held.sending = false;
+        let sent = match held.complete.take() {
+            Some(Request::Complete { results, .. }) => results,
+            _ => Vec::new(),
+        };
+        let mut retry = Vec::new();
+        for (sent, result) in sent.into_iter().zip(results) {
+            let Err(err) = result else { continue };
+            warn!(
+                "Worker: completing {} failed: {}",
+                sent.lease.task_id, err.message
+            );
+            match classify(&err) {
+                Rejected::Retry => retry.push(sent),
+                Rejected::HandBack => held.failed.push(sent.lease),
+                Rejected::Drop => {}
+            }
+        }
+        if retry.is_empty() {
+            return self.cancel(client, &held.failed);
+        }
+        held.complete = Some(Request::Complete {
+            results: retry,
+            then_lease: None,
+        });
+        self.retry(client, held)
+    }
+
+    /// Keeps a batch whose completion failed for another attempt after a
+    /// backoff (its leases keep being renewed meanwhile), or hands its leases
+    /// back once attempts run out.
+    fn retry(&mut self, client: &mut Client, mut held: Held) -> Result<(), Error> {
+        held.sending = false;
+        held.attempts += 1;
+        if held.attempts >= MAX_COMPLETE_ATTEMPTS {
+            warn!(
+                "Worker: giving up completing batch {} after {} attempts",
+                held.batch.id, held.attempts
+            );
+            if let Some(Request::Complete { results, .. }) = held.complete.take() {
+                held.failed
+                    .extend(results.into_iter().map(|result| result.lease));
+            }
+            return self.cancel(client, &held.failed);
+        }
+        let backoff = Duration::from_millis(200) * (1 << (held.attempts - 1));
+        held.retry_at = Some(Instant::now() + backoff);
+        self.batches.insert(held.batch.id, held);
         Ok(())
     }
 
@@ -606,6 +752,9 @@ impl Updater<'_> {
                 batch: batch.clone(),
                 complete: None,
                 failed: Vec::new(),
+                sending: false,
+                attempts: 0,
+                retry_at: None,
             },
         );
         self.unstarted.fetch_add(n, Ordering::Relaxed);
@@ -692,13 +841,13 @@ impl Updater<'_> {
             None
         };
         let leases = then_lease.is_some();
-        let Some(request) = self
-            .batches
-            .get_mut(&id)
-            .and_then(|held| held.complete.as_mut())
-        else {
+        let Some(held) = self.batches.get_mut(&id) else {
             return Ok(());
         };
+        let Some(request) = held.complete.as_mut() else {
+            return Ok(());
+        };
+        held.sending = true;
         if let Request::Complete {
             then_lease: slot, ..
         } = request
@@ -718,25 +867,20 @@ impl Updater<'_> {
         Ok(())
     }
 
-    /// Renews every lease this worker holds (one ref per chunk).
+    /// Renews every lease this worker holds (one ref per chunk). A batch
+    /// waiting to retry its completion only holds the leases of its unsent
+    /// results; chunks it finished have no lease left.
     fn renew(&mut self, client: &mut Client) -> Result<(), Error> {
-        let mut seen = HashSet::new();
-        let leases: Vec<LeaseRef> = self
-            .batches
-            .values()
-            .flat_map(|held| {
-                held.batch
-                    .items
-                    .iter()
-                    .map(|item| (&held.batch.task_type, item))
-            })
-            .filter(|(_, item)| seen.insert(item.token))
-            .map(|(task_type, item)| LeaseRef {
-                task_type: task_type.clone(),
-                task_id: item.task_id.clone(),
-                token: item.token,
-            })
-            .collect();
+        let mut leases = Vec::new();
+        for held in self.batches.values() {
+            match &held.complete {
+                Some(Request::Complete { results, .. }) if held.attempts > 0 => {
+                    leases.extend(results.iter().map(|result| result.lease.clone()))
+                }
+                _ => leases.extend(lease_refs(&held.batch.task_type, &held.batch.items)),
+            }
+        }
+        let leases = chunk_leases(&leases);
         if leases.is_empty() {
             return Ok(());
         }

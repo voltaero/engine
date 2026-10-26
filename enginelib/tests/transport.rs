@@ -1047,7 +1047,7 @@ fn worker_runs_tasks_to_completion() {
         let worker = scope.spawn(|| {
             worker::run(
                 &harness.api,
-                || Client::connect(endpoint, auth(None), worker::caps(None)),
+                |_: Option<&str>| Client::connect(endpoint, auth(None), worker::caps(None)),
                 &opts,
                 &stop,
             )
@@ -1084,7 +1084,7 @@ fn worker_without_runnable_types_stops() {
     let endpoint = harness.server.endpoint();
     let err = worker::run(
         &harness.api,
-        || Client::connect(endpoint, auth(None), worker::caps(None)),
+        |_: Option<&str>| Client::connect(endpoint, auth(None), worker::caps(None)),
         &opts,
         &AtomicBool::new(false),
     )
@@ -1155,7 +1155,7 @@ fn worker_hands_back_panicking_tasks() {
         let worker = scope.spawn(|| {
             worker::run(
                 &api,
-                || Client::connect(endpoint, auth(None), worker::caps(None)),
+                |_: Option<&str>| Client::connect(endpoint, auth(None), worker::caps(None)),
                 &opts,
                 &stop,
             )
@@ -1170,11 +1170,10 @@ fn worker_hands_back_panicking_tasks() {
         worker.join().unwrap().unwrap();
     });
 
-    // Its result was never stored, and its lease was handed back.
-    wait_until("the panicking task requeued", || {
-        let record = &get(&mut client, std::slice::from_ref(unlucky))[0];
-        record.status == TaskStatus::Pending
-    });
+    // Its result was never stored, and its lease was handed back before
+    // `run` returned (stop waits for the `CancelLease` reply).
+    let record = &get(&mut client, std::slice::from_ref(unlucky))[0];
+    assert_eq!(record.status, TaskStatus::Pending);
     // Every other task finished with its own payload echoed back.
     for (i, record) in get(&mut client, &ids).into_iter().enumerate() {
         if &record.task_id != unlucky {

@@ -40,7 +40,8 @@ repo, [voltaero/magnesium](https://github.com/voltaero/magnesium).
 - Test all: `cargo test --workspace`
 - Run server: `cargo run -p engine --bin server`
 - Run proxy: `cargo run -p engine --bin proxy`
-- Run worker: `cargo run -p engine --bin client -- --server tcp://[::1]:50051 --threads 8`
+- Run worker: `cargo run -p engine --bin client` (no arguments; configured by
+  the `[client]` table of `config.toml`, `config::ClientConfig`)
 - Needs the system `libzmq` (the `zmq` crate links it via pkg-config).
 
 ## Key architecture facts
@@ -81,6 +82,13 @@ repo, [voltaero/magnesium](https://github.com/voltaero/magnesium).
   for this (mods' vtables). Panics/skips are cancelled only after the batch's
   `Complete` is acked (else cancel requeues the tasks being completed).
   `client:*` event args are only built if a handler exists (`Hooks`).
+  Rejected results: `IOError` -> resent with backoff (batch kept, leases
+  renewed, ≤6 attempts), `ResultTooLarge`/verify failure -> lease handed back,
+  anything else (lease gone) -> dropped. Held batches are tied to the server
+  that leased them: `run`'s `connect(Some(endpoint))` must reconnect *there*
+  (a proxy may pick another server, whose `WrongServer` would drop the work)
+  until their lease TTL has passed; `connect(None)` may pick any server. On
+  stop it waits for every reply, `CancelLease` included (linger 0).
   Measure with `bench --client-conns C --client-threads T [--work-ns N]`.
 - Transport-level guards (`transport/server.rs`): at most `max_inflight`
   handlers run at once (the I/O thread stops reading the ROUTER when full);

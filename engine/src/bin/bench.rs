@@ -360,8 +360,9 @@ fn main() {
             ..Default::default()
         };
         workers.push(spawn_guarded(format!("client {i}"), &abort, move || {
-            let connect =
-                || Client::connect(&endpoint, auth(&format!("cli{i}")), worker::caps(None));
+            let connect = |_: Option<&str>| {
+                Client::connect(&endpoint, auth(&format!("cli{i}")), worker::caps(None))
+            };
             worker::run(&api, connect, &opts, &done).map_err(|err| err.to_string())
         }));
     }
@@ -425,8 +426,9 @@ fn main() {
     loop {
         std::thread::sleep(Duration::from_millis(250));
         if let Some(client) = &mut stats_client {
+            // Progress only: `completed` also counts idempotent retries.
             let stats = client.stats().expect("stats");
-            completed.store(stats.completed, Ordering::Relaxed);
+            completed.store(stats.completed.min(args.tasks), Ordering::Relaxed);
         }
         let (ins, comp) = (
             inserted.load(Ordering::Relaxed),
@@ -447,7 +449,19 @@ fn main() {
             );
             last = (Instant::now(), ins, comp);
         }
-        if comp >= args.tasks || failed.load(Ordering::Relaxed) > 0 || abort.is_set() {
+        // Client mode finishes on distinct finished tasks: every task
+        // inserted and none pending.
+        let finished = if stats_client.is_some() {
+            ins >= args.tasks
+                && scan_tasks(&api, &task_type(), Scope::Pending, None, 1)
+                    .is_ok_and(|(pending, _)| pending.is_empty())
+        } else {
+            comp >= args.tasks
+        };
+        if finished && stats_client.is_some() {
+            completed.store(args.tasks, Ordering::Relaxed);
+        }
+        if finished || failed.load(Ordering::Relaxed) > 0 || abort.is_set() {
             break;
         }
     }
