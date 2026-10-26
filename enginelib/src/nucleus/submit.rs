@@ -3,7 +3,7 @@ use std::sync::Arc;
 use rust_rocksdb::WriteBatch;
 
 use crate::api::task_key;
-use crate::chunk::{DerivedRange, encode_derived, encode_pending};
+use crate::chunk::{DerivedRange, TaskId, encode_derived, encode_pending};
 use crate::{Identifier, Registry, api::ServerAPI, error::Error};
 
 // t:namespace:task_name:<chunk_seq> -> pending chunk record (payloads)
@@ -35,6 +35,18 @@ pub fn submit_batch<P: AsRef<[u8]>>(
     payloads: &[P],
     task_type: Identifier,
 ) -> Result<Vec<Result<String, Error>>, Error> {
+    Ok(submit_batch_ids(api, payloads, task_type)?
+        .into_iter()
+        .map(|result| result.map(|id| id.to_string()))
+        .collect())
+}
+
+/// [`submit_batch`], returning parsed [`TaskId`]s instead of their strings.
+pub fn submit_batch_ids<P: AsRef<[u8]>>(
+    api: Arc<ServerAPI>,
+    payloads: &[P],
+    task_type: Identifier,
+) -> Result<Vec<Result<TaskId, Error>>, Error> {
     let task = api
         .task_registry
         .get(&task_type)
@@ -44,7 +56,9 @@ pub fn submit_batch<P: AsRef<[u8]>>(
         return Err(Error::invalid_argument("DerivedTaskType"));
     }
 
-    let mut results: Vec<Result<String, Error>> = Vec::with_capacity(payloads.len());
+    // Placeholder for valid payloads until their chunk is written.
+    let unwritten = TaskId::new(0, 0, 0);
+    let mut results: Vec<Result<TaskId, Error>> = Vec::with_capacity(payloads.len());
     let mut valid: Vec<usize> = Vec::with_capacity(payloads.len());
     for (i, payload) in payloads.iter().enumerate() {
         let payload = payload.as_ref();
@@ -57,7 +71,7 @@ pub fn submit_batch<P: AsRef<[u8]>>(
             results.push(Err(Error::invalid_argument("Failed to verify task bytes")));
         } else {
             valid.push(i);
-            results.push(Ok(String::new()));
+            results.push(Ok(unwritten));
         }
     }
     if valid.is_empty() {
@@ -72,7 +86,11 @@ pub fn submit_batch<P: AsRef<[u8]>>(
         Ok(start) => {
             for (offset, members) in chunks.iter().enumerate() {
                 for (idx, &i) in members.iter().enumerate() {
-                    results[i] = Ok(api.task_id(start + offset as u64, idx as u16));
+                    results[i] = Ok(TaskId::new(
+                        api.server_id(),
+                        start + offset as u64,
+                        idx as u16,
+                    ));
                 }
             }
         }
@@ -106,6 +124,20 @@ pub fn submit_derived(
     count: u64,
     task_type: Identifier,
 ) -> Result<Vec<String>, Error> {
+    Ok(submit_derived_ids(api, base, start, count, task_type)?
+        .into_iter()
+        .map(|id| id.to_string())
+        .collect())
+}
+
+/// [`submit_derived`], returning parsed [`TaskId`]s instead of their strings.
+pub fn submit_derived_ids(
+    api: Arc<ServerAPI>,
+    base: &[u8],
+    start: u64,
+    count: u64,
+    task_type: Identifier,
+) -> Result<Vec<TaskId>, Error> {
     let task = api
         .task_registry
         .get(&task_type)
@@ -145,7 +177,9 @@ pub fn submit_derived(
         encode_derived(base, range)
     });
     let first = write_chunks(&api, &task_type, n as usize, records)?;
-    Ok((0..n).map(|k| api.task_id(first + k, 0)).collect())
+    Ok((0..n)
+        .map(|k| TaskId::new(api.server_id(), first + k, 0))
+        .collect())
 }
 
 /// Reserves `n` fresh seqs, writes `records` (exactly `n` of them) as the

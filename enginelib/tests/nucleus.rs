@@ -1275,3 +1275,74 @@ async fn derived_chunks_survive_restart() {
     );
     close(api).await;
 }
+
+/// One batch interleaving several task types (and an unknown one): each item
+/// is routed to its own type's chunk, whatever the order.
+#[tokio::test]
+async fn complete_batch_mixes_task_types() {
+    let dir = TempDir::new("mixed-types");
+    let mut api = ServerAPI::open(&dir.0, Config::default());
+    let types: Vec<Identifier> = (0..3).map(|i| ("m".into(), format!("t{i}"))).collect();
+    for id in &types {
+        api.task_registry.register(
+            Arc::new(TestTask {
+                id: id.clone(),
+                limits: TaskLimits::default(),
+            }),
+            id.clone(),
+        );
+    }
+    let api = Arc::new(api);
+    ServerAPI::populate(&api);
+
+    let mut leases = Vec::new();
+    for id in &types {
+        submit_batch(api.clone(), &[&b"a"[..], b"b"], id.clone()).unwrap();
+        leases.push(
+            lease_timeout(api.clone(), id.clone(), "w".into(), WAIT)
+                .await
+                .unwrap(),
+        );
+    }
+
+    // Round-robin over the types, task by task, with an unknown type mixed in.
+    let mut items = Vec::new();
+    for idx in 0..2 {
+        for lease in &leases {
+            items.push(CompleteItem {
+                task_type: lease.task_type.clone(),
+                task_id: lease.task_ids()[idx].clone(),
+                lease_token: lease.token,
+                bytes: vec![idx as u8 + 1],
+            });
+        }
+        items.push(CompleteItem {
+            task_type: ("m".into(), "missing".into()),
+            task_id: leases[0].task_ids()[idx].clone(),
+            lease_token: leases[0].token,
+            bytes: vec![9],
+        });
+    }
+    let results = complete_batch(&api, items);
+    assert_eq!(results.len(), 8);
+    for (pos, result) in results.iter().enumerate() {
+        if pos % 4 == 3 {
+            assert_eq!(result.as_ref().unwrap_err().as_ref(), "TaskTypeNotFound");
+        } else {
+            assert!(result.is_ok(), "item {pos}: {result:?}");
+        }
+    }
+    for lease in &leases {
+        assert!(
+            api.leased_tasks
+                .cell(&lease.task_type, lease.chunk_seq)
+                .is_none()
+        );
+        let done = api
+            .read_finished(&lease.task_type, lease.chunk_seq)
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.results, vec![Some(vec![1]), Some(vec![2])]);
+    }
+    close(api).await;
+}

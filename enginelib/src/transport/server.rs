@@ -7,6 +7,7 @@
 //! peer. ZeroMQ sockets are not thread-safe, so handlers never touch the ROUTER
 //! directly.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,7 +17,8 @@ use tokio::runtime::Handle;
 use tracing::{debug, error, info, warn};
 
 use super::{Background, POLL_MS, constant_time_eq, context, sleep_unless_stopped, zmq_err};
-use crate::api::{ServerAPI, lock_lease};
+use crate::Identifier;
+use crate::api::{LeaseCell, ServerAPI, lock_lease};
 use crate::config::ConfigTomlServer;
 use crate::error::{Error, ErrorKind};
 use crate::events::Events;
@@ -26,17 +28,16 @@ use crate::nucleus::query::{
 };
 use crate::nucleus::{
     cancel::cancel_batch,
-    complete::{CompleteItem, complete_batch},
+    complete::{CompleteRef, complete_refs},
     lease::lease_many,
     renew::renew_batch,
-    submit::{submit_batch, submit_derived},
+    submit::{submit_batch_ids, submit_derived_ids},
 };
 use crate::wire::{
-    self, Auth, LeaseRef, Leased, LeasedItem, MAX_LEASE_BATCH, MAX_LEASE_WAIT_MS, MAX_SCAN_LIMIT,
-    PROTO_VERSION, ProxyRequest, ProxyResponse, Query, QueryResponse, Request, Response,
-    ServerInfo, Stats, TaskResult, TaskTypeInfo, WireError,
+    self, Auth, LeaseRef, LeaseRefIn, LeasedView, MAX_LEASE_BATCH, MAX_LEASE_WAIT_MS,
+    MAX_SCAN_LIMIT, PROTO_VERSION, ProxyRequest, ProxyResponse, QueryIn, QueryResponse, Reply,
+    RequestIn, RequestKind, Response, ServerInfo, Stats, TaskResultIn, TaskTypeInfo, WireError,
 };
-use crate::{Identifier, Registry};
 
 /// Socket high-water marks, in messages. Generous so bursts of small messages
 /// queue instead of being dropped.
@@ -245,13 +246,7 @@ fn io_loop(
         let (outbound, inbound) = (items[0].is_readable(), items[1].is_readable());
 
         if outbound {
-            // Forward every pending reply. A peer that has gone away (or whose
-            // queue is full) just loses the reply; the ROUTER drops it.
-            while let Ok(frames) = replies_in.recv_multipart(zmq::DONTWAIT) {
-                if let Err(err) = router.send_multipart(frames, zmq::DONTWAIT) {
-                    debug!("Dropped reply: {err}");
-                }
-            }
+            forward_replies(replies_in, router);
         }
 
         if inbound {
@@ -259,18 +254,14 @@ fn io_loop(
                 if shared.saturated() {
                     break;
                 }
-                let frames = match router.recv_multipart(zmq::DONTWAIT) {
-                    Ok(frames) => frames,
+                let (identity, payload) = match recv_routed(router) {
+                    Ok(Some(frames)) => frames,
+                    Ok(None) => continue,
                     Err(zmq::Error::EAGAIN) => break,
                     Err(err) => {
                         warn!("ROUTER recv failed: {err}");
                         break;
                     }
-                };
-                // DEALER clients send a single frame: [identity, payload].
-                let mut frames = frames.into_iter();
-                let (Some(identity), Some(payload)) = (frames.next(), frames.next()) else {
-                    continue;
                 };
                 dispatch(shared, runtime, identity, payload);
             }
@@ -308,13 +299,7 @@ fn drain(shared: &Shared, router: &zmq::Socket, replies_in: &zmq::Socket) {
         if zmq::poll(&mut items, 10).is_err() {
             return;
         }
-        let mut forwarded = false;
-        while let Ok(frames) = replies_in.recv_multipart(zmq::DONTWAIT) {
-            forwarded = true;
-            if let Err(err) = router.send_multipart(frames, zmq::DONTWAIT) {
-                debug!("Dropped reply: {err}");
-            }
-        }
+        let forwarded = forward_replies(replies_in, router);
         if shared.inflight.load(Ordering::SeqCst) == 0 {
             let since = *quiet_since.get_or_insert_with(Instant::now);
             if forwarded {
@@ -333,27 +318,75 @@ fn drain(shared: &Shared, router: &zmq::Socket, replies_in: &zmq::Socket) {
     }
 }
 
-fn dispatch(shared: &Arc<Shared>, runtime: &Handle, identity: Vec<u8>, payload: Vec<u8>) {
+/// Receives one ROUTER message as `(identity, payload)`, moving both frames
+/// out of ZeroMQ without copying them. DEALER clients send a single frame, so
+/// anything after the payload is dropped; a message without one is `None`.
+fn recv_routed(router: &zmq::Socket) -> Result<Option<(zmq::Message, zmq::Message)>, zmq::Error> {
+    let identity = router.recv_msg(zmq::DONTWAIT)?;
+    if !identity.get_more() {
+        return Ok(None);
+    }
+    // The rest of a multipart message is delivered with its first frame.
+    let payload = router.recv_msg(0)?;
+    let mut more = payload.get_more();
+    while more {
+        more = router.recv_msg(0)?.get_more();
+    }
+    Ok(Some((identity, payload)))
+}
+
+/// Forwards every pending `[identity, reply]` from the handlers to the ROUTER,
+/// frames moved as-is. A peer that has gone away (or whose queue is full) just
+/// loses the reply; the ROUTER drops it. Returns whether anything was pending.
+fn forward_replies(replies_in: &zmq::Socket, router: &zmq::Socket) -> bool {
+    let mut forwarded = false;
+    while let Ok(Some((identity, reply))) = recv_routed(replies_in) {
+        forwarded = true;
+        let sent = router
+            .send(identity, zmq::SNDMORE | zmq::DONTWAIT)
+            .and_then(|()| router.send(reply, zmq::DONTWAIT));
+        if let Err(err) = sent {
+            debug!("Dropped reply: {err}");
+        }
+    }
+    forwarded
+}
+
+fn dispatch(shared: &Arc<Shared>, runtime: &Handle, identity: zmq::Message, payload: zmq::Message) {
     let slot = InflightSlot::acquire(shared);
     let shared = shared.clone();
     runtime.spawn(async move {
-        let (req_id, response) = match wire::decode::<Request>(&payload) {
-            Ok(envelope) => (
-                envelope.req_id,
+        // Only the header here: where the body is decoded depends on the kind.
+        let (req_id, reply) = match wire::decode::<RequestKind>(&payload) {
+            Ok(head) => (
+                head.req_id,
                 shared
-                    .handle(&identity, envelope.session, envelope.body)
+                    .handle(&identity, head.session, head.body, payload)
                     .await,
             ),
-            Err(err) => (0, Response::Error(err.into())),
+            Err(err) => (0, Response::Error(err.into()).into()),
         };
         // Free the slot before handing over the reply, so the I/O thread sees
         // the capacity as soon as it wakes for the reply.
         drop(slot);
-        match wire::encode(req_id, &response) {
+        let capacity = match &reply {
+            Reply::Leased(leased) => leased.size_hint(),
+            Reply::Completed { results, next } => {
+                64 + results.len() * 2 + next.as_ref().map_or(0, LeasedView::size_hint)
+            }
+            Reply::Ids(ids) => 64 + ids.len() * (2 + crate::chunk::TASK_ID_HEX_LEN),
+            Reply::Response(_) => 256,
+        };
+        match wire::encode_reply(req_id, &reply, capacity) {
             Ok(bytes) => shared.replies.send(identity, bytes),
             Err(err) => error!("Failed to encode response: {err}"),
         }
     });
+}
+
+/// Decodes the body of a request whose kind was already read.
+fn decode_body(payload: &[u8]) -> Result<RequestIn<'_>, Error> {
+    wire::decode::<RequestIn>(payload).map(|envelope| envelope.body)
 }
 
 /// One handler's share of [`ServerOptions::max_inflight`]; released on drop,
@@ -444,7 +477,7 @@ struct ReplyPool {
 }
 
 impl ReplyPool {
-    fn send(&self, identity: Vec<u8>, bytes: Vec<u8>) {
+    fn send(&self, identity: zmq::Message, bytes: Vec<u8>) {
         let socket = self
             .sockets
             .lock()
@@ -460,7 +493,11 @@ impl ReplyPool {
                 }
             },
         };
-        if let Err(err) = socket.send_multipart([identity, bytes], 0) {
+        // `Vec` -> `Message` hands the buffer to ZeroMQ without a copy.
+        let sent = socket
+            .send(identity, zmq::SNDMORE)
+            .and_then(|()| socket.send(bytes, 0));
+        if let Err(err) = sent {
             // Only times out if the I/O thread is gone (shutting down).
             debug!("Dropped reply: {err}");
         }
@@ -529,6 +566,9 @@ struct Shared {
     max_inflight_per_session: usize,
 }
 
+/// One task type's chunk leases (`LeasedTaskQueue::tasks` value).
+type TypeLeases = Arc<DashMap<u64, LeaseCell>>;
+
 fn not_authenticated() -> Response {
     Response::Error(WireError {
         kind: ErrorKind::InvalidArgument,
@@ -552,53 +592,86 @@ impl Shared {
     /// changes, so this check can't be raced by reaping or re-leasing. Leases
     /// that are gone or held under another token pass through: the nucleus op
     /// rejects them (or treats a `complete` as an idempotent retry).
-    fn check_owner(&self, lease: &LeaseRef, uid: &str) -> Result<(), Error> {
+    ///
+    /// `leases` is the type's lease map (see [`Shared::type_leases`]).
+    fn check_owner(leases: Option<&TypeLeases>, chunk_seq: u64, token: u64, uid: &str) -> bool {
         // Leases are per chunk: every task of a chunk lease shares its holder.
-        // Malformed / foreign ids pass through for the nucleus op to reject.
-        let Ok(id) = self.api.parse_task_id(&lease.task_id) else {
-            return Ok(());
-        };
-        let not_owned = self
-            .api
+        let cell = leases.and_then(|leases| leases.get(&chunk_seq).map(|cell| cell.clone()));
+        !cell.is_some_and(|cell| {
+            let held = lock_lease(&cell);
+            !held.gone && held.token == token && held.user_id != uid
+        })
+    }
+
+    /// The lease map of one task type, if it has ever been leased.
+    fn type_leases(&self, (a, b): (&str, &str)) -> Option<TypeLeases> {
+        let task_type: Identifier = (a.to_owned(), b.to_owned());
+        self.api
             .leased_tasks
-            .cell(&lease.task_type, id.chunk_seq)
-            .is_some_and(|cell| {
-                let held = lock_lease(&cell);
-                !held.gone && held.token == lease.token && held.user_id != uid
-            });
-        if not_owned {
-            return Err(Error::invalid_argument("LeaseNotOwned"));
-        }
-        Ok(())
+            .tasks
+            .get(&task_type)
+            .map(|entry| entry.value().clone())
     }
 
     /// Runs the batch op `op` on the items whose lease `uid` may act on and
     /// answers the rest with `LeaseNotOwned`; one result per item, in order.
+    /// The check is per chunk lease, so consecutive items of the same lease
+    /// share one lookup.
     fn owned_batch<I, T>(
         &self,
         uid: &str,
         items: Vec<I>,
-        lease_of: impl Fn(&I) -> &LeaseRef,
+        lease_of: impl Fn(&I) -> LeaseRefIn<'_>,
         op: impl FnOnce(Vec<I>) -> Vec<Result<T, Error>>,
     ) -> Vec<Result<T, Error>> {
-        let checks: Vec<Result<(), Error>> = items
+        // Each named type's lease map is resolved once per request.
+        let mut types: HashMap<(&str, &str), Option<TypeLeases>> = HashMap::new();
+        let mut last: Option<((&str, &str), u64, u64, bool)> = None;
+        let checks: Vec<bool> = items
             .iter()
-            .map(|item| self.check_owner(lease_of(item), uid))
+            .map(|item| {
+                let lease = lease_of(item);
+                // Malformed / foreign ids pass through for the nucleus op to reject.
+                let Ok(id) = self.api.parse_task_id(lease.task_id) else {
+                    return true;
+                };
+                match last {
+                    Some((task_type, chunk_seq, token, owned))
+                        if task_type == lease.task_type
+                            && chunk_seq == id.chunk_seq
+                            && token == lease.token =>
+                    {
+                        owned
+                    }
+                    _ => {
+                        let leases = types
+                            .entry(lease.task_type)
+                            .or_insert_with(|| self.type_leases(lease.task_type));
+                        let owned =
+                            Self::check_owner(leases.as_ref(), id.chunk_seq, lease.token, uid);
+                        last = Some((lease.task_type, id.chunk_seq, lease.token, owned));
+                        owned
+                    }
+                }
+            })
             .collect();
         let allowed: Vec<I> = items
             .into_iter()
             .zip(&checks)
-            .filter(|(_, check)| check.is_ok())
+            .filter(|(_, owned)| **owned)
             .map(|(item, _)| item)
             .collect();
         let mut results = op(allowed).into_iter();
         checks
             .into_iter()
-            .map(|check| match check {
-                Ok(()) => results
-                    .next()
-                    .unwrap_or_else(|| Err(Error::new("batch op returned too few results".into()))),
-                Err(err) => Err(err),
+            .map(|owned| {
+                if owned {
+                    results.next().unwrap_or_else(|| {
+                        Err(Error::new("batch op returned too few results".into()))
+                    })
+                } else {
+                    Err(Error::invalid_argument("LeaseNotOwned"))
+                }
             })
             .collect()
     }
@@ -607,13 +680,18 @@ impl Shared {
         self: &Arc<Self>,
         identity: &[u8],
         session_key: u128,
-        request: Request,
-    ) -> Response {
-        if let Request::Hello {
-            proto_ver, auth, ..
-        } = request
-        {
-            return self.hello(identity, proto_ver, auth);
+        kind: RequestKind,
+        payload: zmq::Message,
+    ) -> Reply {
+        if kind == RequestKind::Hello {
+            return match decode_body(&payload) {
+                Ok(RequestIn::Hello {
+                    proto_ver, auth, ..
+                }) => self.hello(identity, proto_ver, auth),
+                Ok(_) => Response::Error(Error::new("Unexpected request".into()).into()),
+                Err(err) => Response::Error(err.into()),
+            }
+            .into();
         }
 
         // Every other request needs a session; refresh its idle timer. The
@@ -626,18 +704,31 @@ impl Shared {
                 session.last_seen = Instant::now();
                 (session.uid.clone(), session.admin, session.inflight.clone())
             }
-            _ => return not_authenticated(),
+            _ => return not_authenticated().into(),
         };
         let Some(_slot) = SessionSlot::acquire(&inflight, self.max_inflight_per_session) else {
             return Response::Error(WireError {
                 kind: ErrorKind::InvalidArgument,
                 message: "TooManyRequests".into(),
-            });
+            })
+            .into();
         };
 
+        // Bulk, DB-bound requests are decoded on the blocking pool, straight
+        // from the received message: their payloads and results are never
+        // copied before they reach RocksDB.
+        match kind {
+            RequestKind::Complete => return self.complete_request(payload, uid).await,
+            RequestKind::Query => return self.query_request(payload, admin).await,
+            _ => {}
+        }
+
+        let request = match decode_body(&payload) {
+            Ok(request) => request,
+            Err(err) => return Response::Error(err.into()).into(),
+        };
         match request {
-            Request::Hello { .. } => unreachable!("handled above"),
-            Request::Lease {
+            RequestIn::Lease {
                 task_type,
                 max_tasks,
                 wait_ms,
@@ -650,51 +741,24 @@ impl Shared {
                 )
                 .await
             {
-                Ok(leased) => Response::Leased(leased),
-                Err(err) => Response::Error(err.into()),
+                Ok(leased) => Reply::Leased(leased),
+                Err(err) => Response::Error(err.into()).into(),
             },
-            Request::Renew { leases } => Response::Renewed {
+            RequestIn::Renew { leases } => Response::Renewed {
                 results: self
-                    .owned_batch(
-                        &uid,
-                        leases,
-                        |lease| lease,
-                        |leases| renew_batch(&self.api, leases.into_iter().map(lease_ref_parts)),
-                    )
+                    .owned_batch(&uid, leases, LeaseRef::as_in, |leases| {
+                        renew_batch(&self.api, leases.into_iter().map(lease_ref_parts))
+                    })
                     .into_iter()
                     .map(|result| result.map(wire::unix_ms).map_err(Into::into))
                     .collect(),
-            },
-            Request::Complete {
-                results,
-                then_lease,
-            } => {
-                let this = self.clone();
-                let owner = uid.clone();
-                let results =
-                    match tokio::task::spawn_blocking(move || this.complete(results, &owner)).await
-                    {
-                        Ok(results) => results,
-                        Err(err) => return Response::Error(Error::new(err.to_string()).into()),
-                    };
-                // The next lease never waits: an empty queue just means no `next`.
-                let next = match then_lease {
-                    Some(req) => self
-                        .lease(req.task_type, uid, req.max_tasks, Duration::ZERO)
-                        .await
-                        .ok(),
-                    None => None,
-                };
-                Response::Completed { results, next }
             }
-            Request::CancelLease { leases } => {
+            .into(),
+            RequestIn::CancelLease { leases } => {
                 let results: Vec<Result<(), WireError>> = self
-                    .owned_batch(
-                        &uid,
-                        leases,
-                        |lease| lease,
-                        |leases| cancel_batch(&self.api, leases.into_iter().map(lease_ref_parts)),
-                    )
+                    .owned_batch(&uid, leases, LeaseRef::as_in, |leases| {
+                        cancel_batch(&self.api, leases.into_iter().map(lease_ref_parts))
+                    })
                     .into_iter()
                     .map(|result| result.map_err(Into::into))
                     .collect();
@@ -702,16 +766,52 @@ impl Shared {
                     &self.counters.cancelled,
                     results.iter().filter(|result| result.is_ok()).count(),
                 );
-                Response::Cancelled { results }
+                Response::Cancelled { results }.into()
             }
-            Request::Query(query) => {
-                let this = self.clone();
-                match tokio::task::spawn_blocking(move || this.query(query, admin)).await {
-                    Ok(Ok(response)) => Response::Query(response),
-                    Ok(Err(err)) => Response::Error(err.into()),
-                    Err(err) => Response::Error(Error::new(err.to_string()).into()),
-                }
+            RequestIn::Hello { .. } | RequestIn::Complete { .. } | RequestIn::Query(_) => {
+                unreachable!("handled above")
             }
+        }
+    }
+
+    async fn complete_request(self: &Arc<Self>, payload: zmq::Message, uid: String) -> Reply {
+        let this = self.clone();
+        let owner = uid.clone();
+        let completed = tokio::task::spawn_blocking(move || match decode_body(&payload)? {
+            RequestIn::Complete {
+                results,
+                then_lease,
+            } => Ok((this.complete(results, &owner), then_lease)),
+            _ => Err(Error::new("Unexpected request".into())),
+        })
+        .await;
+        let (results, then_lease) = match completed {
+            Ok(Ok(completed)) => completed,
+            Ok(Err(err)) => return Response::Error(err.into()).into(),
+            Err(err) => return Response::Error(Error::new(err.to_string()).into()).into(),
+        };
+        // The next lease never waits: an empty queue just means no `next`.
+        let next = match then_lease {
+            Some(req) => self
+                .lease(req.task_type, uid, req.max_tasks, Duration::ZERO)
+                .await
+                .ok(),
+            None => None,
+        };
+        Reply::Completed { results, next }
+    }
+
+    async fn query_request(self: &Arc<Self>, payload: zmq::Message, admin: bool) -> Reply {
+        let this = self.clone();
+        let reply = tokio::task::spawn_blocking(move || match decode_body(&payload)? {
+            RequestIn::Query(query) => this.query(query, admin),
+            _ => Err(Error::new("Unexpected request".into())),
+        })
+        .await;
+        match reply {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(err)) => Response::Error(err.into()).into(),
+            Err(err) => Response::Error(Error::new(err.to_string()).into()).into(),
         }
     }
 
@@ -791,7 +891,7 @@ impl Shared {
         uid: String,
         max_tasks: u32,
         wait: Duration,
-    ) -> Result<Leased, Error> {
+    ) -> Result<LeasedView, Error> {
         let max_tasks = max_tasks.clamp(1, MAX_LEASE_BATCH) as usize;
         // Shutdown can cut the wait short: `lease_many` only awaits the first
         // chunk's cancel-safe `recv`; the rest is synchronous `try_lease`.
@@ -805,42 +905,37 @@ impl Shared {
             }
             leases = lease_many(self.api.clone(), task_type.clone(), uid, max_tasks, wait) => leases?,
         };
-        let mut expires_at = chrono::DateTime::<chrono::Utc>::MAX_UTC;
-        let mut tasks = Vec::with_capacity(leases.iter().map(|lease| lease.len()).sum());
-        for lease in &leases {
-            expires_at = expires_at.min(lease.expires_at);
-            tasks.extend(lease.tasks().map(|(task_id, bytes)| LeasedItem {
-                task_id,
-                token: lease.token,
-                bytes: bytes.to_vec(),
-                range: lease.range(),
-            }));
-        }
-        add(&self.counters.leased, tasks.len());
-        Ok(Leased {
+        let expires_at = leases
+            .iter()
+            .map(|lease| lease.expires_at)
+            .min()
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC);
+        // Tasks are written into the reply straight from the chunk leases.
+        let leased = LeasedView {
             task_type,
             expires_at_ms: wire::unix_ms(expires_at),
-            tasks,
-        })
+            leases,
+        };
+        add(&self.counters.leased, leased.len());
+        Ok(leased)
     }
 
-    fn complete(&self, results: Vec<TaskResult>, uid: &str) -> Vec<Result<(), WireError>> {
+    fn complete(&self, results: Vec<TaskResultIn<'_>>, uid: &str) -> Vec<Result<(), WireError>> {
         let results: Vec<Result<(), WireError>> = self
             .owned_batch(
                 uid,
                 results,
-                |result| &result.lease,
+                |result| result.lease,
                 |results| {
-                    let items = results
-                        .into_iter()
-                        .map(|TaskResult { lease, bytes }| CompleteItem {
-                            task_type: lease.task_type,
-                            task_id: lease.task_id,
-                            lease_token: lease.token,
-                            bytes,
-                        })
-                        .collect();
-                    complete_batch(&self.api, items)
+                    complete_refs(
+                        &self.api,
+                        results.iter().map(|result| CompleteRef {
+                            task_type: result.lease.task_type,
+                            task_id: result.lease.task_id,
+                            lease_token: result.lease.token,
+                            bytes: result.bytes,
+                        }),
+                    )
                 },
             )
             .into_iter()
@@ -853,39 +948,39 @@ impl Shared {
         results
     }
 
-    fn query(&self, query: Query, admin: bool) -> Result<QueryResponse, Error> {
+    fn query(&self, query: QueryIn<'_>, admin: bool) -> Result<Reply, Error> {
         let api = &self.api;
-        match query {
-            Query::Insert {
+        let response = match query {
+            QueryIn::Insert {
                 task_type,
                 payloads,
             } => {
-                let results: Vec<Result<String, WireError>> =
-                    submit_batch(api.clone(), &payloads, task_type)?
+                let ids: Vec<Result<_, WireError>> =
+                    submit_batch_ids(api.clone(), &payloads, task_type)?
                         .into_iter()
                         .map(|result| result.map_err(Into::into))
                         .collect();
                 add(
                     &self.counters.inserted,
-                    results.iter().filter(|result| result.is_ok()).count(),
+                    ids.iter().filter(|result| result.is_ok()).count(),
                 );
-                Ok(QueryResponse::Ids(results))
+                return Ok(Reply::Ids(ids));
             }
-            Query::InsertDerived {
+            QueryIn::InsertDerived {
                 task_type,
                 base,
                 start,
                 count,
             } => {
-                let ids = submit_derived(api.clone(), &base, start, count, task_type)?;
+                let ids = submit_derived_ids(api.clone(), base, start, count, task_type)?;
                 add(&self.counters.inserted, ids.len());
-                Ok(QueryResponse::Ids(ids.into_iter().map(Ok).collect()))
+                return Ok(Reply::Ids(ids.into_iter().map(Ok).collect()));
             }
-            Query::Get { task_type, ids } => {
+            QueryIn::Get { task_type, ids } => {
                 self.require_type(&task_type)?;
-                Ok(QueryResponse::Records(get_tasks(api, &task_type, ids)?))
+                QueryResponse::Records(get_tasks(api, &task_type, ids)?)
             }
-            Query::Scan {
+            QueryIn::Scan {
                 task_type,
                 scope,
                 after,
@@ -894,21 +989,21 @@ impl Shared {
                 self.require_type(&task_type)?;
                 let limit = limit.clamp(1, MAX_SCAN_LIMIT) as usize;
                 let (records, next) = scan_tasks(api, &task_type, scope, after.as_deref(), limit)?;
-                Ok(QueryResponse::Page { records, next })
+                QueryResponse::Page { records, next }
             }
-            Query::EstimateKeys => match db_query::query(api.clone(), DbQuery::EstimateKeys)? {
-                QueryResult::EstimateKeys(keys) => Ok(QueryResponse::Estimate(keys)),
-                _ => Err(Error::new("Unexpected estimate result".into())),
+            QueryIn::EstimateKeys => match db_query::query(api.clone(), DbQuery::EstimateKeys)? {
+                QueryResult::EstimateKeys(keys) => QueryResponse::Estimate(keys),
+                _ => return Err(Error::new("Unexpected estimate result".into())),
             },
-            Query::EstimateSize { task_type, scope } => {
+            QueryIn::EstimateSize { task_type, scope } => {
                 self.require_type(&task_type)?;
                 let prefix = scope_prefix(&task_type, scope);
                 match db_query::query(api.clone(), DbQuery::EstimateSize { prefix })? {
-                    QueryResult::EstimateSize(size) => Ok(QueryResponse::Estimate(size)),
-                    _ => Err(Error::new("Unexpected estimate result".into())),
+                    QueryResult::EstimateSize(size) => QueryResponse::Estimate(size),
+                    _ => return Err(Error::new("Unexpected estimate result".into())),
                 }
             }
-            Query::Delete {
+            QueryIn::Delete {
                 task_type,
                 scope,
                 ids,
@@ -916,26 +1011,27 @@ impl Shared {
                 require_admin(admin)?;
                 self.require_type(&task_type)?;
                 delete_tasks(api, &task_type, scope, &ids)?;
-                Ok(QueryResponse::Done)
+                QueryResponse::Done
             }
-            Query::Purge { task_type, scope } => {
+            QueryIn::Purge { task_type, scope } => {
                 require_admin(admin)?;
                 self.require_type(&task_type)?;
                 purge_tasks(api, &task_type, scope)?;
-                Ok(QueryResponse::Done)
+                QueryResponse::Done
             }
-            Query::Stats => Ok(QueryResponse::Stats(self.stats())),
-        }
+            QueryIn::Stats => QueryResponse::Stats(self.stats()),
+        };
+        Ok(Response::Query(response).into())
     }
 
     /// Typed queries only accept registered task types, so a crafted namespace
     /// or name can't build a key prefix that reaches another type's records.
     fn require_type(&self, task_type: &Identifier) -> Result<(), Error> {
-        self.api
-            .task_registry
-            .get(task_type)
-            .map(|_| ())
-            .ok_or(Error::not_found("TaskTypeNotFound"))
+        if self.api.task_registry.tasks.contains_key(task_type) {
+            Ok(())
+        } else {
+            Err(Error::not_found("TaskTypeNotFound"))
+        }
     }
 
     fn task_types(&self) -> Vec<Identifier> {
