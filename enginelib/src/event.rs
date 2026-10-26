@@ -118,7 +118,9 @@ impl EventBus {
             .register_handler(handler, identifier);
     }
 
-    #[instrument]
+    // Events can carry credentials (auth challenges, admin tokens): never
+    // record them in the span.
+    #[instrument(skip_all)]
     pub fn fire<T: Event>(&self, event: &mut T) {
         let id = event.get_id();
         debug!("EventBus: Firing event {}.{}", id.0, id.1);

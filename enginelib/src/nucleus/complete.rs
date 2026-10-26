@@ -4,7 +4,7 @@ use std::sync::Arc;
 use rust_rocksdb::WriteBatch;
 
 use crate::api::{TaskSettings, finished_task_key, lock_lease, task_key};
-use crate::chunk::{Bitmap, FinishedChunk};
+use crate::chunk::{Bitmap, decode_finished, encode_finished};
 use crate::task::Task;
 use crate::{Identifier, Registry, api::ServerAPI, error::Error};
 
@@ -17,6 +17,28 @@ pub struct CompleteItem {
     pub bytes: Vec<u8>,
 }
 
+impl CompleteItem {
+    pub fn as_ref(&self) -> CompleteRef<'_> {
+        CompleteRef {
+            task_type: (&self.task_type.0, &self.task_type.1),
+            task_id: &self.task_id,
+            lease_token: self.lease_token,
+            bytes: &self.bytes,
+        }
+    }
+}
+
+/// Borrowed form of [`CompleteItem`], e.g. decoded straight out of a request
+/// buffer: completing never copies a result before it is encoded into the
+/// chunk's finished record.
+#[derive(Debug, Clone, Copy)]
+pub struct CompleteRef<'a> {
+    pub task_type: (&'a str, &'a str),
+    pub task_id: &'a str,
+    pub lease_token: u64,
+    pub bytes: &'a [u8],
+}
+
 /// Finalizes one leased task with its result bytes. See [`complete_batch`].
 pub fn complete(
     api: Arc<ServerAPI>,
@@ -25,13 +47,13 @@ pub fn complete(
     lease_token: u64,
     task_bytes: &[u8],
 ) -> Result<(), Error> {
-    complete_batch(
+    complete_refs(
         &api,
-        vec![CompleteItem {
-            task_type,
-            task_id,
+        [CompleteRef {
+            task_type: (&task_type.0, &task_type.1),
+            task_id: &task_id,
             lease_token,
-            bytes: task_bytes.to_vec(),
+            bytes: task_bytes,
         }],
     )
     .pop()
@@ -54,42 +76,73 @@ pub fn complete(
 /// NotFound `"TaskNotLeased"` (or `"LeaseTokenMismatch"` if someone else holds
 /// the chunk's lease).
 pub fn complete_batch(api: &Arc<ServerAPI>, items: Vec<CompleteItem>) -> Vec<Result<(), Error>> {
-    let mut results: Vec<Result<(), Error>> = Vec::with_capacity(items.len());
-    // Groups keyed by (type, chunk, token), in first-seen order.
-    let mut index: HashMap<GroupKey, usize> = HashMap::new();
-    let mut groups: Vec<(GroupKey, Vec<Entry>)> = Vec::new();
-    let mut types: HashMap<Identifier, Option<TypeInfo>> = HashMap::new();
+    complete_refs(api, items.iter().map(CompleteItem::as_ref))
+}
 
-    for (pos, item) in items.into_iter().enumerate() {
+/// [`complete_batch`] over borrowed items.
+pub fn complete_refs<'a>(
+    api: &Arc<ServerAPI>,
+    items: impl IntoIterator<Item = CompleteRef<'a>>,
+) -> Vec<Result<(), Error>> {
+    let items = items.into_iter();
+    let mut results: Vec<Result<(), Error>> = Vec::with_capacity(items.size_hint().0);
+    // Task types seen in this call, looked up by the borrowed names (no owned
+    // key per item). A batch rarely has more than one, so the previous item's
+    // type is checked first and the map is only hashed when the type changes.
+    let mut types: Vec<(Identifier, Option<TypeInfo>)> = Vec::new();
+    let mut type_index: HashMap<(&'a str, &'a str), usize> = HashMap::new();
+    let mut last_type: Option<((&'a str, &'a str), usize)> = None;
+    // Groups keyed by (type, chunk, token), in first-seen order. Items of one
+    // chunk usually arrive together, so the last group is checked first.
+    let mut index: HashMap<GroupKey, usize> = HashMap::new();
+    let mut groups: Vec<(GroupKey, Vec<Entry<'a>>)> = Vec::new();
+
+    for (pos, item) in items.enumerate() {
         let checked = (|| {
-            let typed = types
-                .entry(item.task_type.clone())
-                .or_insert_with_key(|task_type| {
-                    api.task_registry
-                        .get(task_type)
-                        .map(|task| (task, api.settings(task_type)))
-                });
-            let (task, settings) = typed.as_ref().ok_or(Error::not_found("TaskTypeNotFound"))?;
-            let id = api.parse_task_id(&item.task_id)?;
+            let ty = match last_type {
+                Some((name, ty)) if name == item.task_type => ty,
+                _ => {
+                    let ty = *type_index.entry(item.task_type).or_insert_with(|| {
+                        let (a, b) = item.task_type;
+                        let task_type = (a.to_owned(), b.to_owned());
+                        let info = api
+                            .task_registry
+                            .get(&task_type)
+                            .map(|task| (task, api.settings(&task_type)));
+                        types.push((task_type, info));
+                        types.len() - 1
+                    });
+                    last_type = Some((item.task_type, ty));
+                    ty
+                }
+            };
+            let (task, settings) = types[ty]
+                .1
+                .as_ref()
+                .ok_or(Error::not_found("TaskTypeNotFound"))?;
+            let id = api.parse_task_id(item.task_id)?;
             if settings
                 .max_result
                 .is_some_and(|max| item.bytes.len() > max as usize)
             {
                 return Err(Error::invalid_argument("ResultTooLarge"));
             }
-            if !task.verify(&item.bytes) {
+            if !task.verify(item.bytes) {
                 return Err(Error::invalid_argument("Failed to verify task bytes"));
             }
-            Ok(id)
+            Ok((ty, id))
         })();
         match checked {
-            Ok(id) => {
+            Ok((ty, id)) => {
                 results.push(Ok(()));
-                let key = (item.task_type, id.chunk_seq, item.lease_token);
-                let group = *index.entry(key.clone()).or_insert_with(|| {
-                    groups.push((key, Vec::new()));
-                    groups.len() - 1
-                });
+                let key = (ty, id.chunk_seq, item.lease_token);
+                let group = match groups.last() {
+                    Some((last, _)) if *last == key => groups.len() - 1,
+                    _ => *index.entry(key).or_insert_with(|| {
+                        groups.push((key, Vec::new()));
+                        groups.len() - 1
+                    }),
+                };
                 groups[group].1.push(Entry {
                     pos,
                     idx: id.idx as usize,
@@ -100,20 +153,31 @@ pub fn complete_batch(api: &Arc<ServerAPI>, items: Vec<CompleteItem>) -> Vec<Res
         }
     }
 
-    for ((task_type, chunk_seq, token), entries) in groups {
-        complete_chunk(api, &task_type, chunk_seq, token, entries, &mut results);
+    for ((ty, chunk_seq, token), entries) in groups {
+        complete_chunk(api, &types[ty].0, chunk_seq, token, entries, &mut results);
     }
     results
 }
 
-/// (task type, chunk_seq, lease token)
-type GroupKey = (Identifier, u64, u64);
+/// (index into the call's task types, chunk_seq, lease token)
+type GroupKey = (usize, u64, u64);
 type TypeInfo = (Box<dyn Task>, TaskSettings);
 
-struct Entry {
+struct Entry<'a> {
     pos: usize,
     idx: usize,
-    bytes: Vec<u8>,
+    bytes: &'a [u8],
+}
+
+/// Reads the raw finished record of a chunk (pinned, not copied).
+fn read_finished_raw<'db>(
+    api: &'db ServerAPI,
+    task_type: &Identifier,
+    chunk_seq: u64,
+) -> Result<Option<rust_rocksdb::DBPinnableSlice<'db>>, Error> {
+    api.db
+        .get_pinned_cf(api.cf_finished(), finished_task_key(task_type, chunk_seq))
+        .map_err(|err| Error::io_error(format!("Failed to read finished chunk: {err}")))
 }
 
 fn complete_chunk(
@@ -121,7 +185,7 @@ fn complete_chunk(
     task_type: &Identifier,
     chunk_seq: u64,
     token: u64,
-    entries: Vec<Entry>,
+    entries: Vec<Entry<'_>>,
     results: &mut [Result<(), Error>],
 ) {
     let Some(cell) = api.leased_tasks.cell(task_type, chunk_seq) else {
@@ -164,10 +228,11 @@ fn complete_chunk(
     }
 
     // The stored results are only needed to merge into, or to check retries.
+    // They stay in the pinned record; `slots` borrows them.
     let needs_stored = lease.chunk.has_finished || retries.iter().any(|e| !newly.get(e.idx));
-    let mut finished = if needs_stored {
-        match api.read_finished(task_type, chunk_seq) {
-            Ok(finished) => finished.unwrap_or_else(|| FinishedChunk::new(len)),
+    let stored = if needs_stored {
+        match read_finished_raw(api, task_type, chunk_seq) {
+            Ok(stored) => stored,
             Err(err) => {
                 for entry in fresh.iter().chain(&retries) {
                     results[entry.pos] = Err(err.clone());
@@ -176,11 +241,18 @@ fn complete_chunk(
             }
         }
     } else {
-        FinishedChunk::new(len)
+        None
     };
-    if finished.results.len() != len {
-        finished.results.resize(len, None);
-    }
+    let mut slots = match stored.as_deref().map(decode_finished).transpose() {
+        Ok(slots) => slots.unwrap_or_default(),
+        Err(err) => {
+            for entry in fresh.iter().chain(&retries) {
+                results[entry.pos] = Err(err.clone());
+            }
+            return;
+        }
+    };
+    slots.resize(len, None);
 
     // Retries of tasks done before this call: compare with what is stored.
     let mut in_call: Vec<Entry> = Vec::new();
@@ -188,8 +260,8 @@ fn complete_chunk(
         if newly.get(entry.idx) {
             in_call.push(entry);
         } else {
-            results[entry.pos] = match &finished.results[entry.idx] {
-                Some(stored) if *stored == entry.bytes => Ok(()),
+            results[entry.pos] = match slots[entry.idx] {
+                Some(stored) if stored == entry.bytes => Ok(()),
                 _ => Err(Error::not_found("TaskNotLeased")),
             };
         }
@@ -200,11 +272,9 @@ fn complete_chunk(
     }
 
     let mut open_after = lease.chunk.open.clone();
-    let mut positions = Vec::with_capacity(fresh.len());
-    for entry in fresh {
+    for entry in &fresh {
         open_after.clear(entry.idx);
-        positions.push(entry.pos);
-        finished.results[entry.idx] = Some(entry.bytes);
+        slots[entry.idx] = Some(entry.bytes);
     }
     let all_done = open_after.none();
 
@@ -214,7 +284,7 @@ fn complete_chunk(
     batch.put_cf(
         api.cf_finished(),
         finished_task_key(task_type, chunk_seq),
-        finished.encode(),
+        encode_finished(slots.iter().copied()),
     );
     if all_done {
         batch.delete_cf(api.cf_pending(), task_key(task_type, chunk_seq));
@@ -222,13 +292,13 @@ fn complete_chunk(
     if let Err(err) = api.db.write(&batch) {
         // Nothing changed: the lease is intact and the worker may retry.
         let err = Error::io_error(format!("Failed to persist results: {err}"));
-        for pos in positions.into_iter().chain(in_call.iter().map(|e| e.pos)) {
-            results[pos] = Err(err.clone());
+        for entry in fresh.iter().chain(&in_call) {
+            results[entry.pos] = Err(err.clone());
         }
         return;
     }
     for entry in in_call {
-        if finished.results[entry.idx].as_deref() != Some(entry.bytes.as_slice()) {
+        if slots[entry.idx] != Some(entry.bytes) {
             results[entry.pos] = Err(Error::not_found("TaskNotLeased"));
         }
     }
@@ -252,7 +322,7 @@ fn already_completed(
     api: &ServerAPI,
     task_type: &Identifier,
     chunk_seq: u64,
-    entries: Vec<Entry>,
+    entries: Vec<Entry<'_>>,
     results: &mut [Result<(), Error>],
     otherwise: Option<Error>,
 ) {
@@ -260,8 +330,13 @@ fn already_completed(
         return;
     }
     let otherwise = otherwise.unwrap_or_else(|| Error::not_found("TaskNotLeased"));
-    let finished = match api.read_finished(task_type, chunk_seq) {
-        Ok(finished) => finished,
+    let stored = read_finished_raw(api, task_type, chunk_seq);
+    let slots = match &stored {
+        Ok(stored) => stored.as_deref().map(decode_finished).transpose(),
+        Err(err) => Err(err.clone()),
+    };
+    let slots = match &slots {
+        Ok(slots) => slots.as_deref().unwrap_or_default(),
         Err(err) => {
             for entry in entries {
                 results[entry.pos] = Err(err.clone());
@@ -270,12 +345,8 @@ fn already_completed(
         }
     };
     for entry in entries {
-        let stored = finished
-            .as_ref()
-            .and_then(|finished| finished.results.get(entry.idx))
-            .and_then(Option::as_deref);
-        results[entry.pos] = match stored {
-            Some(stored) if stored == entry.bytes.as_slice() => Ok(()),
+        results[entry.pos] = match slots.get(entry.idx) {
+            Some(Some(stored)) if *stored == entry.bytes => Ok(()),
             _ => Err(otherwise.clone()),
         };
     }

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -11,36 +12,39 @@ pub enum ErrorKind {
     Unknown,
 }
 
+/// An engine error. The message is a `Cow` so the common static messages
+/// (`"TaskNotFound"`, `"LeaseTokenMismatch"`, ...) never allocate, and cloning
+/// one error into every item of a batch is free.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
     kind: ErrorKind,
-    message: String,
+    message: Cow<'static, str>,
 }
 
 impl Error {
     pub fn new(message: String) -> Error {
         Error {
             kind: ErrorKind::Unknown,
-            message,
+            message: Cow::Owned(message),
         }
     }
 
-    pub fn with_kind(kind: ErrorKind, message: impl Into<String>) -> Error {
+    pub fn with_kind(kind: ErrorKind, message: impl Into<Cow<'static, str>>) -> Error {
         Error {
             kind,
             message: message.into(),
         }
     }
 
-    pub fn not_found(message: impl Into<String>) -> Error {
+    pub fn not_found(message: impl Into<Cow<'static, str>>) -> Error {
         Self::with_kind(ErrorKind::NotFound, message)
     }
 
-    pub fn invalid_argument(message: impl Into<String>) -> Error {
+    pub fn invalid_argument(message: impl Into<Cow<'static, str>>) -> Error {
         Self::with_kind(ErrorKind::InvalidArgument, message)
     }
 
-    pub fn io_error(message: impl Into<String>) -> Error {
+    pub fn io_error(message: impl Into<Cow<'static, str>>) -> Error {
         Self::with_kind(ErrorKind::IOError, message)
     }
 
@@ -57,7 +61,7 @@ impl AsRef<str> for Error {
 
 impl From<Error> for String {
     fn from(e: Error) -> String {
-        e.message
+        e.message.into_owned()
     }
 }
 

@@ -16,6 +16,12 @@ enginewasm = { path = "../enginewasm", optional = true }
 enginelib = { path = "../enginelib" }
 tokio = { version = "1.50.0", features = ["full"] }
 tracing = "0.1.44"
+# jemalloc for RocksDB, which also replaces `malloc` for the whole process.
+# Enabled here, in the host binaries, and not in enginelib: mods link enginelib
+# statically and must not carry a second heap. Their `malloc` binds to the one
+# this binary exports. Build mods on their own (`cargo build -p <mod>`), since
+# a `--workspace` build unifies this feature into them.
+rust-rocksdb = { version = "0.51.0", features = ["jemalloc"] }
 
 [[bin]]
 name = "wasm_worker"

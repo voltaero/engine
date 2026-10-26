@@ -45,24 +45,75 @@ impl TaskId {
     /// Parses a 24-char hex task id. Anything else is InvalidArgument
     /// `"InvalidTaskId"`.
     pub fn parse(s: &str) -> Result<Self, Error> {
-        let invalid = || Error::invalid_argument(format!("InvalidTaskId: {s}"));
-        if s.len() != TASK_ID_HEX_LEN || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(invalid());
+        let bytes: &[u8; TASK_ID_HEX_LEN] =
+            s.as_bytes().try_into().map_err(|_| Self::invalid(s))?;
+        let mut raw = [0u8; 12];
+        for (out, pair) in raw.iter_mut().zip(bytes.as_chunks::<2>().0) {
+            let (Some(hi), Some(lo)) = (hex_value(pair[0]), hex_value(pair[1])) else {
+                return Err(Self::invalid(s));
+            };
+            *out = hi << 4 | lo;
         }
-        let server_id = u16::from_str_radix(&s[0..4], 16).map_err(|_| invalid())?;
-        let chunk_seq = u64::from_str_radix(&s[4..20], 16).map_err(|_| invalid())?;
-        let idx = u16::from_str_radix(&s[20..24], 16).map_err(|_| invalid())?;
-        Ok(Self::new(server_id, chunk_seq, idx))
+        Ok(Self::new(
+            u16::from_be_bytes([raw[0], raw[1]]),
+            u64::from_be_bytes(raw[2..10].try_into().expect("8 bytes")),
+            u16::from_be_bytes([raw[10], raw[11]]),
+        ))
+    }
+
+    #[cold]
+    fn invalid(s: &str) -> Error {
+        Error::invalid_argument(format!("InvalidTaskId: {s}"))
+    }
+
+    /// The wire form, hex-encoded into a stack buffer (no allocation).
+    pub fn to_hex(&self) -> TaskIdHex {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut raw = [0u8; 12];
+        raw[0..2].copy_from_slice(&self.server_id.to_be_bytes());
+        raw[2..10].copy_from_slice(&self.chunk_seq.to_be_bytes());
+        raw[10..12].copy_from_slice(&self.idx.to_be_bytes());
+        let mut hex = [0u8; TASK_ID_HEX_LEN];
+        for (pair, byte) in hex.as_chunks_mut::<2>().0.iter_mut().zip(raw) {
+            pair[0] = DIGITS[(byte >> 4) as usize];
+            pair[1] = DIGITS[(byte & 0xf) as usize];
+        }
+        TaskIdHex(hex)
+    }
+}
+
+fn hex_value(digit: u8) -> Option<u8> {
+    match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        b'A'..=b'F' => Some(digit - b'A' + 10),
+        _ => None,
     }
 }
 
 impl fmt::Display for TaskId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{:04x}{:016x}{:04x}",
-            self.server_id, self.chunk_seq, self.idx
-        )
+        f.write_str(&self.to_hex())
+    }
+}
+
+/// A task id's 24 lowercase hex chars, on the stack. Derefs to `str`.
+#[derive(Clone, Copy)]
+pub struct TaskIdHex([u8; TASK_ID_HEX_LEN]);
+
+impl std::ops::Deref for TaskIdHex {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        // Only ever filled with ASCII hex digits.
+        std::str::from_utf8(&self.0).expect("hex digits are ASCII")
+    }
+}
+
+/// Serializes as the wire `task_id` string, without building a `String`.
+impl Serialize for TaskId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_hex())
     }
 }
 
@@ -340,50 +391,17 @@ impl FinishedChunk {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let n = self.results.len();
-        let size: usize = self.results.iter().flatten().map(|r| r.len() + 4).sum();
-        let mut out = Vec::with_capacity(5 + n.div_ceil(8) + size);
-        out.push(FORMAT_V1);
-        put_u32(&mut out, n);
-        let start = out.len();
-        out.resize(start + n.div_ceil(8), 0);
-        for (idx, result) in self.results.iter().enumerate() {
-            if result.is_some() {
-                out[start + idx / 8] |= 1 << (idx % 8);
-            }
-        }
-        for result in self.results.iter().flatten() {
-            put_u32(&mut out, result.len());
-            out.extend_from_slice(result);
-        }
-        out
+        encode_finished(self.results.iter().map(Option::as_deref))
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, Error> {
-        let mut at = 0;
-        if data.first() != Some(&FORMAT_V1) {
-            return Err(corrupt("finished"));
-        }
-        at += 1;
-        let n = read_u32(data, &mut at).ok_or_else(|| corrupt("finished"))?;
-        if n > MAX_CHUNK_SIZE as usize {
-            return Err(corrupt("finished"));
-        }
-        let bitmap = data
-            .get(at..at + n.div_ceil(8))
-            .ok_or_else(|| corrupt("finished"))?;
-        at += bitmap.len();
-        let mut results = vec![None; n];
-        for (idx, result) in results.iter_mut().enumerate() {
-            if bitmap[idx / 8] & (1 << (idx % 8)) == 0 {
-                continue;
-            }
-            let len = read_u32(data, &mut at).ok_or_else(|| corrupt("finished"))?;
-            let bytes = data.get(at..at + len).ok_or_else(|| corrupt("finished"))?;
-            *result = Some(bytes.to_vec());
-            at += len;
-        }
-        Ok(Self { results })
+        let slots = decode_finished(data)?;
+        Ok(Self {
+            results: slots
+                .into_iter()
+                .map(|slot| slot.map(<[u8]>::to_vec))
+                .collect(),
+        })
     }
 
     /// Walks the results of an encoded record in index order without copying
@@ -439,6 +457,59 @@ impl FinishedChunk {
         }
         Ok(done)
     }
+}
+
+/// Encodes a finished chunk record from its result slots (`Some` = done), in
+/// index order. Takes borrowed results so callers can merge stored and new
+/// results without copying each one into its own buffer first.
+pub fn encode_finished<'a>(
+    slots: impl ExactSizeIterator<Item = Option<&'a [u8]>> + Clone,
+) -> Vec<u8> {
+    let n = slots.len();
+    let size: usize = slots.clone().flatten().map(|r| r.len() + 4).sum();
+    let mut out = Vec::with_capacity(5 + n.div_ceil(8) + size);
+    out.push(FORMAT_V1);
+    put_u32(&mut out, n);
+    let start = out.len();
+    out.resize(start + n.div_ceil(8), 0);
+    for (idx, slot) in slots.clone().enumerate() {
+        if slot.is_some() {
+            out[start + idx / 8] |= 1 << (idx % 8);
+        }
+    }
+    for result in slots.flatten() {
+        put_u32(&mut out, result.len());
+        out.extend_from_slice(result);
+    }
+    out
+}
+
+/// Decodes a finished chunk record into result slots borrowing from `data`.
+pub fn decode_finished(data: &[u8]) -> Result<Vec<Option<&[u8]>>, Error> {
+    let mut at = 0;
+    if data.first() != Some(&FORMAT_V1) {
+        return Err(corrupt("finished"));
+    }
+    at += 1;
+    let n = read_u32(data, &mut at).ok_or_else(|| corrupt("finished"))?;
+    if n > MAX_CHUNK_SIZE as usize {
+        return Err(corrupt("finished"));
+    }
+    let bitmap = data
+        .get(at..at + n.div_ceil(8))
+        .ok_or_else(|| corrupt("finished"))?;
+    at += bitmap.len();
+    let mut slots = vec![None; n];
+    for (idx, slot) in slots.iter_mut().enumerate() {
+        if bitmap[idx / 8] & (1 << (idx % 8)) == 0 {
+            continue;
+        }
+        let len = read_u32(data, &mut at).ok_or_else(|| corrupt("finished"))?;
+        let end = at.checked_add(len).ok_or_else(|| corrupt("finished"))?;
+        *slot = Some(data.get(at..end).ok_or_else(|| corrupt("finished"))?);
+        at = end;
+    }
+    Ok(slots)
 }
 
 // ---------------------------------------------------------------------------

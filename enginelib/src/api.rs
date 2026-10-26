@@ -871,7 +871,9 @@ impl Registry<dyn Task> for EngineTaskRegistry {
         );
         self.tasks.insert(identifier, task);
     }
-    #[instrument(skip_all, fields(namespace = %identifier.0, name = %identifier.1))]
+    // Runs on every insert / complete / typed query: TRACE, so release builds
+    // (INFO) don't build and format a span per request.
+    #[instrument(level = "trace", skip_all, fields(namespace = %identifier.0, name = %identifier.1))]
     fn get(&self, identifier: &Identifier) -> Option<Box<dyn Task>> {
         self.tasks.get(identifier).map(|obj| obj.clone_box())
     }

@@ -32,5 +32,4 @@ vergen-gix = { version = "9.1.0", features = ["build", "cargo", "rustc"] }
 [dev-dependencies]
 tracing-test = "0.2.6"
 [dependencies.rust-rocksdb]
-features = ["jemalloc"]
 version = "0.51.0"

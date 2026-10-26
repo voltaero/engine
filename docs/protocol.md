@@ -32,9 +32,12 @@ Envelope { req_id: u64, session: u128, body: Request | Response | ProxyRequest |
   IPv6 is enabled on every socket.
 - Messages larger than `max_message_bytes` drop the connection.
 
-Server internals: one I/O thread owns the ROUTER and only moves bytes. Each
-message is decoded and handled on the tokio runtime (DB work on the blocking
-pool); replies return to the I/O thread over an inproc PUSH/PULL pair. At most
+Server internals: one I/O thread owns the ROUTER and only moves bytes (frames
+are handed over as ZeroMQ messages, never copied). Each message is decoded and
+handled on the tokio runtime (DB work, including decoding `Complete` and
+`Query` bodies, on the blocking pool); payloads and results are read in place
+from the received message and leased tasks are encoded straight from the chunk
+leases. Replies return to the I/O thread over an inproc PUSH/PULL pair. At most
 `max_inflight` requests (default 65 536, parked `Lease` waits included) are
 handled at once; at the cap the I/O thread stops reading the ROUTER until a
 handler finishes, so ZeroMQ's high-water marks and TCP push back on clients.

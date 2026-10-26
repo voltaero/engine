@@ -10,6 +10,8 @@ Workspace members:
 - `engine` (binaries: `server`, `proxy`, `bench`)
 - `enginelib` (shared runtime API, events, tasks, plugin loader, task nucleus)
 - `enginelib/macros` (proc macros used by mods and core)
+The management mod (web dashboard, token auth, `mgmtctl`) lives in its own
+repo, [voltaero/magnesium](https://github.com/voltaero/magnesium).
 
 > **Repo is mid-rewrite.** The earlier design (gRPC/proto, `client`/`packer`
 > binaries, and the RFC1002/1003/1004 design docs) was removed in the "rewrite:
@@ -52,7 +54,16 @@ Workspace members:
 - Server I/O: one thread owns the ROUTER socket and only moves bytes; handlers
   run on tokio (DB work on the blocking pool) and send replies back over an
   inproc PUSH/PULL pair. Never touch the ROUTER from a handler (zmq sockets are
-  not thread-safe).
+  not thread-safe). Frames travel as `zmq::Message`s end to end (no copies).
+- Zero-copy wire path (`wire.rs` "Server-side views"): the server reads only the
+  header + variant first (`RequestKind`), then decodes the body as `RequestIn`
+  (Complete results / Insert payloads borrow from the received message; bulk
+  requests are decoded on the blocking pool), and encodes replies as `Reply`
+  (`LeasedView` writes leased tasks straight from the chunk leases, `Ids` from
+  `TaskId`s). These mirror `Request`/`Query`/`Response` positionally (postcard):
+  **any change to those types must be mirrored there**; the `wire::tests`
+  byte-equality tests catch drift. Hot `Vec<u8>` fields use `#[serde(with =
+  "bytes")]` (same bytes on the wire, one memcpy instead of per-byte).
 - Transport-level guards (`transport/server.rs`): at most `max_inflight`
   handlers run at once (the I/O thread stops reading the ROUTER when full);
   `Renew`/`Complete`/`CancelLease` reject a lease held by another session uid
@@ -134,6 +145,8 @@ trait method) > engine default (`chunk_size` 1024, no size limits). Resolved in
 ### Task lifecycle (`enginelib/src/nucleus/*`)
 
 - `submit(bytes, type) -> task_id` / `submit_batch(payloads, type) -> [Result<task_id>]`
+  (`submit_batch_ids` / `submit_derived_ids` return `chunk::TaskId`s; the
+  transport uses those so no id `String` is built per task)
   — verifies each payload (+ `max_payload`), packs the valid ones of *this call*
   into fresh chunks of `chunk_size`, reserves seqs, writes all chunks in one
   `WriteBatch`, and only then returns ids. Never merges across calls. Bumps the
@@ -147,7 +160,7 @@ trait method) > engine default (`chunk_size` 1024, no size limits). Resolved in
   Requests a refill below the 25% watermark, both before waiting and again after
   taking a chunk (so workers still parked on a small queue aren't left waiting).
 - `renew` / `renew_batch` — extends the chunk lease named by `(task_id, token)`.
-- `complete` / `complete_batch(items)` — verifies each result (+ `max_result`),
+- `complete` / `complete_batch(items)` / `complete_refs(borrowed items)` — verifies each result (+ `max_result`),
   groups items per (type, chunk, token) and merges each group into the `f:`
   record in one `WriteBatch` (partial completes allowed). When the chunk's last
   open task is done the same batch deletes the `t:` record and the lease + dedup
@@ -223,6 +236,14 @@ Exported symbols required:
 `#[metadata]` and `#[module]` macros are the preferred way to provide these.
 
 Strict compatibility check is enabled when `GE_STRICT_MODS` is set.
+
+Mods statically link enginelib, so enginelib must stay allocator-neutral.
+RocksDB's `jemalloc` feature replaces `malloc` process-wide; it is enabled only
+by the host binaries (`engine/Cargo.toml`). A mod that links its own copy gets a
+private heap: memory crossing `run(&mut ServerAPI)` corrupts it, or `dlopen`
+fails with "cannot allocate memory in static TLS block". Build mods on their
+own (as a separate project, like the voltaero/mod template), never inside a
+`--workspace` build with the engine, where features unify.
 
 ### Wasm mods (experimental, `enginewasm` crate)
 
@@ -304,6 +325,11 @@ If changing API surface or behavior, also run:
 Report any warnings/errors that indicate risk (panic paths, serialization, auth flow).
 
 ## Notes for future agents
+
+- Hot paths are kept allocation-free per task (server: ~0.1 allocations/task
+  in `bench`). `Error` messages are `Cow<'static, str>`: use string literals for
+  fixed messages; task ids format via `TaskId::to_hex()` (stack buffer).
+  Measure with `bench` (see the lifecycle playbook) before and after changes.
 
 - Existing code has several warnings and `unwrap()` calls in runtime paths.
 - Prefer minimal, targeted edits.
