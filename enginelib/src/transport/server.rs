@@ -823,7 +823,7 @@ impl Shared {
             });
         }
         let api = &self.api;
-        if !Events::CheckAuth(api, auth.uid.clone(), auth.challenge, api.db.clone()) {
+        if !Events::CheckAuth(api, auth.uid.clone(), auth.challenge, api.db().clone()) {
             return Response::Error(WireError {
                 kind: ErrorKind::InvalidArgument,
                 message: "AuthFailed".into(),
@@ -836,7 +836,7 @@ impl Shared {
                 api,
                 token,
                 ("core".to_string(), "admin".to_string()),
-                api.db.clone(),
+                api.db().clone(),
             )
         });
         // Re-handshaking under an identity replaces its session, so a peer

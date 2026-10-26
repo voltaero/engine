@@ -183,6 +183,38 @@ impl Client {
         }
     }
 
+    /// Like [`Client::recv`] without waiting: `None` if no reply to a `send`
+    /// request is ready. Pair with [`Client::poll_item`] to wait on this
+    /// connection alongside other sockets.
+    pub fn try_recv(&mut self) -> Result<Option<Envelope<Response>>, Error> {
+        if let Some(envelope) = self.buffered.pop_front() {
+            self.outstanding.remove(&envelope.req_id);
+            return Ok(Some(envelope));
+        }
+        loop {
+            let bytes = match self.socket.recv_bytes(zmq::DONTWAIT) {
+                Ok(bytes) => bytes,
+                Err(zmq::Error::EAGAIN) => return Ok(None),
+                Err(err) => return Err(zmq_err("Failed to receive response", err)),
+            };
+            let envelope: Envelope<Response> = wire::decode(&bytes)?;
+            if self.outstanding.remove(&envelope.req_id) {
+                return Ok(Some(envelope));
+            }
+        }
+    }
+
+    /// Poll item for the connection's socket (readable = a reply may be ready).
+    pub fn poll_item(&self) -> zmq::PollItem<'_> {
+        self.socket.as_poll_item(zmq::POLLIN)
+    }
+
+    /// Whether [`Client::try_recv`] has replies buffered by an earlier `call`,
+    /// which polling the socket wouldn't show.
+    pub fn has_buffered(&self) -> bool {
+        !self.buffered.is_empty()
+    }
+
     fn recv_raw(&mut self, timeout: Duration) -> Result<Envelope<Response>, Error> {
         let mut items = [self.socket.as_poll_item(zmq::POLLIN)];
         let ready = zmq::poll(&mut items, timeout.as_millis().min(i64::MAX as u128) as i64)

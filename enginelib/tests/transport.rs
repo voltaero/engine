@@ -4,10 +4,11 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use enginelib::api::ServerAPI;
+use enginelib::chunk::decode_derived;
 use enginelib::config::{Config, TaskTypeConfig};
 use enginelib::error::ErrorKind;
 use enginelib::nucleus::submit::submit;
@@ -22,6 +23,7 @@ use enginelib::wire::{
     Auth, Caps, DerivedRange, LeaseRef, LeaseReq, Leased, Query, QueryResponse, Request, Response,
     Scope, TaskRecord, TaskResult, TaskStatus,
 };
+use enginelib::worker::{self, WorkerOptions};
 use enginelib::{Identifier, Registry};
 
 #[derive(Debug, Clone)]
@@ -56,9 +58,12 @@ fn task_type() -> Identifier {
     ("test".to_string(), "task".to_string())
 }
 
-/// A derived type: chunks are a base plus an index range.
-#[derive(Debug, Clone)]
-struct DerivedTask;
+/// A derived type: chunks are a base plus an index range. Its result is how
+/// many indexes the chunk covered.
+#[derive(Debug, Clone, Default)]
+struct DerivedTask {
+    count: u64,
+}
 impl Verifiable for DerivedTask {
     fn verify(&self, b: &[u8]) -> bool {
         !b.is_empty()
@@ -78,11 +83,13 @@ impl Task for DerivedTask {
             ..Default::default()
         }
     }
+    fn run_cpu(&mut self) {}
     fn to_bytes(&self) -> Vec<u8> {
-        vec![1]
+        self.count.to_le_bytes().to_vec()
     }
-    fn from_bytes(&self, _bytes: &[u8]) -> Box<dyn Task> {
-        Box::new(self.clone())
+    fn from_bytes(&self, bytes: &[u8]) -> Box<dyn Task> {
+        let (range, _base) = decode_derived(bytes).expect("a derived chunk");
+        Box::new(DerivedTask { count: range.count })
     }
     fn from_toml(&self, _d: String) -> Box<dyn Task> {
         Box::new(self.clone())
@@ -164,7 +171,7 @@ fn start_with(
     let mut api = ServerAPI::open(&dir.0, cfg);
     api.task_registry.register(Arc::new(TestTask), task_type());
     api.task_registry
-        .register(Arc::new(DerivedTask), derived_type());
+        .register(Arc::new(DerivedTask::default()), derived_type());
     let api = Arc::new(api);
     ServerAPI::populate(&api);
 
@@ -997,4 +1004,181 @@ fn derived_chunks_over_tcp() {
     assert_eq!(records[0].bytes.as_deref(), Some(&b"semirp"[..]));
     assert_eq!(records[2].status, TaskStatus::Leased);
     assert_eq!(records[2].range, next.tasks[0].range);
+}
+
+fn get_typed(client: &mut Client, task_type: Identifier, ids: &[String]) -> Vec<TaskRecord> {
+    match client
+        .query(Query::Get {
+            task_type,
+            ids: ids.to_vec(),
+        })
+        .unwrap()
+    {
+        QueryResponse::Records(records) => records,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[test]
+fn worker_runs_tasks_to_completion() {
+    let harness = start("worker", None, None);
+    let mut client = connect(&harness);
+    let ids: Vec<String> = client
+        .insert(task_type(), (1..=25u8).map(|i| vec![i]).collect())
+        .unwrap()
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    let derived: Vec<String> = client
+        .insert_derived(derived_type(), b"base".to_vec(), 0, 250_000)
+        .unwrap()
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+
+    let stop = AtomicBool::new(false);
+    let opts = WorkerOptions {
+        max_tasks: 8,
+        wait: Duration::from_millis(100),
+        ..Default::default()
+    };
+    let endpoint = harness.server.endpoint();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            worker::run(
+                &harness.api,
+                || Client::connect(endpoint, auth(None), worker::caps(None)),
+                &opts,
+                &stop,
+            )
+        });
+        wait_until("every task finished", || {
+            get(&mut client, &ids)
+                .iter()
+                .chain(&get_typed(&mut client, derived_type(), &derived))
+                .all(|record| record.status == TaskStatus::Finished)
+        });
+        stop.store(true, Ordering::SeqCst);
+        worker.join().unwrap().unwrap();
+    });
+
+    assert!(
+        get(&mut client, &ids)
+            .iter()
+            .all(|record| record.bytes.as_deref() == Some(&[1][..]))
+    );
+    let counts: Vec<u64> = get_typed(&mut client, derived_type(), &derived)
+        .into_iter()
+        .map(|record| u64::from_le_bytes(record.bytes.unwrap().try_into().unwrap()))
+        .collect();
+    assert_eq!(counts, [100_000, 100_000, 50_000]);
+}
+
+#[test]
+fn worker_without_runnable_types_stops() {
+    let harness = start("worker-none", None, None);
+    let opts = WorkerOptions {
+        task_types: vec![("missing".into(), "type".into())],
+        ..Default::default()
+    };
+    let endpoint = harness.server.endpoint();
+    let err = worker::run(
+        &harness.api,
+        || Client::connect(endpoint, auth(None), worker::caps(None)),
+        &opts,
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
+    assert_eq!(err.as_ref(), "NoRunnableTaskTypes");
+}
+
+/// `test:task` as a worker's mod sees it: panics on payload `[13]`.
+#[derive(Debug, Clone, Default)]
+struct PanickyTask {
+    payload: Vec<u8>,
+}
+impl Verifiable for PanickyTask {
+    fn verify(&self, b: &[u8]) -> bool {
+        !b.is_empty()
+    }
+}
+impl Task for PanickyTask {
+    fn get_id(&self) -> Identifier {
+        task_type()
+    }
+    fn clone_box(&self) -> Box<dyn Task> {
+        Box::new(self.clone())
+    }
+    fn run_cpu(&mut self) {
+        assert_ne!(self.payload, [13], "unlucky payload");
+    }
+    fn to_bytes(&self) -> Vec<u8> {
+        self.payload.clone()
+    }
+    fn from_bytes(&self, bytes: &[u8]) -> Box<dyn Task> {
+        Box::new(PanickyTask {
+            payload: bytes.to_vec(),
+        })
+    }
+    fn from_toml(&self, _d: String) -> Box<dyn Task> {
+        Box::new(self.clone())
+    }
+    fn to_toml(&self) -> String {
+        String::new()
+    }
+}
+
+#[test]
+fn worker_hands_back_panicking_tasks() {
+    let harness = start("worker-panic", None, None);
+    let mut client = connect(&harness);
+    let ids: Vec<String> = client
+        .insert(task_type(), (1..=25u8).map(|i| vec![i]).collect())
+        .unwrap()
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    let unlucky = &ids[12];
+
+    // A store-less worker API with its own mod for the type.
+    let mut api = ServerAPI::client(Config::default());
+    api.task_registry
+        .register(Arc::new(PanickyTask::default()), task_type());
+    let stop = AtomicBool::new(false);
+    let opts = WorkerOptions {
+        threads: 2,
+        wait: Duration::from_millis(100),
+        ..Default::default()
+    };
+    let endpoint = harness.server.endpoint();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            worker::run(
+                &api,
+                || Client::connect(endpoint, auth(None), worker::caps(None)),
+                &opts,
+                &stop,
+            )
+        });
+        wait_until("every other task finished", || {
+            get(&mut client, &ids)
+                .iter()
+                .filter(|record| &record.task_id != unlucky)
+                .all(|record| record.status == TaskStatus::Finished)
+        });
+        stop.store(true, Ordering::SeqCst);
+        worker.join().unwrap().unwrap();
+    });
+
+    // Its result was never stored, and its lease was handed back.
+    wait_until("the panicking task requeued", || {
+        let record = &get(&mut client, std::slice::from_ref(unlucky))[0];
+        record.status == TaskStatus::Pending
+    });
+    // Every other task finished with its own payload echoed back.
+    for (i, record) in get(&mut client, &ids).into_iter().enumerate() {
+        if &record.task_id != unlucky {
+            assert_eq!(record.bytes, Some(vec![i as u8 + 1]));
+        }
+    }
 }

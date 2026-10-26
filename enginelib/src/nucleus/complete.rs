@@ -175,7 +175,7 @@ fn read_finished_raw<'db>(
     task_type: &Identifier,
     chunk_seq: u64,
 ) -> Result<Option<rust_rocksdb::DBPinnableSlice<'db>>, Error> {
-    api.db
+    api.db()
         .get_pinned_cf(api.cf_finished(), finished_task_key(task_type, chunk_seq))
         .map_err(|err| Error::io_error(format!("Failed to read finished chunk: {err}")))
 }
@@ -289,7 +289,7 @@ fn complete_chunk(
     if all_done {
         batch.delete_cf(api.cf_pending(), task_key(task_type, chunk_seq));
     }
-    if let Err(err) = api.db.write(&batch) {
+    if let Err(err) = api.db().write(&batch) {
         // Nothing changed: the lease is intact and the worker may retry.
         let err = Error::io_error(format!("Failed to persist results: {err}"));
         for entry in fresh.iter().chain(&in_call) {

@@ -179,7 +179,7 @@ fn is_leased(api: &ServerAPI, chunk_seq: u64) -> bool {
 }
 
 fn pending_exists(api: &ServerAPI, chunk_seq: u64) -> bool {
-    api.db
+    api.db()
         .get_cf(api.cf_pending(), task_key(&task_type(), chunk_seq))
         .unwrap()
         .is_some()
@@ -865,14 +865,14 @@ async fn refill_cursor_only_moves_forward() {
     assert!(api.task_queue.get(&task_type()).unwrap().dedup.is_empty());
     // Every pending record is gone; finished records stay.
     let pending = api
-        .db
+        .db()
         .iterator_cf(api.cf_pending(), IteratorMode::Start)
         .filter_map(Result::ok)
         .filter(|(key, _)| key.starts_with(task_key_prefix(&task_type()).as_bytes()))
         .count();
     assert_eq!(pending, 0);
     assert!(
-        api.db
+        api.db()
             .get_cf(
                 api.cf_finished(),
                 finished_task_key(&task_type(), seq_of(&ids[0]))
@@ -896,7 +896,7 @@ async fn drained_queue_finds_key_behind_cursor_at_prefix_end() {
     );
     let tt = task_type();
     // A seq reserved but never written (a failed insert) sorts before b1/b2.
-    let behind = api.chunk_seq.reserve(&api.db, 1).unwrap().start;
+    let behind = api.chunk_seq.reserve(&api.db(), 1).unwrap().start;
     let ids = ids(submit_batch(api.clone(), &[b"b1", b"b2"], tt.clone()).unwrap());
     api.refill(&tt).unwrap();
     wait_queued(&api, 2).await;
@@ -905,7 +905,7 @@ async fn drained_queue_finds_key_behind_cursor_at_prefix_end() {
     // submitted and an out-of-band writer puts a record *behind* the cursor,
     // announcing it with `mark_rescan` as the refill contract requires.
     let after = submit(api.clone(), b"c", tt.clone()).unwrap();
-    api.db
+    api.db()
         .put_cf(
             api.cf_pending(),
             task_key(&tt, behind),
@@ -974,7 +974,7 @@ async fn chunk_above_an_unfinished_insert_loads_once_it_lands() {
     );
     let tt = task_type();
     // Another insert (of any type) reserved a lower seq and is still writing.
-    let blocking = api.chunk_seq.reserve(&api.db, 1).unwrap();
+    let blocking = api.chunk_seq.reserve(&api.db(), 1).unwrap();
     let task_id = submit(api.clone(), b"a", tt.clone()).unwrap();
     assert!(seq_of(&task_id) > blocking.start);
 

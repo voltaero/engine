@@ -106,8 +106,8 @@ pub fn query(api: Arc<ServerAPI>, query: Query) -> Result<QueryResult, Error> {
     match query {
         Query::Get { key } => {
             let value = match api.cf_for_key(key.as_bytes()) {
-                Some(cf) => api.db.get_cf(cf, key.as_bytes()),
-                None => api.db.get(key.as_bytes()),
+                Some(cf) => api.db().get_cf(cf, key.as_bytes()),
+                None => api.db().get(key.as_bytes()),
             }
             .map_err(|err| Error::io_error(format!("Failed to read record: {err}")))?;
             Ok(QueryResult::Record(
@@ -120,13 +120,13 @@ pub fn query(api: Arc<ServerAPI>, query: Query) -> Result<QueryResult, Error> {
                     .map(|keys| keys.unwrap_or(0))
                     .map_err(|err| Error::io_error(format!("Failed to read key estimate: {err}")))
             };
-            let keys = read(api.db.property_int_value(properties::ESTIMATE_NUM_KEYS))?
+            let keys = read(api.db().property_int_value(properties::ESTIMATE_NUM_KEYS))?
                 + read(
-                    api.db
+                    api.db()
                         .property_int_value_cf(api.cf_pending(), properties::ESTIMATE_NUM_KEYS),
                 )?
                 + read(
-                    api.db
+                    api.db()
                         .property_int_value_cf(api.cf_finished(), properties::ESTIMATE_NUM_KEYS),
                 )?;
             Ok(QueryResult::EstimateKeys(keys))
@@ -136,8 +136,8 @@ pub fn query(api: Arc<ServerAPI>, query: Query) -> Result<QueryResult, Error> {
                 .ok_or_else(|| Error::invalid_argument("Cannot size an unbounded prefix"))?;
             let range = [Range::new(prefix.as_bytes(), &end)];
             let size = match api.cf_for_key(prefix.as_bytes()) {
-                Some(cf) => api.db.get_approximate_sizes_cf(cf, &range),
-                None => api.db.get_approximate_sizes(&range),
+                Some(cf) => api.db().get_approximate_sizes_cf(cf, &range),
+                None => api.db().get_approximate_sizes(&range),
             }
             .into_iter()
             .next()
@@ -155,8 +155,8 @@ pub fn query(api: Arc<ServerAPI>, query: Query) -> Result<QueryResult, Error> {
             let start = after.as_deref().unwrap_or(prefix.as_str());
             let mode = IteratorMode::From(start.as_bytes(), Direction::Forward);
             let iter = match api.cf_for_key(prefix.as_bytes()) {
-                Some(cf) => api.db.iterator_cf(cf, mode),
-                None => api.db.iterator(mode),
+                Some(cf) => api.db().iterator_cf(cf, mode),
+                None => api.db().iterator(mode),
             };
 
             let mut records: Vec<Record> = Vec::with_capacity(limit.min(1024));
@@ -182,8 +182,8 @@ pub fn query(api: Arc<ServerAPI>, query: Query) -> Result<QueryResult, Error> {
         }
         Query::Delete { key } => {
             match api.cf_for_key(key.as_bytes()) {
-                Some(cf) => api.db.delete_cf(cf, key.as_bytes()),
-                None => api.db.delete(key.as_bytes()),
+                Some(cf) => api.db().delete_cf(cf, key.as_bytes()),
+                None => api.db().delete(key.as_bytes()),
             }
             .map_err(|err| Error::io_error(format!("Failed to delete record: {err}")))?;
             Ok(QueryResult::Deleted)
@@ -196,7 +196,7 @@ pub fn query(api: Arc<ServerAPI>, query: Query) -> Result<QueryResult, Error> {
                 Some(cf) => batch.delete_range_cf(cf, prefix.as_bytes(), end.as_slice()),
                 None => batch.delete_range(prefix.as_bytes(), end.as_slice()),
             }
-            api.db
+            api.db()
                 .write(&batch)
                 .map_err(|err| Error::io_error(format!("Failed to purge prefix: {err}")))?;
             Ok(QueryResult::Purged)
@@ -316,7 +316,7 @@ pub fn scan_tasks(
     let mut records: Vec<PageRecord> = Vec::with_capacity(limit.min(1024));
     // Set once a task beyond the page is seen.
     let mut more = false;
-    for result in api.db.iterator_cf_opt(cf, opts, IteratorMode::Start) {
+    for result in api.db().iterator_cf_opt(cf, opts, IteratorMode::Start) {
         let (key, value) =
             result.map_err(|err| Error::io_error(format!("Failed to read record: {err}")))?;
         let Some(chunk_seq) = chunk_seq_from_key(&key) else {
@@ -345,7 +345,7 @@ pub fn scan_tasks(
             Scope::Pending => {
                 let payloads = ChunkPayloads::decode(value.into_vec())?;
                 let done = match api
-                    .db
+                    .db()
                     .get_pinned_cf(api.cf_finished(), finished_task_key(task_type, chunk_seq))
                     .map_err(|err| Error::io_error(format!("Failed to read record: {err}")))?
                 {
@@ -479,7 +479,7 @@ pub fn purge_tasks(api: &ServerAPI, task_type: &Identifier, scope: Scope) -> Res
                         let finished_key = finished_key_of(key);
                         let protected = in_flight(chunk_seq_from_key(key))
                             || api
-                                .db
+                                .db()
                                 .get_pinned_cf(api.cf_finished(), &finished_key)
                                 .map_err(|err| {
                                     Error::io_error(format!("Failed to read record: {err}"))
@@ -518,7 +518,7 @@ fn pending_page(api: &ServerAPI, lower: &[u8], upper: &[u8]) -> Result<KeyPage, 
     let mut opts = ReadOptions::default();
     opts.set_iterate_lower_bound(lower.to_vec());
     opts.set_iterate_upper_bound(upper.to_vec());
-    let mut iter = api.db.raw_iterator_cf_opt(api.cf_pending(), opts);
+    let mut iter = api.db().raw_iterator_cf_opt(api.cf_pending(), opts);
     iter.seek_to_first();
     let mut keys = Vec::new();
     let mut next = None;
@@ -552,14 +552,14 @@ fn finished_key_of(pending_key: &[u8]) -> Vec<u8> {
 }
 
 fn pending_exists(api: &ServerAPI, key: &str) -> Result<bool, Error> {
-    api.db
+    api.db()
         .get_pinned_cf(api.cf_pending(), key)
         .map(|value| value.is_some())
         .map_err(|err| Error::io_error(format!("Failed to read record: {err}")))
 }
 
 fn write_deletes(api: &ServerAPI, batch: WriteBatch) -> Result<(), Error> {
-    api.db
+    api.db()
         .write(&batch)
         .map_err(|err| Error::io_error(format!("Failed to delete records: {err}")))
 }
