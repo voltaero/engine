@@ -108,6 +108,13 @@ impl Client {
         &self.endpoint
     }
 
+    /// The credentials of the handshake, including a proxy-issued ticket that
+    /// [`Client::connect_via_proxy`] put in `challenge`. Reconnect to this
+    /// server with these, not the ones given to the proxy.
+    pub fn auth(&self) -> &Auth {
+        &self.auth
+    }
+
     fn hello(&mut self) -> Result<(), Error> {
         let request = Request::Hello {
             proto_ver: PROTO_VERSION,

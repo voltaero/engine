@@ -99,13 +99,26 @@ async fn main() {
             .name(format!("updater-{id}"))
             .spawn(move || {
                 // `home` is the server holding this worker's leases: go back
-                // there, even when a proxy would pick another.
-                let connect = |home: Option<&str>| match (home, &proxy) {
-                    (Some(home), _) => Client::connect(home, auth.clone(), caps.clone()),
-                    (None, Some(proxy)) => {
-                        Client::connect_via_proxy(proxy, None, auth.clone(), caps.clone())
-                    }
-                    (None, None) => Client::connect(&server, auth.clone(), caps.clone()),
+                // there, even when a proxy would pick another, with the
+                // credentials that server accepted (a proxy ticket replaces
+                // `challenge`).
+                let mut accepted: Option<(String, Auth)> = None;
+                let connect = move |home: Option<&str>| {
+                    let client = match (home, &proxy) {
+                        (Some(home), _) => {
+                            let home_auth = match &accepted {
+                                Some((endpoint, accepted)) if endpoint == home => accepted,
+                                _ => &auth,
+                            };
+                            Client::connect(home, home_auth.clone(), caps.clone())
+                        }
+                        (None, Some(proxy)) => {
+                            Client::connect_via_proxy(proxy, None, auth.clone(), caps.clone())
+                        }
+                        (None, None) => Client::connect(&server, auth.clone(), caps.clone()),
+                    }?;
+                    accepted = Some((client.endpoint().to_string(), client.auth().clone()));
+                    Ok(client)
                 };
                 let result = worker::run(&api, connect, &opts, &stop);
                 let _ = done_tx.send(result);
