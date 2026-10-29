@@ -8,7 +8,10 @@ description = "A Blazingly fast distributed task system"
 [features]
 default = []
 dev = []
+# Experimental: sandboxed `.wasm` task mods (server) and the `wasm_worker` bin.
+wasm = ["dep:enginewasm"]
 [dependencies]
+enginewasm = { path = "../enginewasm", optional = true }
 
 enginelib = { path = "../enginelib" }
 tokio = { version = "1.50.0", features = ["full"] }
@@ -19,3 +22,7 @@ tracing = "0.1.44"
 # this binary exports. Build mods on their own (`cargo build -p <mod>`), since
 # a `--workspace` build unifies this feature into them.
 rust-rocksdb = { version = "0.51.0", features = ["jemalloc"] }
+
+[[bin]]
+name = "wasm_worker"
+required-features = ["wasm"]

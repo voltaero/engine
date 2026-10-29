@@ -1,0 +1,21 @@
+# Example wasm task mod (CPU `ge_run` + WGSL GPU kernel). Standalone, not a
+# workspace member:
+#
+#   cargo build --release --target wasm32-unknown-unknown \
+#       --manifest-path examples/wasm-mix/Cargo.toml
+#   cp examples/wasm-mix/target/wasm32-unknown-unknown/release/wasm_mix.wasm mods/
+[package]
+name = "wasm-mix"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+
+[workspace]

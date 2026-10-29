@@ -271,6 +271,21 @@ fails with "cannot allocate memory in static TLS block". Build mods on their
 own (as a separate project, like the voltaero/mod template), never inside a
 `--workspace` build with the engine, where features unify.
 
+### Wasm mods (experimental, `enginewasm` crate)
+
+Untrusted task mods as core wasm (`./mods/*.wasm`, loaded only by
+`engine --features wasm`'s server via `enginewasm::load_mods` before
+`populate`). Modules may be wasm32 or wasm64 (memory64); the host is generic
+over pointer width (`host::Width`). The ABI is `ge_alloc`/`ge_free`/
+`ge_verify`/`ge_run(ptr, len, out)`, imports are `ge.*` only (`host.rs`: log,
+fs, net), and metadata lives in the `ge:meta` custom section. An optional WGSL
+kernel in `ge:wgsl` runs on wgpu (`enginewasm::gpu`) and must match `ge_run`
+byte for byte. Limits and grants (`SandboxLimits`: memory, timeouts, io caps,
+memory64, `fs` mounts, `net` allowlist) come from `config.toml` `[wasm]` and
+`[wasm.mods."ns:name"]` (`policy.rs`, `WasmConfig`). Everything is denied by
+default; fs goes through cap-std handles. Spec: `docs/wasm.md`. Tests: `enginewasm/tests/sandbox.rs`
+(the GPU test skips without an adapter). Worker: `engine/src/bin/wasm_worker.rs`.
+
 ## Auth behavior warning
 
 - User auth/admin auth are event-driven.
