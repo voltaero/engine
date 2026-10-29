@@ -11,7 +11,18 @@ Status: v5 (`PROTO_VERSION = 5`) implemented over ZeroMQ (`enginelib/src/wire.rs
   queues/leases (`ServerAPI`). Servers share no state.
 - **Client** (`transport::client::Client`) — workers (`Lease`/`Renew`/
   `Complete`/`CancelLease`) and submitters/operators (`Query`). One protocol;
-  the role is just which messages a connection sends.
+  the role is just which messages a connection sends. The `engine` bin
+  `client` is the stock worker (`enginelib::worker`): it loads `./mods`, leases
+  every type it has a mod for and runs each task through the mod's `Task`
+  (`from_bytes` → `run` → `to_bytes`; a derived chunk is handed to
+  `from_bytes` as its `encode_derived(base, range)` record, split again with
+  `chunk::decode_derived`). Per connection, one updater thread pipelines
+  `Lease` (up to two ahead) / `Complete` (with `then_lease`) / `Renew` while
+  compute threads run the batches. Tasks that panic, or are skipped on
+  shutdown, are handed back with `CancelLease` after the batch's `Complete`
+  is acknowledged. After a disconnect it reconnects to the server that
+  leased its unfinished batches (ids only exist there), not via the proxy.
+  Configured only by the `[client]` table of `config.toml`.
 - **Proxy** (`engine` bin `proxy`) — discovery only: tells a client which
   server to use. Never on the task hot path.
 

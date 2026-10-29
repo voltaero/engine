@@ -194,7 +194,7 @@ fn write_chunks(
 ) -> Result<u64, Error> {
     // Held until the write lands: the refill cursor never passes a seq whose
     // record may still be written.
-    let reservation = api.chunk_seq.reserve(&api.db, n as u64)?;
+    let reservation = api.chunk_seq.reserve(&api.db(), n as u64)?;
     let start = reservation.start;
 
     let cf = api.cf_pending();
@@ -202,7 +202,7 @@ fn write_chunks(
     for (offset, record) in records.enumerate() {
         batch.put_cf(cf, task_key(task_type, start + offset as u64), record);
     }
-    let written = api.db.write(&batch);
+    let written = api.db().write(&batch);
     drop(reservation);
     // Releasing the reservation may advance `safe_upto` past chunks that other
     // inserts (of any type) already wrote: refill types whose pass stopped here.

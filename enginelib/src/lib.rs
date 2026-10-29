@@ -12,6 +12,7 @@ pub mod prelude;
 pub mod task;
 pub mod transport;
 pub mod wire;
+pub mod worker;
 pub type Identifier = (String, String);
 pub type RawIdentifier = String;
 pub const GIT_VERSION: &str = env!("CARGO_PKG_VERSION"); //get commit hash

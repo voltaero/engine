@@ -12,6 +12,11 @@
 //! (payloads per Insert), `--lease` (max_tasks per Lease), `--chunk`
 //! (chunk_size), `--payload` (bytes per payload, >= 8), `--db` (store dir;
 //! default a fresh temp dir, removed afterwards).
+//!
+//! Client mode: `--client-conns C` replaces the bench workers with C
+//! `enginelib::worker` connections running `EchoTask` through the mod path,
+//! each with `--client-threads` compute threads (default 1); `--work-ns` spins
+//! that long per task to stand in for compute.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,10 +33,18 @@ use enginelib::transport::server::{
     DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_INFLIGHT_PER_SESSION, Server, ServerOptions,
 };
 use enginelib::wire::{Auth, Caps, LeaseRef, LeaseReq, Leased, Scope, TaskResult};
+use enginelib::worker::{self, WorkerOptions};
 use enginelib::{Identifier, Registry};
 
-#[derive(Debug, Clone)]
-struct EchoTask;
+/// Busy-work per task in client mode (`--work-ns`).
+static WORK_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Echoes its payload back as the result; in client mode, after spinning for
+/// `WORK_NS` to stand in for real compute.
+#[derive(Debug, Clone, Default)]
+struct EchoTask {
+    bytes: Vec<u8>,
+}
 impl Verifiable for EchoTask {
     fn verify(&self, b: &[u8]) -> bool {
         b.len() >= 8
@@ -44,11 +57,22 @@ impl Task for EchoTask {
     fn clone_box(&self) -> Box<dyn Task> {
         Box::new(self.clone())
     }
-    fn to_bytes(&self) -> Vec<u8> {
-        Vec::new()
+    fn run_cpu(&mut self) {
+        let ns = WORK_NS.load(Ordering::Relaxed);
+        if ns > 0 {
+            let end = Instant::now() + Duration::from_nanos(ns);
+            while Instant::now() < end {
+                std::hint::spin_loop();
+            }
+        }
     }
-    fn from_bytes(&self, _bytes: &[u8]) -> Box<dyn Task> {
-        Box::new(self.clone())
+    fn to_bytes(&self) -> Vec<u8> {
+        self.bytes.clone()
+    }
+    fn from_bytes(&self, bytes: &[u8]) -> Box<dyn Task> {
+        Box::new(EchoTask {
+            bytes: bytes.to_vec(),
+        })
     }
     fn from_toml(&self, _d: String) -> Box<dyn Task> {
         Box::new(self.clone())
@@ -71,6 +95,9 @@ struct Args {
     chunk: u32,
     payload: usize,
     db: Option<PathBuf>,
+    client_conns: usize,
+    client_threads: usize,
+    work_ns: u64,
 }
 
 fn parse_args() -> Args {
@@ -83,6 +110,9 @@ fn parse_args() -> Args {
         chunk: 1024,
         payload: 16,
         db: None,
+        client_conns: 0,
+        client_threads: 1,
+        work_ns: 0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -103,6 +133,9 @@ fn parse_args() -> Args {
             "--chunk" => args.chunk = num() as u32,
             "--payload" => args.payload = (num() as usize).max(8),
             "--db" => args.db = Some(PathBuf::from(&value)),
+            "--client-conns" => args.client_conns = num() as usize,
+            "--client-threads" => args.client_threads = (num() as usize).max(1),
+            "--work-ns" => args.work_ns = num(),
             other => panic!("unknown flag {other}"),
         }
     }
@@ -212,7 +245,8 @@ fn main() {
         },
     );
     let mut api = ServerAPI::open(&db, cfg);
-    api.task_registry.register(Arc::new(EchoTask), task_type());
+    api.task_registry
+        .register(Arc::new(EchoTask::default()), task_type());
     let api = Arc::new(api);
     ServerAPI::populate(&api);
     ServerAPI::spawn_reaper(&api);
@@ -251,10 +285,13 @@ fn main() {
     let endpoint = server.endpoint().to_string();
 
     println!(
-        "bench: tasks={} inserters={} workers={} batch={} lease={} chunk={} payload={}B db={}",
+        "bench: tasks={} inserters={} workers={} client_conns={} client_threads={} work_ns={} batch={} lease={} chunk={} payload={}B db={}",
         args.tasks,
         args.inserters,
         args.workers,
+        args.client_conns,
+        args.client_threads,
+        args.work_ns,
         args.batch,
         args.lease,
         args.chunk,
@@ -306,8 +343,35 @@ fn main() {
         }));
     }
 
+    WORK_NS.store(args.work_ns, Ordering::Relaxed);
     let mut workers = Vec::new();
-    for i in 0..args.workers {
+    let worker_api = Arc::new({
+        let mut api = ServerAPI::client(Config::default());
+        api.task_registry
+            .register(Arc::new(EchoTask::default()), task_type());
+        api
+    });
+    for i in 0..args.client_conns {
+        let (endpoint, done, api) = (endpoint.clone(), done.clone(), worker_api.clone());
+        let opts = WorkerOptions {
+            max_tasks: args.lease,
+            wait: Duration::from_millis(100),
+            threads: args.client_threads,
+            ..Default::default()
+        };
+        workers.push(spawn_guarded(format!("client {i}"), &abort, move || {
+            let connect = |_: Option<&str>| {
+                Client::connect(&endpoint, auth(&format!("cli{i}")), worker::caps(None))
+            };
+            worker::run(&api, connect, &opts, &done).map_err(|err| err.to_string())
+        }));
+    }
+    let bench_workers = if args.client_conns > 0 {
+        0
+    } else {
+        args.workers
+    };
+    for i in 0..bench_workers {
         let (endpoint, completed, failed, done) = (
             endpoint.clone(),
             completed.clone(),
@@ -357,8 +421,15 @@ fn main() {
     // Progress once a second until everything is completed.
     let mut insert_done_at: Option<Duration> = None;
     let mut last = (Instant::now(), 0u64, 0u64);
+    let mut stats_client = (args.client_conns > 0)
+        .then(|| Client::connect(&endpoint, auth("progress"), Caps::default()).expect("connect"));
     loop {
         std::thread::sleep(Duration::from_millis(250));
+        if let Some(client) = &mut stats_client {
+            // Progress only: `completed` also counts idempotent retries.
+            let stats = client.stats().expect("stats");
+            completed.store(stats.completed.min(args.tasks), Ordering::Relaxed);
+        }
         let (ins, comp) = (
             inserted.load(Ordering::Relaxed),
             completed.load(Ordering::Relaxed),
@@ -378,7 +449,19 @@ fn main() {
             );
             last = (Instant::now(), ins, comp);
         }
-        if comp >= args.tasks || failed.load(Ordering::Relaxed) > 0 || abort.is_set() {
+        // Client mode finishes on distinct finished tasks: every task
+        // inserted and none pending.
+        let finished = if stats_client.is_some() {
+            ins >= args.tasks
+                && scan_tasks(&api, &task_type(), Scope::Pending, None, 1)
+                    .is_ok_and(|(pending, _)| pending.is_empty())
+        } else {
+            comp >= args.tasks
+        };
+        if finished && stats_client.is_some() {
+            completed.store(args.tasks, Ordering::Relaxed);
+        }
+        if finished || failed.load(Ordering::Relaxed) > 0 || abort.is_set() {
             break;
         }
     }

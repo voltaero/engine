@@ -100,7 +100,67 @@ pub struct ConfigTomlServer {
     /// refuses every registration while it is unset.
     #[serde(default)]
     pub proxy_token: Option<String>,
+
+    /// `[client]`: settings of the worker binary (`engine` bin `client`).
+    #[serde(default)]
+    pub client: ClientConfig,
 }
+
+fn default_client_conns() -> usize {
+    1
+}
+
+fn default_client_max_tasks() -> u32 {
+    1024
+}
+
+/// `[client]` table: the worker binary takes no command-line arguments.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ClientConfig {
+    /// Server to work for. Default: `advertise`, else `host`.
+    #[serde(default)]
+    pub server: Option<String>,
+    /// Resolve the server through this proxy instead of `server`.
+    #[serde(default)]
+    pub proxy: Option<String>,
+    /// Session uid (leases are bound to it). Default: `worker-<pid>`.
+    #[serde(default)]
+    pub uid: Option<String>,
+    /// Auth challenge sent in `Hello`.
+    #[serde(default)]
+    pub challenge: String,
+    /// Compute threads per connection. Default: CPU count.
+    #[serde(default)]
+    pub threads: Option<usize>,
+    /// Connections, each with its own updater thread and `threads`.
+    #[serde(default = "default_client_conns")]
+    pub conns: usize,
+    /// Task types to work on (`"ns:name"`). Default: all the mods provide.
+    #[serde(default)]
+    pub task_types: Vec<String>,
+    /// `max_tasks` per lease.
+    #[serde(default = "default_client_max_tasks")]
+    pub max_tasks: u32,
+    /// Prefer the HIP runner.
+    #[serde(default)]
+    pub hip: bool,
+}
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            server: None,
+            proxy: None,
+            uid: None,
+            challenge: String::new(),
+            threads: None,
+            conns: default_client_conns(),
+            task_types: Vec::new(),
+            max_tasks: default_client_max_tasks(),
+            hip: false,
+        }
+    }
+}
+
 impl Default for ConfigTomlServer {
     fn default() -> Self {
         Self {
@@ -118,6 +178,7 @@ impl Default for ConfigTomlServer {
             heartbeat_secs: default_heartbeat_secs(),
             tasks: HashMap::new(),
             proxy_token: None,
+            client: ClientConfig::default(),
         }
     }
 }
@@ -197,6 +258,31 @@ mod tests {
         assert_eq!(cfg.host, default_host());
         assert_eq!(cfg.tasks["ns:t"].chunk_size, Some(7));
         assert_eq!(cfg.tasks["ns:t"].max_payload, None);
+    }
+
+    #[test]
+    fn client_table_is_optional_and_parsed() {
+        let path = std::env::temp_dir().join(format!(
+            "enginelib-config-client-{}.toml",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            "[client]\nproxy = \"tcp://p:1\"\nthreads = 4\ntask_types = [\"ns:t\"]\n",
+        )
+        .unwrap();
+        let client = Config::from_file(&path).config_toml.client;
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(client.proxy.as_deref(), Some("tcp://p:1"));
+        assert_eq!(client.threads, Some(4));
+        assert_eq!(client.task_types, ["ns:t"]);
+        assert_eq!(client.conns, 1);
+        assert_eq!(client.max_tasks, 1024);
+
+        let defaults = Config::from_file("/nonexistent/enginelib/config.toml").config_toml;
+        assert_eq!(defaults.client.conns, 1);
+        assert_eq!(defaults.client.max_tasks, 1024);
     }
 
     #[test]

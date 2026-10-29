@@ -135,7 +135,9 @@ pub struct ServerAPI {
     pub cfg: Config,                 // RW
     pub event_bus: EventBus,         // RW
     pub lib_manager: LibraryManager, // RW
-    pub db: Arc<rust_rocksdb::DB>,
+    /// The RocksDB store; `None` in a worker ([`ServerAPI::client`]), which
+    /// only needs the mods' registries and events. Use [`ServerAPI::db`].
+    pub db: Option<Arc<rust_rocksdb::DB>>,
     pub task_queue: TaskQueue,             // RW
     pub leased_tasks: LeasedTaskQueue,     // RW
     pub task_registry: EngineTaskRegistry, // RW
@@ -195,7 +197,17 @@ impl ServerAPI {
             .expect("Failed to open RocksDB — check that the path is writable and no other process holds the lock"),
         );
         let chunk_seq = SeqAllocator::open(&db).expect("Failed to read the chunk_seq meta record");
+        Self::with_store(cfg, Some(db), chunk_seq)
+    }
 
+    /// A `ServerAPI` without a store, for workers: loads the mods and their
+    /// event handlers, so the task registry and client events work. Anything
+    /// that touches the store (the nucleus ops, [`ServerAPI::db`]) panics.
+    pub fn client(cfg: Config) -> Self {
+        Self::with_store(cfg, None, SeqAllocator::default())
+    }
+
+    fn with_store(cfg: Config, db: Option<Arc<rust_rocksdb::DB>>, chunk_seq: SeqAllocator) -> Self {
         init_tracing();
 
         let mut k = Self {
@@ -215,16 +227,26 @@ impl ServerAPI {
         k
     }
 
+    /// The RocksDB store.
+    ///
+    /// # Panics
+    /// On a store-less [`ServerAPI::client`].
+    pub fn db(&self) -> &Arc<rust_rocksdb::DB> {
+        self.db
+            .as_ref()
+            .expect("ServerAPI::client has no store; open the server API with ServerAPI::open")
+    }
+
     /// The pending-chunk column family (`t:` keys).
     pub fn cf_pending(&self) -> &ColumnFamily {
-        self.db
+        self.db()
             .cf_handle(CF_PENDING)
             .expect("pending column family is created at open")
     }
 
     /// The finished-chunk column family (`f:` keys).
     pub fn cf_finished(&self) -> &ColumnFamily {
-        self.db
+        self.db()
             .cf_handle(CF_FINISHED)
             .expect("finished column family is created at open")
     }
@@ -293,7 +315,7 @@ impl ServerAPI {
         chunk_seq: u64,
     ) -> Result<Option<ChunkPayloads>, Error> {
         let data = self
-            .db
+            .db()
             .get_cf(self.cf_pending(), task_key(task_type, chunk_seq))
             .map_err(|err| Error::io_error(format!("Failed to read pending chunk: {err}")))?;
         data.map(ChunkPayloads::decode).transpose()
@@ -306,7 +328,7 @@ impl ServerAPI {
         chunk_seq: u64,
     ) -> Result<Option<FinishedChunk>, Error> {
         let data = self
-            .db
+            .db()
             .get_pinned_cf(self.cf_finished(), finished_task_key(task_type, chunk_seq))
             .map_err(|err| Error::io_error(format!("Failed to read finished chunk: {err}")))?;
         data.map(|data| FinishedChunk::decode(&data)).transpose()
@@ -323,7 +345,7 @@ impl ServerAPI {
     ) -> Result<Option<QueuedChunk>, LoadError> {
         let payloads = ChunkPayloads::decode(pending).map_err(LoadError::Corrupt)?;
         let finished = self
-            .db
+            .db()
             .get_pinned_cf(self.cf_finished(), finished_task_key(task_type, chunk_seq))
             .map_err(|err| {
                 LoadError::Read(Error::io_error(format!(
@@ -432,7 +454,7 @@ impl ServerAPI {
                 continue; // already queued or leased
             }
             let loaded = self
-                .db
+                .db()
                 .get_cf(self.cf_pending(), task_key(task_type, chunk_seq))
                 .map_err(|err| {
                     LoadError::Read(Error::io_error(format!(
@@ -501,7 +523,7 @@ impl ServerAPI {
             opts.set_iterate_upper_bound(upper);
             let mut last_key: Option<Box<[u8]>> = None;
             for result in self
-                .db
+                .db()
                 .iterator_cf_opt(self.cf_pending(), opts, IteratorMode::Start)
             {
                 let (key, value) = match result {

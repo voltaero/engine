@@ -295,6 +295,25 @@ pub fn encode_derived(base: &[u8], range: DerivedRange) -> Vec<u8> {
     out
 }
 
+/// Splits an [`encode_derived`] record into its range and base. Workers hand a
+/// derived chunk to `Task::from_bytes` in this form; `None` if malformed.
+pub fn decode_derived(bytes: &[u8]) -> Option<(DerivedRange, &[u8])> {
+    if bytes.first() != Some(&FORMAT_DERIVED) {
+        return None;
+    }
+    let word = |at: usize| {
+        bytes
+            .get(at..at + 8)
+            .and_then(|word| word.try_into().ok())
+            .map(u64::from_le_bytes)
+    };
+    let range = DerivedRange {
+        start: word(1)?,
+        count: word(9)?,
+    };
+    Some((range, &bytes[17..]))
+}
+
 /// The payloads of one chunk: the raw record plus offsets into it, so decoding
 /// is one allocation and leasing hands out slices. A derived chunk has a single
 /// slot whose payload is the base; `range` says which indexes it covers.
@@ -541,6 +560,20 @@ struct SeqInner {
     next: u64,
     reserved_until: u64,
     in_progress: BTreeSet<u64>,
+}
+
+impl Default for SeqAllocator {
+    /// An allocator starting at 0 that never persisted anything; only for a
+    /// store-less `ServerAPI::client`, which never reserves.
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(SeqInner {
+                next: 0,
+                reserved_until: 0,
+                in_progress: BTreeSet::new(),
+            }),
+        }
+    }
 }
 
 impl SeqAllocator {

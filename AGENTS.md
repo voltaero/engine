@@ -7,7 +7,7 @@ Operational guide for coding agents in this repository.
 Rust workspace for a distributed task engine with dynamic mods.
 
 Workspace members:
-- `engine` (binaries: `server`, `proxy`, `bench`)
+- `engine` (binaries: `server`, `proxy`, `client`, `bench`)
 - `enginelib` (shared runtime API, events, tasks, plugin loader, task nucleus)
 - `enginelib/macros` (proc macros used by mods and core)
 The management mod (web dashboard, token auth, `mgmtctl`) lives in its own
@@ -30,7 +30,9 @@ repo, [voltaero/magnesium](https://github.com/voltaero/magnesium).
 6. `enginelib/src/config.rs` (config/token)
 7. `enginelib/src/wire.rs` (wire messages) and `enginelib/src/transport/*`
    (ZeroMQ server, client, proxy); spec in `docs/protocol.md`
-8. `engine/src/bin/server.rs`, `engine/src/bin/proxy.rs` (entrypoints)
+8. `enginelib/src/worker.rs` (worker loop: lease -> run mod task -> complete)
+9. `engine/src/bin/server.rs`, `engine/src/bin/proxy.rs`, `engine/src/bin/client.rs`
+   (entrypoints)
 
 ## Build/test commands
 
@@ -38,12 +40,17 @@ repo, [voltaero/magnesium](https://github.com/voltaero/magnesium).
 - Test all: `cargo test --workspace`
 - Run server: `cargo run -p engine --bin server`
 - Run proxy: `cargo run -p engine --bin proxy`
+- Run worker: `cargo run -p engine --bin client` (no arguments; configured by
+  the `[client]` table of `config.toml`, `config::ClientConfig`)
 - Needs the system `libzmq` (the `zmq` crate links it via pkg-config).
 
 ## Key architecture facts
 
 - Engine state is centralized in `enginelib::api::ServerAPI`.
-- Persistence is RocksDB-backed (`ServerAPI::db: Arc<rust_rocksdb::DB>`, store dir `engine_db`).
+- Persistence is RocksDB-backed (`api.db()`, store dir `engine_db`). The field is
+  `ServerAPI::db: Option<Arc<rust_rocksdb::DB>>` (same layout as an `Arc`):
+  `None` only for the store-less `ServerAPI::client(cfg)` a worker uses, where
+  `db()` and every nucleus op panic.
 - Task lifecycle operations live in `enginelib/src/nucleus/*` (`submit`, `lease`, `renew`, `complete`, `cancel`, `query`).
 - Core event system is in `enginelib/src/event.rs`; core events in `enginelib/src/events/*`.
 - Mods are loaded from `./mods/*.rf` by `enginelib/src/plugin.rs`.
@@ -64,6 +71,25 @@ repo, [voltaero/magnesium](https://github.com/voltaero/magnesium).
   **any change to those types must be mirrored there**; the `wire::tests`
   byte-equality tests catch drift. Hot `Vec<u8>` fields use `#[serde(with =
   "bytes")]` (same bytes on the wire, one memcpy instead of per-byte).
+- Worker (`enginelib/src/worker.rs`, bin `client`): loads mods into a
+  store-less `ServerAPI::client`. One `worker::run` per connection: the calling
+  thread is the *updater* (owns the `Client`, keeps `Lease` (≤2 ahead) /
+  `Complete`+`then_lease` / `Renew` / `CancelLease` pipelined via
+  `send`/`try_recv`) and `threads` compute threads run slices of each batch;
+  the last slice wakes the updater over an inproc PUSH/PULL. Tasks run as
+  `from_bytes` -> `run` -> `to_bytes` (derived: `from_bytes(encode_derived(base,
+  range))`; `chunk::decode_derived` splits it). Don't add `Task` trait methods
+  for this (mods' vtables). Panics/skips are cancelled only after the batch's
+  `Complete` is acked (else cancel requeues the tasks being completed).
+  `client:*` event args are only built if a handler exists (`Hooks`).
+  Rejected results: `IOError` -> resent with backoff (batch kept, leases
+  renewed, ≤6 attempts), `ResultTooLarge`/verify failure -> lease handed back,
+  anything else (lease gone) -> dropped. Held batches are tied to the server
+  that leased them: `run`'s `connect(Some(endpoint))` must reconnect *there*
+  (a proxy may pick another server, whose `WrongServer` would drop the work)
+  until their lease TTL has passed; `connect(None)` may pick any server. On
+  stop it waits for every reply, `CancelLease` included (linger 0).
+  Measure with `bench --client-conns C --client-threads T [--work-ns N]`.
 - Transport-level guards (`transport/server.rs`): at most `max_inflight`
   handlers run at once (the I/O thread stops reading the ROUTER when full);
   `Renew`/`Complete`/`CancelLease` reject a lease held by another session uid

@@ -18,7 +18,9 @@ pub struct TaskLimits {
     /// Derived type: a chunk stores one base payload and an index range, not
     /// per-task payloads. Workers derive each task from `(base, idx)` and
     /// complete the chunk with one result. Set by the mod only (config can't
-    /// override it); such a type only accepts `submit_derived`.
+    /// override it); such a type only accepts `submit_derived`. The worker
+    /// runs a derived chunk as `from_bytes(encode_derived(base, range))` ->
+    /// `run` -> `to_bytes`; split it with [`crate::chunk::decode_derived`].
     pub derived: bool,
 }
 
@@ -45,7 +47,9 @@ pub trait Task: Debug + Sync + Send + Verifiable {
             self.get_id().1
         );
     }
-    #[instrument]
+    // Runs once per task on the worker's hot path: TRACE and no `Debug` of
+    // `self` (the whole payload), or every task pays for a formatted span.
+    #[instrument(level = "trace", skip(self))]
     fn run(&mut self, run: Option<Runner>) {
         match run {
             Some(Runner::HIP) => self.run_hip(),
